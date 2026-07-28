@@ -1,0 +1,10 @@
+export { FractalNoiseDemo } from "./fractal-noise";
+export { ParticleDemo } from "./particles";
+export { BoidDemo } from "./boid";
+export { ToonDemo } from "./toon";
+export { ShowcaseDemo } from "./showcase";
+export { IndirectDrawDemo } from "./indirect-draw";
+export { PBRShadowDemo } from "./pbr-shadow";
+export { MeshGenDemo } from "./mesh-gen";
+export { GLBViewerDemo } from "./glb-viewer";
+export type { Demo, ShaderStageDesc, ShaderStageType } from "./types";

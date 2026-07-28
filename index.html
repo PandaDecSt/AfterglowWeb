@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AfterglowRender Web</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #error-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.9);
+      color: #ff6b6b;
+      font-family: monospace;
+      font-size: 14px;
+      padding: 2rem;
+      white-space: pre-wrap;
+      z-index: 9999;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="error-overlay"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
