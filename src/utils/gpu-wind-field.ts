@@ -7,7 +7,7 @@ struct WindUniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: WindUniforms;
-@group(0) @binding(1) var windTex: texture_storage_2d<rg32float, write>;
+@group(0) @binding(1) var windTex: texture_storage_2d<rgba16float, write>;
 
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -51,7 +51,7 @@ export class GPUWindField {
     this.windTexture = this.device.createTexture({
       label: "gpu-wind-field",
       size: [this.size, this.size],
-      format: "rg32float",
+      format: "rgba16float",
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
 

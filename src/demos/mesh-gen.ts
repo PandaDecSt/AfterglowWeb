@@ -7,6 +7,8 @@ import type { EngineContext } from "../core/engine";
 const GRID_SIZE = 64;
 const VERTEX_COUNT = GRID_SIZE * GRID_SIZE;
 const INDEX_COUNT = (GRID_SIZE - 1) * (GRID_SIZE - 1) * 6;
+// WGSL struct alignment: vec3 has 16-byte alignment, so Vertex struct stride = 48 bytes
+const VERTEX_STRIDE = 48;
 
 const meshGenShader = `
 struct MeshUniforms {
@@ -199,14 +201,14 @@ export class MeshGenDemo implements Demo {
     // Vertex buffer: position(3) + normal(3) + uv(2) = 8 floats per vertex
     this.vertexBuffer = this.device.createBuffer({
       label: "meshgen-vb",
-      size: VERTEX_COUNT * 8 * 4,
+      size: VERTEX_COUNT * VERTEX_STRIDE,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
     this.indexBuffer = this.device.createBuffer({
       label: "meshgen-ib",
       size: INDEX_COUNT * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.INDEX,
     });
 
     // Indirect draw args: 5 x u32 = 20 bytes
@@ -229,19 +231,32 @@ export class MeshGenDemo implements Demo {
     });
 
     const genModule = this.device.createShaderModule({ code: meshGenShader });
+
+    const computeBGL = this.device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      ],
+    });
+    const computePipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [computeBGL],
+    });
+
     this.genVerticesPipeline = this.device.createComputePipeline({
       label: "meshgen-vertices",
-      layout: "auto",
+      layout: computePipelineLayout,
       compute: { module: genModule, entryPoint: "cs_genVertices" },
     });
     this.genIndicesPipeline = this.device.createComputePipeline({
       label: "meshgen-indices",
-      layout: "auto",
+      layout: computePipelineLayout,
       compute: { module: genModule, entryPoint: "cs_genIndices" },
     });
 
     this.genBindGroup = this.device.createBindGroup({
-      layout: this.genVerticesPipeline.getBindGroupLayout(0),
+      layout: computeBGL,
       entries: [
         { binding: 0, resource: { buffer: this.meshUBO } },
         { binding: 1, resource: { buffer: this.vertexBuffer } },
@@ -316,6 +331,7 @@ export class MeshGenDemo implements Demo {
     });
     renderPass.setPipeline(this.renderPipeline);
     renderPass.setBindGroup(0, this.renderBindGroup);
+    renderPass.setIndexBuffer(this.indexBuffer, "uint32");
     renderPass.drawIndexedIndirect(this.drawArgsBuffer, 0);
     renderPass.end();
   }

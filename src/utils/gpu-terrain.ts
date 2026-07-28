@@ -7,7 +7,7 @@ struct TerrainUniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: TerrainUniforms;
-@group(0) @binding(1) var heightTex: texture_storage_2d<r32float, write>;
+@group(0) @binding(1) var heightTex: texture_storage_2d<rgba16float, write>;
 
 fn hash2d(x: f32, y: f32) -> f32 {
   return fract(sin(dot(vec2<f32>(x, y), vec2<f32>(127.1, 311.7))) * 43758.5453123);
@@ -76,7 +76,7 @@ export class GPUTerrain {
     this.heightTexture = this.device.createTexture({
       label: "gpu-terrain-height",
       size: [this.size, this.size],
-      format: "r32float",
+      format: "rgba16float",
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.heightView = this.heightTexture.createView();
