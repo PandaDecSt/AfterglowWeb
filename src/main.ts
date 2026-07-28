@@ -14,6 +14,11 @@ import {
   PBRShadowDemo,
   MeshGenDemo,
   GLBViewerDemo,
+  GrassDemo,
+  WaterDemo,
+  ShellFurDemo,
+  GlitchedMosaicsDemo,
+  GreedySnakeDemo,
 } from "./demos";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -27,13 +32,18 @@ function showError(msg: string) {
 const demoFactories: { label: string; create: () => Demo }[] = [
   { label: "GLB Viewer (Qin_DL)", create: () => new GLBViewerDemo() },
   { label: "PBR + Shadow", create: () => new PBRShadowDemo() },
-  { label: "MeshGen (CS→Indirect)", create: () => new MeshGenDemo() },
-  { label: "Showcase (Full Pipeline)", create: () => new ShowcaseDemo() },
-  { label: "IndirectDraw (10k Culling)", create: () => new IndirectDrawDemo() },
-  { label: "FractalNoise", create: () => new FractalNoiseDemo() },
+  { label: "Toon (Multi-Material)", create: () => new ToonDemo() },
+  { label: "Grass", create: () => new GrassDemo() },
+  { label: "Water", create: () => new WaterDemo() },
+  { label: "ShellFur", create: () => new ShellFurDemo() },
   { label: "Particles", create: () => new ParticleDemo() },
   { label: "Boid", create: () => new BoidDemo() },
-  { label: "Toon", create: () => new ToonDemo() },
+  { label: "MeshGen (CS→Indirect)", create: () => new MeshGenDemo() },
+  { label: "IndirectDraw (10k Culling)", create: () => new IndirectDrawDemo() },
+  { label: "GlitchedMosaics", create: () => new GlitchedMosaicsDemo() },
+  { label: "GreedySnake", create: () => new GreedySnakeDemo() },
+  { label: "FractalNoise", create: () => new FractalNoiseDemo() },
+  { label: "Showcase (Full Pipeline)", create: () => new ShowcaseDemo() },
 ];
 
 async function main() {
