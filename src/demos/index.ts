@@ -14,4 +14,8 @@ export { ShellFurDemo } from "./shell-fur";
 export { GlitchedMosaicsDemo } from "./glitched-mosaics";
 export { GreedySnakeDemo } from "./greedy-snake";
 export { MeteorographDemo } from "./meteorograph";
+export { ToonTexturedDemo } from "./toon-textured";
+export { TerrainHydrologyDemo } from "./terrain-hydrology";
+export { ACESPipelineDemo } from "./aces-pipeline";
+export { HairEyeShadowDemo } from "./hair-eye-shadow";
 export type { Demo } from "./types";

@@ -21,6 +21,10 @@ import {
   GlitchedMosaicsDemo,
   GreedySnakeDemo,
   MeteorographDemo,
+  ToonTexturedDemo,
+  TerrainHydrologyDemo,
+  ACESPipelineDemo,
+  HairEyeShadowDemo,
 } from "./demos";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -47,6 +51,10 @@ const demoFactories: { label: string; create: () => Demo }[] = [
   { label: "GreedySnake", create: () => new GreedySnakeDemo() },
   { label: "FractalNoise", create: () => new FractalNoiseDemo() },
   { label: "Meteorograph (Weather)", create: () => new MeteorographDemo() },
+  { label: "Toon Textured (Ramp)", create: () => new ToonTexturedDemo() },
+  { label: "Terrain Hydrology", create: () => new TerrainHydrologyDemo() },
+  { label: "ACES Pipeline", create: () => new ACESPipelineDemo() },
+  { label: "Hair/Eye Shadow", create: () => new HairEyeShadowDemo() },
   { label: "Showcase (Full Pipeline)", create: () => new ShowcaseDemo() },
 ];
 

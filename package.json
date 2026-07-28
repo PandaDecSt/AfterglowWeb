@@ -9,6 +9,7 @@
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.60",
+    "puppeteer": "^25.4.0",
     "typescript": "^5.8.0",
     "vite": "^6.3.0"
   },
