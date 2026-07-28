@@ -3,13 +3,14 @@ import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
 
-const multiToonShader = `
+const arcToonVS = `
 struct Uniforms {
   viewProj: mat4x4<f32>,
   model: mat4x4<f32>,
   invTransModel: mat4x4<f32>,
   cameraPosition: vec4<f32>,
   lightDir: vec4<f32>,
+  lightColor: vec4<f32>,
   time: f32,
   outlineWidth: f32,
   materialID: f32,
@@ -23,6 +24,7 @@ struct VSOut {
   @location(0) worldNormal: vec3<f32>,
   @location(1) worldPos: vec3<f32>,
   @location(2) uv: vec2<f32>,
+  @location(3) vertexColor: f32,
 };
 
 @vertex
@@ -37,96 +39,119 @@ fn vs_main(
   out.worldNormal = normalize((u.invTransModel * vec4<f32>(normal, 0.0)).xyz);
   out.worldPos = worldPos.xyz;
   out.uv = uv;
+  // Procedural vertex color based on height (simulates ILM vertex color)
+  out.vertexColor = smoothstep(0.0, 1.5, worldPos.y);
   return out;
 }
+`;
 
-// Material 0: Face - SDF-like soft shadow, warm skin tone
-fn shadeFace(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-  let NdotL = dot(N, L);
-  let shadowEdge = smoothstep(-0.02, 0.05, NdotL);
-  let baseColor = vec3<f32>(0.95, 0.78, 0.68);
-  let shadowColor = vec3<f32>(0.85, 0.55, 0.5);
-  var color = mix(shadowColor, baseColor, shadowEdge);
-  // Cheek blush
-  let cheekL = distance(uv, vec2<f32>(0.3, 0.55));
-  let cheekR = distance(uv, vec2<f32>(0.7, 0.55));
-  let blush = max(smoothstep(0.12, 0.04, cheekL), smoothstep(0.12, 0.04, cheekR));
-  color = mix(color, vec3<f32>(0.95, 0.5, 0.45), blush * 0.4);
-  // Nose highlight
-  let nose = smoothstep(0.06, 0.0, distance(uv, vec2<f32>(0.5, 0.5)));
-  color += nose * 0.1;
-  return color;
+const arcToonFS = `
+struct Uniforms {
+  viewProj: mat4x4<f32>,
+  model: mat4x4<f32>,
+  invTransModel: mat4x4<f32>,
+  cameraPosition: vec4<f32>,
+  lightDir: vec4<f32>,
+  lightColor: vec4<f32>,
+  time: f32,
+  outlineWidth: f32,
+  materialID: f32,
+  pad: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+
+struct VSOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) worldNormal: vec3<f32>,
+  @location(1) worldPos: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+  @location(3) vertexColor: f32,
+};
+
+// Procedural ILM-like map
+fn sampleILM(uv: vec2<f32>, materialID: f32) -> vec4<f32> {
+  // ILM channels:
+  // .x: vertex color (used for diffuse masking)
+  // .y: luminance correction
+  // .z: specular mask
+  // .w: internal lines (for outline effect)
+
+  var ilm = vec4<f32>(1.0, 1.0, 0.5, 1.0);
+
+  // Material-specific ILM patterns
+  if (materialID < 0.5) {
+    // Face: smooth ILM with cheek highlights
+    let cheekL = distance(uv, vec2<f32>(0.3, 0.55));
+    let cheekR = distance(uv, vec2<f32>(0.7, 0.55));
+    let cheek = max(smoothstep(0.15, 0.05, cheekL), smoothstep(0.15, 0.05, cheekR));
+    ilm.x = 1.0 - cheek * 0.3;
+    ilm.z = 0.3; // Low specular on skin
+    ilm.w = 1.0 - smoothstep(0.02, 0.0, abs(uv.x - 0.5)) * 0.3; // Nose line
+  } else if (materialID < 1.5) {
+    // Hair: strong specular band
+    ilm.z = smoothstep(0.3, 0.7, sin(uv.x * 30.0 + uv.y * 10.0) * 0.5 + 0.5);
+    ilm.w = 1.0 - sin(uv.x * 50.0) * 0.1; // Strand lines
+  } else if (materialID < 2.5) {
+    // Body: fabric pattern
+    let pattern = step(0.5, fract(uv.y * 8.0));
+    ilm.x = 1.0 - pattern * 0.2;
+    ilm.z = 0.6; // Medium specular
+    ilm.w = 1.0 - smoothstep(0.48, 0.52, fract(uv.y * 8.0)) * 0.4; // Seam lines
+  } else {
+    // Eye: high specular, reflective
+    let irisDist = distance(uv, vec2<f32>(0.5, 0.5));
+    ilm.z = smoothstep(0.3, 0.1, irisDist); // Strong specular on iris
+    ilm.w = 1.0;
+  }
+
+  return ilm;
 }
 
-// Material 1: Hair - anisotropic-like strand highlight, cool tone
-fn shadeHair(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-  let NdotL = dot(N, L);
-  let diffuse = smoothstep(0.0, 0.3, NdotL) * 0.7 + 0.3;
-  let baseColor = vec3<f32>(0.25, 0.2, 0.35);
-  var color = baseColor * diffuse;
-  // Strand highlight (anisotropic approximation)
-  let H = normalize(L + V);
-  let strandDir = normalize(vec3<f32>(0.0, 1.0, 0.0));
-  let TdotH = dot(strandDir, H);
-  let aniso = pow(sqrt(max(1.0 - TdotH * TdotH, 0.0)), 8.0);
-  let specBand = step(0.6, aniso) * 0.5;
-  color += vec3<f32>(0.6, 0.5, 0.8) * specBand;
-  // Hair strand lines
-  let strands = sin(uv.x * 80.0 + uv.y * 20.0) * 0.5 + 0.5;
-  color *= 0.9 + strands * 0.1;
-  return color;
+// Procedural SSS-like color
+fn sampleSSS(baseColor: vec3<f32>, materialID: f32, NdotL: f32) -> vec3<f32> {
+  var sssColor = baseColor;
+
+  if (materialID < 0.5) {
+    // Face: warm subsurface scattering
+    let sss = smoothstep(-0.2, 0.3, NdotL);
+    sssColor = mix(vec3<f32>(0.85, 0.55, 0.5), baseColor, sss);
+  } else if (materialID < 1.5) {
+    // Hair: cool subsurface
+    let sss = smoothstep(-0.1, 0.2, NdotL);
+    sssColor = mix(vec3<f32>(0.15, 0.1, 0.25), baseColor, sss);
+  } else if (materialID < 2.5) {
+    // Body: neutral subsurface
+    let sss = smoothstep(-0.1, 0.2, NdotL);
+    sssColor = mix(vec3<f32>(0.15, 0.15, 0.2), baseColor, sss);
+  }
+
+  return sssColor;
 }
 
-// Material 2: Body/Clothes - hard banded toon, saturated
-fn shadeBody(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-  let NdotL = dot(N, L);
-  var band: f32;
-  if (NdotL > 0.7) { band = 1.0; }
-  else if (NdotL > 0.3) { band = 0.65; }
-  else if (NdotL > 0.0) { band = 0.4; }
-  else { band = 0.2; }
-  let baseColor = vec3<f32>(0.2, 0.5, 0.85);
-  var color = baseColor * band;
-  // Rim light
-  let rim = 1.0 - max(dot(N, V), 0.0);
-  color += baseColor * step(0.7, rim) * 0.5;
-  // Fabric pattern
-  let pattern = step(0.5, fract(uv.y * 6.0));
-  color = mix(color, color * 0.8, pattern * 0.3);
-  return color;
-}
+// GGX specular with ILM mask
+fn specularGGX(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, roughness: f32, F0: vec3<f32>) -> vec3<f32> {
+  let H = normalize(V + L);
+  let NdotH = max(dot(N, H), 0.0);
+  let NdotV = max(dot(N, V), 0.0);
+  let NdotL = max(dot(N, L), 0.0);
 
-// Material 3: Eye - reflective, sharp highlight with shadow
-fn shadeEye(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, uv: vec2<f32>, time: f32) -> vec3<f32> {
-  let irisCenter = vec2<f32>(0.5, 0.5);
-  let irisDist = distance(uv, irisCenter);
-  let irisMask = smoothstep(0.35, 0.3, irisDist);
-  let pupilMask = smoothstep(0.12, 0.1, irisDist);
-  // Iris color gradient with animation
-  let irisColor = mix(vec3<f32>(0.2, 0.6, 0.8), vec3<f32>(0.1, 0.3, 0.6), irisDist * 3.0);
-  var color = mix(vec3<f32>(0.95, 0.95, 0.95), irisColor, irisMask);
-  color = mix(color, vec3<f32>(0.02, 0.02, 0.05), pupilMask);
-  // Sharp specular
-  let H = normalize(L + V);
-  let spec = pow(max(dot(N, H), 0.0), 64.0);
-  color += step(0.5, spec) * 0.9;
-  // Reflection dot
-  let reflPos = vec2<f32>(0.38, 0.38);
-  let refl = smoothstep(0.06, 0.03, distance(uv, reflPos));
-  color += refl * 0.8;
-  // Eye shadow (top gradient like original)
-  let shadow = 1.0 - smoothstep(0.7, 1.0, uv.y) * 0.4;
-  color *= shadow;
-  return color;
-}
+  let a = roughness * roughness;
+  let a2 = a * a;
+  let denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+  let NDF = a2 / (3.14159 * denom * denom);
 
-// Material 4: Eyelash - depth-aware transparency
-fn shadeEyelash(N: vec3<f32>, L: vec3<f32>, V: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
-  // Simple dark color with alpha based on UV
-  let baseColor = vec3<f32>(0.05, 0.02, 0.08);
-  // Alpha gradient (top to bottom, like original)
-  let alpha = 1.0 - uv.y;
-  return baseColor * alpha;
+  let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+  let G1 = NdotV / (NdotV * (1.0 - k) + k);
+  let G2 = NdotL / (NdotL * (1.0 - k) + k);
+  let G = G1 * G2;
+
+  let F = F0 + (1.0 - F0) * pow(clamp(1.0 - max(dot(H, V), 0.0), 0.0, 1.0), 5.0);
+
+  let numerator = NDF * G * F;
+  let denominator = 4.0 * NdotV * NdotL + 0.0001;
+
+  return numerator / denominator;
 }
 
 @fragment
@@ -134,40 +159,66 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let N = normalize(in.worldNormal);
   let L = normalize(-u.lightDir.xyz);
   let V = normalize(u.cameraPosition.xyz - in.worldPos);
+  let NdotL = dot(N, L);
 
-  var color: vec3<f32>;
-  let matID = i32(u.materialID);
-  if (matID == 0) {
-    color = shadeFace(N, L, V, in.uv);
-  } else if (matID == 1) {
-    color = shadeHair(N, L, V, in.uv);
-  } else if (matID == 2) {
-    color = shadeBody(N, L, V, in.uv);
-  } else if (matID == 3) {
-    color = shadeEye(N, L, V, in.uv, u.time);
+  let materialID = u.materialID;
+
+  // Base colors per material
+  var baseColor: vec3<f32>;
+  if (materialID < 0.5) {
+    baseColor = vec3<f32>(0.95, 0.78, 0.68); // Face skin
+  } else if (materialID < 1.5) {
+    baseColor = vec3<f32>(0.25, 0.2, 0.35); // Hair
+  } else if (materialID < 2.5) {
+    baseColor = vec3<f32>(0.2, 0.5, 0.85); // Body
   } else {
-    color = shadeEyelash(N, L, V, in.uv);
+    baseColor = vec3<f32>(0.1, 0.3, 0.6); // Eye
   }
+
+  // Sample procedural ILM
+  let ilm = sampleILM(in.uv, materialID);
+
+  // Toon diffuse with smoothstep (Arc Toon style)
+  let diffuse = smoothstep(0.49, 0.50, NdotL * ilm.x);
+
+  // SSS-like shadow color
+  let sssColor = sampleSSS(baseColor, materialID, NdotL);
+
+  // Mix diffuse with SSS
+  var color = mix(sssColor, baseColor, diffuse);
+
+  // GGX specular with ILM mask
+  let specularColor = mix(vec3<f32>(0.04), baseColor, 0.0);
+  let specular = specularGGX(N, V, L, 0.5, specularColor);
+  let specMask = smoothstep(vec3<f32>(0.04), vec3<f32>(0.05), specular * ilm.z);
+  color += specMask * ilm.z;
+
+  // Internal lines (from ILM)
+  color *= ilm.w;
+
+  // Lighting
+  color *= u.lightColor.rgb * u.lightColor.a;
+
+  // Luminance correction
+  let luma = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+  color = color * ilm.y * (1.0 + luma * 0.2);
 
   return vec4<f32>(color, 1.0);
 }
 `;
 
-const outlineShader = `
+const arcOutlineVS = `
 struct Uniforms {
   viewProj: mat4x4<f32>,
   model: mat4x4<f32>,
   invTransModel: mat4x4<f32>,
   cameraPosition: vec4<f32>,
   lightDir: vec4<f32>,
+  lightColor: vec4<f32>,
   time: f32,
   outlineWidth: f32,
   materialID: f32,
-  distanceFadeFactor: f32,
-  fovCompensation: f32,
-  pad0: f32,
-  pad1: f32,
-  pad2: f32,
+  pad: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -181,19 +232,13 @@ fn vs_main(
   let worldPos = (u.model * vec4<f32>(pos, 1.0)).xyz;
   let worldNormal = normalize((u.invTransModel * vec4<f32>(normal, 0.0)).xyz);
 
-  // Distance fade: caps expansion growth at far distances
+  // Distance fade
   let dist = distance(u.cameraPosition.xyz, worldPos);
-  let distanceFade = min(dist * u.distanceFadeFactor, 0.01);
+  let distanceFade = min(dist * 0.15, 0.01);
 
-  // View-direction expansion (unnormalized, scales with distance like original)
+  // View + normal expansion (Arc Toon style)
   let camToVertex = worldPos - u.cameraPosition.xyz;
-  let faceExpand = camToVertex * 0.6;
-
-  // Normal-direction expansion (pushes shell outward)
-  let normalExpand = worldNormal * 1.0;
-
-  // Combined expansion with FOV compensation for screen-space consistency
-  let expansion = u.outlineWidth * (distanceFade * u.fovCompensation) * (faceExpand + normalExpand);
+  let expansion = u.outlineWidth * distanceFade * (camToVertex * 0.6 + worldNormal * 1.0);
   let expandedWorldPos = worldPos + expansion;
 
   return u.viewProj * vec4<f32>(expandedWorldPos, 1.0);
@@ -201,18 +246,8 @@ fn vs_main(
 
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
-  let matID = i32(u.materialID);
-  var outlineColor: vec3<f32>;
-  if (matID == 0) {
-    outlineColor = vec3<f32>(0.15, 0.05, 0.05);
-  } else if (matID == 1) {
-    outlineColor = vec3<f32>(0.05, 0.02, 0.1);
-  } else if (matID == 2) {
-    outlineColor = vec3<f32>(0.02, 0.05, 0.12);
-  } else {
-    outlineColor = vec3<f32>(0.02, 0.02, 0.02);
-  }
-  return vec4<f32>(outlineColor, 1.0);
+  // Arc Toon uses dark outline color based on material
+  return vec4<f32>(0.05, 0.02, 0.08, 1.0);
 }
 `;
 
@@ -224,8 +259,8 @@ interface MaterialPart {
   outlineScale: number;
 }
 
-export class ToonDemo implements Demo {
-  label = "Toon Multi-Material";
+export class ArcToonDemo implements Demo {
+  label = "Arc Toon";
 
   private device!: GPUDevice;
   private format!: GPUTextureFormat;
@@ -241,13 +276,12 @@ export class ToonDemo implements Demo {
   private parts: MaterialPart[] = [];
   private static readonly SLOT_SIZE = 256;
 
-  outlineWidth = 2.0;
+  outlineWidth = 1.5;
   showOutline = true;
   showFace = true;
   showHair = true;
   showBody = true;
   showEye = true;
-  showEyelash = true;
 
   init(ctx: GPUContext, camera: Camera) {
     this.device = ctx.device;
@@ -259,7 +293,7 @@ export class ToonDemo implements Demo {
     this.parts = parts;
 
     this.vertexBuffer = this.device.createBuffer({
-      label: "toon-vb",
+      label: "arctoon-vb",
       size: vertices.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
@@ -268,7 +302,7 @@ export class ToonDemo implements Demo {
     this.vertexBuffer.unmap();
 
     this.indexBuffer = this.device.createBuffer({
-      label: "toon-ib",
+      label: "arctoon-ib",
       size: indices.byteLength,
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
@@ -278,8 +312,8 @@ export class ToonDemo implements Demo {
 
     const maxSlots = 16;
     this.uniformBuffer = this.device.createBuffer({
-      label: "toon-ubo",
-      size: ToonDemo.SLOT_SIZE * maxSlots,
+      label: "arctoon-ubo",
+      size: ArcToonDemo.SLOT_SIZE * maxSlots,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -305,19 +339,20 @@ export class ToonDemo implements Demo {
       bindGroupLayouts: [bindGroupLayout],
     });
 
-    const module = this.device.createShaderModule({ code: multiToonShader });
+    const toonModule = this.device.createShaderModule({ code: arcToonFS });
+    const toonVSModule = this.device.createShaderModule({ code: arcToonVS });
     this.toonPipeline = this.device.createRenderPipeline({
-      label: "toon-render",
+      label: "arctoon-render",
       layout: pipelineLayout,
-      vertex: { module, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module, entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module: toonVSModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: toonModule, entryPoint: "fs_main", targets: [{ format: this.format }] },
       primitive: { topology: "triangle-list", cullMode: "back" },
       depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
     });
 
-    const outlineModule = this.device.createShaderModule({ code: outlineShader });
+    const outlineModule = this.device.createShaderModule({ code: arcOutlineVS });
     this.outlinePipeline = this.device.createRenderPipeline({
-      label: "toon-outline",
+      label: "arctoon-outline",
       layout: pipelineLayout,
       vertex: { module: outlineModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: outlineModule, entryPoint: "fs_main", targets: [{ format: this.format }] },
@@ -327,7 +362,7 @@ export class ToonDemo implements Demo {
 
     this.bindGroup = this.device.createBindGroup({
       layout: bindGroupLayout,
-      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer, size: ToonDemo.SLOT_SIZE } }],
+      entries: [{ binding: 0, resource: { buffer: this.uniformBuffer, size: ArcToonDemo.SLOT_SIZE } }],
     });
   }
 
@@ -383,20 +418,16 @@ export class ToonDemo implements Demo {
       });
     };
 
-    // Head (face) - large sphere
+    // Head (face)
     addSphere(0, 1.2, 0, 0.6, 24, 16, "Face", 0, 1.0);
-    // Hair - slightly larger sphere on top/back
+    // Hair
     addSphere(0, 1.45, -0.1, 0.62, 20, 12, "Hair", 1, 1.2, 2, 1);
-    // Body - elongated sphere below
+    // Body
     addSphere(0, 0.1, 0, 0.5, 16, 12, "Body", 2, 0.8, 1, 3);
     // Left eye
     addSphere(-0.2, 1.25, 0.5, 0.12, 12, 8, "EyeL", 3, 0.5);
     // Right eye
     addSphere(0.2, 1.25, 0.5, 0.12, 12, 8, "EyeR", 3, 0.5);
-    // Left eyelash (thin strip above eye)
-    addSphere(-0.2, 1.35, 0.48, 0.08, 8, 4, "EyelashL", 4, 0.3, 2, 0.5);
-    // Right eyelash
-    addSphere(0.2, 1.35, 0.48, 0.08, 8, 4, "EyelashR", 4, 0.3, 2, 0.5);
 
     return {
       vertices: new Float32Array(allVerts),
@@ -435,11 +466,7 @@ export class ToonDemo implements Demo {
     );
     const invTransModel = mat4.transpose(mat4.inverse(model));
 
-    const fovRad = (this.camera.fov * Math.PI) / 180;
-    const fovCompensation = Math.tan(fovRad / 2);
-    const distanceFadeFactor = 0.15;
-
-    const visibility = [this.showFace, this.showHair, this.showBody, this.showEye, this.showEyelash];
+    const visibility = [this.showFace, this.showHair, this.showBody, this.showEye];
     let slot = 0;
     const ubo = this.uboScratch;
 
@@ -454,25 +481,33 @@ export class ToonDemo implements Demo {
       ubo[49] = this.camera.position[1];
       ubo[50] = this.camera.position[2];
       ubo[51] = 1.0;
-      ubo[52] = -0.4; ubo[53] = -1.0; ubo[54] = -0.3; ubo[55] = 0.0;
-      ubo[56] = time;
-      ubo[57] = this.outlineWidth * part.outlineScale;
-      ubo[58] = part.materialID;
-      ubo[59] = distanceFadeFactor;
-      ubo[60] = fovCompensation;
-      this.device.queue.writeBuffer(this.uniformBuffer, slot * ToonDemo.SLOT_SIZE, ubo as unknown as GPUAllowSharedBufferSource);
+      // Light direction (normalized)
+      const lightLen = Math.sqrt(0.4 * 0.4 + 1.0 * 1.0 + 0.3 * 0.3);
+      ubo[52] = -0.4 / lightLen;
+      ubo[53] = -1.0 / lightLen;
+      ubo[54] = -0.3 / lightLen;
+      ubo[55] = 0.0;
+      // Light color + intensity
+      ubo[56] = 3.0;
+      ubo[57] = 3.0;
+      ubo[58] = 3.0;
+      ubo[59] = 1.0;
+      ubo[60] = time;
+      ubo[61] = this.outlineWidth * part.outlineScale;
+      ubo[62] = part.materialID;
+      this.device.queue.writeBuffer(this.uniformBuffer, slot * ArcToonDemo.SLOT_SIZE, ubo as unknown as GPUAllowSharedBufferSource);
       (part as any)._outlineSlot = slot;
       slot++;
 
-      ubo[57] = this.outlineWidth;
-      this.device.queue.writeBuffer(this.uniformBuffer, slot * ToonDemo.SLOT_SIZE, ubo as unknown as GPUAllowSharedBufferSource);
+      ubo[61] = this.outlineWidth;
+      this.device.queue.writeBuffer(this.uniformBuffer, slot * ArcToonDemo.SLOT_SIZE, ubo as unknown as GPUAllowSharedBufferSource);
       (part as any)._toonSlot = slot;
       slot++;
     }
   }
 
   private buildRenderBundle() {
-    const visibility = [this.showFace, this.showHair, this.showBody, this.showEye, this.showEyelash];
+    const visibility = [this.showFace, this.showHair, this.showBody, this.showEye];
     const key = `${this.showOutline}|${visibility.join("")}`;
     if (key === this.lastVisibilityKey && this.renderBundle) return;
     this.lastVisibilityKey = key;
@@ -489,7 +524,7 @@ export class ToonDemo implements Demo {
       bundleEncoder.setPipeline(this.outlinePipeline);
       for (const part of this.parts) {
         if (!visibility[part.materialID]) continue;
-        bundleEncoder.setBindGroup(0, this.bindGroup, [(part as any)._outlineSlot * ToonDemo.SLOT_SIZE]);
+        bundleEncoder.setBindGroup(0, this.bindGroup, [(part as any)._outlineSlot * ArcToonDemo.SLOT_SIZE]);
         bundleEncoder.drawIndexed(part.count, 1, part.offset);
       }
     }
@@ -497,7 +532,7 @@ export class ToonDemo implements Demo {
     bundleEncoder.setPipeline(this.toonPipeline);
     for (const part of this.parts) {
       if (!visibility[part.materialID]) continue;
-      bundleEncoder.setBindGroup(0, this.bindGroup, [(part as any)._toonSlot * ToonDemo.SLOT_SIZE]);
+      bundleEncoder.setBindGroup(0, this.bindGroup, [(part as any)._toonSlot * ArcToonDemo.SLOT_SIZE]);
       bundleEncoder.drawIndexed(part.count, 1, part.offset);
     }
 
@@ -529,7 +564,7 @@ export class ToonDemo implements Demo {
 
   stats() {
     const visibleParts = this.parts.filter((p) =>
-      [this.showFace, this.showHair, this.showBody, this.showEye, this.showEyelash][p.materialID]
+      [this.showFace, this.showHair, this.showBody, this.showEye][p.materialID]
     );
     const drawCalls = visibleParts.length * (this.showOutline ? 2 : 1);
     const tris = visibleParts.reduce((sum, p) => sum + p.count / 3, 0) * (this.showOutline ? 2 : 1);
@@ -538,8 +573,8 @@ export class ToonDemo implements Demo {
       triangles: tris,
       custom: {
         "Materials": `${visibleParts.length} / ${this.parts.length}`,
-        "Outline": this.showOutline ? "Per-Material" : "Off",
-        "Shading": "Face/Hair/Body/Eye",
+        "Outline": this.showOutline ? "Arc Style" : "Off",
+        "Technique": "ILM + SSS + GGX",
       },
     };
   }
@@ -548,11 +583,10 @@ export class ToonDemo implements Demo {
     gui.add(this, "outlineWidth", 0.0, 5.0, 0.1).name("Outline Width");
     gui.add(this, "showOutline").name("Show Outline");
     const f = gui.addFolder("Material Visibility");
-    f.add(this, "showFace").name("Face (Skin)");
+    f.add(this, "showFace").name("Face (SSS)");
     f.add(this, "showHair").name("Hair (Aniso)");
     f.add(this, "showBody").name("Body (Banded)");
     f.add(this, "showEye").name("Eye (Reflective)");
-    f.add(this, "showEyelash").name("Eyelash (Depth)");
   }
 
   destroy() {

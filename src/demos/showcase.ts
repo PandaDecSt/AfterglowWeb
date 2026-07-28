@@ -330,7 +330,15 @@ export class ShowcaseDemo implements Demo {
 
     this.bloomPass.execute(encoder, sceneRT.texture, this.mipTargets, bloomRT.view);
 
-    this.postProcessPass.execute(
+    // Pass camera/light info to post-process
+    const pp = this.postProcessPass;
+    pp.cameraPos = [this.camera.position[0], this.camera.position[1], this.camera.position[2]];
+    const aspect = this.ctx.canvas.width / this.ctx.canvas.height;
+    const invVP = mat4.inverse(this.camera.getViewProjectionMatrix(aspect));
+    pp.invVP.set(invVP as unknown as ArrayLike<number>);
+    pp.lightDir = [-0.5, -1.0, -0.3];
+
+    pp.execute(
       encoder,
       bloomRT.texture,
       depthTarget.texture,
@@ -358,9 +366,17 @@ export class ShowcaseDemo implements Demo {
     const fxFolder = gui.addFolder("Post Process");
     fxFolder.add(pp, "exposure", 0.1, 3, 0.01).name("Exposure");
     fxFolder.add(pp, "chromaticStrength", 0, 0.02, 0.001).name("Chromatic Aberr.");
-    fxFolder.add(pp, "fogDensity", 0, 0.1, 0.001).name("Fog Density");
     fxFolder.add(pp, "vignetteStrength", 0, 1, 0.01).name("Vignette");
     fxFolder.add(pp, "saturation", 0, 2, 0.01).name("Saturation");
+    fxFolder.add(pp, "heightFogDensity", 0, 2, 0.01).name("Height Fog");
+    fxFolder.add(pp, "heightFogBlend", 0, 1, 0.01).name("Fog Blend");
+    fxFolder.add(pp, "dustIntensity", 0, 1, 0.01).name("Atmospheric Dust");
+    fxFolder.add(pp, "lightShaftIntensity", 0, 1, 0.01).name("Light Shaft");
+    fxFolder.add(pp, "lightShaftLayers", 1, 16, 1).name("Shaft Layers");
+    const lutFolder = gui.addFolder("Color Grading");
+    lutFolder.add(pp, "lutStrength", 0, 1, 0.01).name("LUT Strength");
+    lutFolder.add(pp, "contrast", 0.5, 2, 0.01).name("Contrast");
+    lutFolder.add(pp, "colorTemp", -1, 1, 0.01).name("Color Temp");
   }
 
   destroy() {

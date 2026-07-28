@@ -9,6 +9,7 @@ import {
   ParticleDemo,
   BoidDemo,
   ToonDemo,
+  ArcToonDemo,
   ShowcaseDemo,
   IndirectDrawDemo,
   PBRShadowDemo,
@@ -19,6 +20,7 @@ import {
   ShellFurDemo,
   GlitchedMosaicsDemo,
   GreedySnakeDemo,
+  MeteorographDemo,
 } from "./demos";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -33,6 +35,7 @@ const demoFactories: { label: string; create: () => Demo }[] = [
   { label: "GLB Viewer (Qin_DL)", create: () => new GLBViewerDemo() },
   { label: "PBR + Shadow", create: () => new PBRShadowDemo() },
   { label: "Toon (Multi-Material)", create: () => new ToonDemo() },
+  { label: "Arc Toon (ILM+SSS)", create: () => new ArcToonDemo() },
   { label: "Grass", create: () => new GrassDemo() },
   { label: "Water", create: () => new WaterDemo() },
   { label: "ShellFur", create: () => new ShellFurDemo() },
@@ -43,6 +46,7 @@ const demoFactories: { label: string; create: () => Demo }[] = [
   { label: "GlitchedMosaics", create: () => new GlitchedMosaicsDemo() },
   { label: "GreedySnake", create: () => new GreedySnakeDemo() },
   { label: "FractalNoise", create: () => new FractalNoiseDemo() },
+  { label: "Meteorograph (Weather)", create: () => new MeteorographDemo() },
   { label: "Showcase (Full Pipeline)", create: () => new ShowcaseDemo() },
 ];
 
