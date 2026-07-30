@@ -66,11 +66,20 @@ export class Camera {
     return mat4.lookAt(this.position, this.target, this.up);
   }
 
+  private _zRemap: Mat4 = (() => { const m = mat4.identity(mat4.create()); m[10] = 0.5; m[14] = 0.5; return m; })();
+
   getProjectionMatrix(aspect: number): Mat4 {
-    return mat4.perspective((this.fov * Math.PI) / 180, aspect, this.near, this.far);
+    return mat4.mul(this._zRemap, mat4.perspective((this.fov * Math.PI) / 180, aspect, this.near, this.far));
   }
 
   getViewProjectionMatrix(aspect: number): Mat4 {
     return mat4.mul(this.getProjectionMatrix(aspect), this.getViewMatrix());
+  }
+
+  orbit(target: Vec3, distance: number, near?: number, far?: number): void {
+    this.target = target;
+    this.distance = distance;
+    if (near !== undefined) this.near = near;
+    if (far !== undefined) this.far = far;
   }
 }

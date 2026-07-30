@@ -19,6 +19,12 @@ export class Skeleton {
   worldMatrices: Float32Array;
   inverseBindMatrices: Float32Array;
 
+  private _tmpMat = mat4.create();
+  private _tmpPos = vec3.create();
+  private _tmpRot = quat.create();
+  private _tmpScl = vec3.create();
+  private _tmpLocal = mat4.create();
+
   constructor(descs: BoneDesc[], inverseBindMatrices?: Float32Array) {
     this.boneCount = descs.length;
     this.boneNames = descs.map((d) => d.name);
@@ -48,13 +54,13 @@ export class Skeleton {
       this.localScales[i * 3 + 2] = d.scale[2];
     }
 
+    this.updateWorldMatrices();
+
     if (inverseBindMatrices) {
       this.inverseBindMatrices.set(inverseBindMatrices);
     } else {
       this.computeInverseBindMatrices();
     }
-
-    this.updateWorldMatrices();
   }
 
   getBoneIndex(name: string): number {
@@ -79,40 +85,35 @@ export class Skeleton {
   }
 
   updateWorldMatrices(): void {
-    const tmpMat = mat4.create();
-
     for (let i = 0; i < this.boneCount; i++) {
-      const pos = vec3.create(
-        this.localPositions[i * 3],
-        this.localPositions[i * 3 + 1],
-        this.localPositions[i * 3 + 2]
-      );
-      const rot = quat.create(
-        this.localRotations[i * 4],
-        this.localRotations[i * 4 + 1],
-        this.localRotations[i * 4 + 2],
-        this.localRotations[i * 4 + 3]
-      );
-      const scl = vec3.create(
-        this.localScales[i * 3],
-        this.localScales[i * 3 + 1],
-        this.localScales[i * 3 + 2]
-      );
+      const off3 = i * 3;
+      const off4 = i * 4;
+      this._tmpPos[0] = this.localPositions[off3];
+      this._tmpPos[1] = this.localPositions[off3 + 1];
+      this._tmpPos[2] = this.localPositions[off3 + 2];
+      this._tmpRot[0] = this.localRotations[off4];
+      this._tmpRot[1] = this.localRotations[off4 + 1];
+      this._tmpRot[2] = this.localRotations[off4 + 2];
+      this._tmpRot[3] = this.localRotations[off4 + 3];
+      this._tmpScl[0] = this.localScales[off3];
+      this._tmpScl[1] = this.localScales[off3 + 1];
+      this._tmpScl[2] = this.localScales[off3 + 2];
 
-      const localMat = mat4.identity(mat4.create());
-      mat4.translate(localMat, pos, localMat);
-      mat4.multiply(localMat, mat4.fromQuat(mat4.create(), rot), localMat);
-      mat4.scale(localMat, scl, localMat);
+      mat4.identity(this._tmpLocal);
+      mat4.translate(this._tmpLocal, this._tmpPos, this._tmpLocal);
+      // 这个注释代码是错误的：mat4.multiply(this._tmpLocal, mat4.fromQuat(this._tmpMat, this._tmpRot), this._tmpLocal);
+      mat4.multiply(this._tmpLocal, mat4.fromQuat(this._tmpRot, this._tmpMat), this._tmpLocal);
+      mat4.scale(this._tmpLocal, this._tmpScl, this._tmpLocal);
 
       const parentIdx = this.parentIndices[i];
       if (parentIdx >= 0 && parentIdx < i) {
         const parentWorld = this.getWorldMatrix(parentIdx);
-        mat4.multiply(parentWorld, localMat, tmpMat);
+        mat4.multiply(parentWorld, this._tmpLocal, this._tmpMat);
       } else {
-        mat4.copy(localMat, tmpMat);
+        mat4.copy(this._tmpLocal, this._tmpMat);
       }
 
-      this.worldMatrices.set(tmpMat, i * 16);
+      this.worldMatrices.set(this._tmpMat, i * 16);
     }
   }
 
@@ -125,16 +126,11 @@ export class Skeleton {
   }
 
   computeSkinMatrices(out: Float32Array): void {
-    const tmpMat = mat4.create();
     for (let i = 0; i < this.boneCount; i++) {
       const world = this.getWorldMatrix(i);
       const ibm = this.inverseBindMatrices.subarray(i * 16, i * 16 + 16);
-      mat4.multiply(
-        world,
-        ibm as unknown as Mat4,
-        tmpMat
-      );
-      out.set(tmpMat, i * 16);
+      mat4.multiply(world, ibm as unknown as Mat4, this._tmpMat);
+      out.set(this._tmpMat, i * 16);
     }
   }
 }

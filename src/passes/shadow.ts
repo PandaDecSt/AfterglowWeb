@@ -87,7 +87,12 @@ export class ShadowMap {
     const view = mat4.lookAt(this.lightPosition, this.lightTarget, up);
     const half = this.orthoSize / 2;
     const proj = mat4.ortho(-half, half, -half, half, this.near, this.far);
-    this.lightVP = mat4.multiply(proj, view);
+
+    const remap = mat4.identity(mat4.create());
+    remap[10] = 0.5;
+    remap[14] = 0.5;
+
+    this.lightVP = mat4.multiply(remap, mat4.multiply(proj, view));
 
     this.uniformData.set(this.lightVP as unknown as ArrayLike<number>, 0);
     this.device.queue.writeBuffer(
@@ -141,15 +146,9 @@ fn sampleShadowPCF(
   bias: f32
 ) -> f32 {
   let lightPos = lightVP * vec4<f32>(worldPos, 1.0);
-  let shadowCoord = lightPos.xy / lightPos.w * 0.5 + 0.5;
-
-  if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
-      shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
-      lightPos.z > 1.0) {
-    return 1.0;
-  }
-
+  let shadowCoord = clamp(lightPos.xy / lightPos.w * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
   let depth = lightPos.z / lightPos.w - bias;
+
   let texelSize = 1.0 / vec2<f32>(textureDimensions(shadowTexture));
 
   var shadow = 0.0;
@@ -158,7 +157,7 @@ fn sampleShadowPCF(
       let offset = vec2<f32>(f32(x), f32(y)) * texelSize;
       shadow += textureSampleCompare(
         shadowTexture, shadowSampler,
-        shadowCoord + offset, depth
+        clamp(shadowCoord + offset, vec2<f32>(0.0), vec2<f32>(1.0)), depth
       );
     }
   }
