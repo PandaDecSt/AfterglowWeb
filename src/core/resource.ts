@@ -3,9 +3,23 @@ export class ResourceManager {
   private buffers = new Map<string, GPUBuffer>();
   private textures = new Map<string, GPUTexture>();
   private samplers = new Map<string, GPUSampler>();
+  private namespace: string;
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, namespace = "") {
     this.device = device;
+    this.namespace = namespace;
+  }
+
+  private ns(label: string): string {
+    return this.namespace ? `${this.namespace}:${label}` : label;
+  }
+
+  withNamespace(ns: string): ResourceManager {
+    const child = new ResourceManager(this.device, ns);
+    child.buffers = this.buffers;
+    child.textures = this.textures;
+    child.samplers = this.samplers;
+    return child;
   }
 
   createBuffer(
@@ -14,8 +28,9 @@ export class ResourceManager {
     usage: GPUBufferUsageFlags,
     data?: ArrayBufferView
   ): GPUBuffer {
+    const key = this.ns(label);
     const buffer = this.device.createBuffer({
-      label,
+      label: key,
       size: Math.max(size, 4),
       usage: usage | GPUBufferUsage.COPY_DST,
       mappedAtCreation: !!data,
@@ -25,7 +40,7 @@ export class ResourceManager {
       dst.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
       buffer.unmap();
     }
-    this.buffers.set(label, buffer);
+    this.buffers.set(key, buffer);
     return buffer;
   }
 
@@ -39,7 +54,7 @@ export class ResourceManager {
   }
 
   updateBuffer(label: string, data: ArrayBufferView, offset = 0) {
-    const buffer = this.buffers.get(label);
+    const buffer = this.buffers.get(this.ns(label));
     if (buffer) {
       this.device.queue.writeBuffer(buffer, offset, data as GPUAllowSharedBufferSource);
     }
@@ -49,12 +64,13 @@ export class ResourceManager {
     label: string,
     url: string
   ): Promise<GPUTexture> {
+    const key = this.ns(label);
     const response = await fetch(url);
     const blob = await response.blob();
     const bitmap = await createImageBitmap(blob);
 
     const texture = this.device.createTexture({
-      label,
+      label: key,
       size: [bitmap.width, bitmap.height],
       format: "rgba8unorm",
       usage:
@@ -69,27 +85,28 @@ export class ResourceManager {
       [bitmap.width, bitmap.height]
     );
 
-    this.textures.set(label, texture);
+    this.textures.set(key, texture);
     bitmap.close();
     return texture;
   }
 
   createSampler(label: string, desc?: GPUSamplerDescriptor): GPUSampler {
+    const key = this.ns(label);
     const sampler = this.device.createSampler(desc);
-    this.samplers.set(label, sampler);
+    this.samplers.set(key, sampler);
     return sampler;
   }
 
   getBuffer(label: string) {
-    return this.buffers.get(label);
+    return this.buffers.get(this.ns(label));
   }
 
   getTexture(label: string) {
-    return this.textures.get(label);
+    return this.textures.get(this.ns(label));
   }
 
   getSampler(label: string) {
-    return this.samplers.get(label);
+    return this.samplers.get(this.ns(label));
   }
 
   destroy() {

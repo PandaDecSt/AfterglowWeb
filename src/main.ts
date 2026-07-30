@@ -118,6 +118,8 @@ async function main() {
   function switchDemo(index: number) {
     renderer.stop();
     renderer.clearPasses();
+    engine.graph.clearPasses();
+    renderer.disableGraph();
 
     if (currentDemo) {
       currentDemo.destroy();
@@ -135,9 +137,14 @@ async function main() {
     const setupDemo = () => {
       registerDemoShaders(demo);
 
-      const passes = demo.createPasses();
-      for (const pass of passes) {
-        renderer.addPass(pass);
+      if (demo.setupGraph) {
+        demo.setupGraph(engine.graph);
+        renderer.enableGraph(ctx.device);
+      } else {
+        const passes = demo.createPasses();
+        for (const pass of passes) {
+          renderer.addPass(pass);
+        }
       }
 
       if (demo.registerGUI) {

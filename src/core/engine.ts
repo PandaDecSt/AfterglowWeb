@@ -5,6 +5,7 @@ import { BindGroupCache } from "./bindgroup-cache";
 import { AutoBinder } from "./auto-bind";
 import { ShaderHotReload } from "../shader/hotreload";
 import { ShaderModuleSystem } from "../shader/module-system";
+import { RenderGraph } from "./render-graph";
 
 export class EngineContext {
   readonly gpu: GPUContext;
@@ -15,6 +16,7 @@ export class EngineContext {
   readonly autoBind: AutoBinder;
   readonly shaderReload: ShaderHotReload;
   readonly modules: ShaderModuleSystem;
+  readonly graph: RenderGraph;
 
   constructor(gpu: GPUContext) {
     this.gpu = gpu;
@@ -25,6 +27,7 @@ export class EngineContext {
     this.autoBind = new AutoBinder(gpu.device, this.resources);
     this.shaderReload = new ShaderHotReload();
     this.modules = new ShaderModuleSystem();
+    this.graph = new RenderGraph(gpu.device);
   }
 
   compileShader(label: string, code: string): GPUShaderModule {

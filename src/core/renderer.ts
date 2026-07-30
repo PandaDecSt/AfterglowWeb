@@ -1,4 +1,5 @@
 import { GPUContext } from "./device";
+import { RenderGraph } from "./render-graph";
 
 export interface RenderContext {
   device: GPUDevice;
@@ -17,6 +18,8 @@ export interface RenderPass {
 export class Renderer {
   private gpu: GPUContext;
   private passes: RenderPass[] = [];
+  private graph: RenderGraph | null = null;
+  private useGraph = false;
   private frameIndex = 0;
   private startTime = performance.now();
   private lastTime = this.startTime;
@@ -27,6 +30,20 @@ export class Renderer {
 
   constructor(gpu: GPUContext) {
     this.gpu = gpu;
+  }
+
+  get renderGraph(): RenderGraph | null {
+    return this.graph;
+  }
+
+  enableGraph(device: GPUDevice): RenderGraph {
+    this.graph = new RenderGraph(device);
+    this.useGraph = true;
+    return this.graph;
+  }
+
+  disableGraph(): void {
+    this.useGraph = false;
   }
 
   addPass(pass: RenderPass) {
@@ -63,9 +80,16 @@ export class Renderer {
 
     this.onUpdate?.(ctx);
 
-    if (this.passes.length > 0) {
+    const hasGraphPasses = this.graph && this.graph.getPassCount() > 0;
+    const hasSimplePasses = this.passes.length > 0;
+
+    if (hasGraphPasses || hasSimplePasses) {
       const encoder = this.gpu.device.createCommandEncoder();
       const view = this.gpu.context.getCurrentTexture().createView();
+
+      if (this.useGraph && hasGraphPasses) {
+        this.graph!.execute(encoder, view, ctx);
+      }
 
       for (const pass of this.passes) {
         pass.execute(encoder, view, ctx);
