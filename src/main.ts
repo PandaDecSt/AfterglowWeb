@@ -26,6 +26,7 @@ import {
   TerrainHydrologyDemo,
   ACESPipelineDemo,
   HairEyeShadowDemo,
+  PMXDemo,
 } from "./demos";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -57,6 +58,7 @@ const demoFactories: { label: string; create: () => Demo }[] = [
   { label: "ACES Pipeline", create: () => new ACESPipelineDemo() },
   { label: "Hair/Eye Shadow", create: () => new HairEyeShadowDemo() },
   { label: "Showcase (Full Pipeline)", create: () => new ShowcaseDemo() },
+  { label: "PMX Viewer", create: () => new PMXDemo() },
 ];
 
 async function main() {

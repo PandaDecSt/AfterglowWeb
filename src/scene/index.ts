@@ -1,0 +1,13 @@
+export { Skeleton } from "./skeleton";
+export type { BoneDesc } from "./skeleton";
+export { Skinning } from "./skinning";
+export { AnimationClip, sampleTrack } from "./animation-clip";
+export type { Keyframe, BoneTrack, MorphTrack, TrackType } from "./animation-clip";
+export { AnimationPlayer } from "./animation-player";
+export type { AnimationSlot } from "./animation-player";
+export { MorphTarget } from "./morph-target";
+export type { MorphDesc } from "./morph-target";
+export { SkinnedMesh } from "./skinned-mesh";
+export { Entity, Scene } from "./entity";
+export type { Component } from "./entity";
+export { Camera } from "./camera";

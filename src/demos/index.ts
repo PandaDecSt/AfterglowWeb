@@ -18,4 +18,5 @@ export { ToonTexturedDemo } from "./toon-textured";
 export { TerrainHydrologyDemo } from "./terrain-hydrology";
 export { ACESPipelineDemo } from "./aces-pipeline";
 export { HairEyeShadowDemo } from "./hair-eye-shadow";
+export { PMXDemo } from "./pmx-viewer";
 export type { Demo } from "./types";

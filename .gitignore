@@ -3,6 +3,7 @@ dist/
 original/
 *.glb
 .arts/
+scripts/
 test-errors.txt
 test-output.txt
 test-screenshots/
