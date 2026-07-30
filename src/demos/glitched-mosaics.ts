@@ -1,6 +1,7 @@
 import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
+import type { RenderPass } from "../core/renderer";
 
 const GRID_SIZE = 64;
 
@@ -209,25 +210,30 @@ export class GlitchedMosaicsDemo implements Demo {
     this.device.queue.writeBuffer(this.renderUniformBuffer, 0, new Float32Array([time, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(this.computePipeline);
-    computePass.setBindGroup(0, this.computeBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(GRID_SIZE / 8), Math.ceil(GRID_SIZE / 8));
-    computePass.end();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        const computePass = encoder.beginComputePass();
+        computePass.setPipeline(this.computePipeline);
+        computePass.setBindGroup(0, this.computeBindGroup);
+        computePass.dispatchWorkgroups(Math.ceil(GRID_SIZE / 8), Math.ceil(GRID_SIZE / 8));
+        computePass.end();
 
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroup);
-    renderPass.draw(3);
-    renderPass.end();
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroup);
+        renderPass.draw(3);
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

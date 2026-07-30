@@ -2,6 +2,7 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
+import type { RenderPass } from "../core/renderer";
 
 const multiToonShader = `
 struct Uniforms {
@@ -504,27 +505,32 @@ export class ToonDemo implements Demo {
     this.renderBundle = bundleEncoder.finish();
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    this.ensureDepth();
-    this.buildRenderBundle();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        this.ensureDepth();
+        this.buildRenderBundle();
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.9, g: 0.91, b: 0.94, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-      depthStencilAttachment: {
-        view: this.cachedDepthView!,
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.9, g: 0.91, b: 0.94, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+          depthStencilAttachment: {
+            view: this.cachedDepthView!,
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+          },
+        });
+
+        pass.executeBundles([this.renderBundle!]);
+        pass.end();
       },
-    });
-
-    pass.executeBundles([this.renderBundle!]);
-    pass.end();
+    }];
   }
 
   stats() {

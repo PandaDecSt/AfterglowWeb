@@ -1,5 +1,6 @@
 import { GPUContext } from "./core/device";
 import { EngineContext } from "./core/engine";
+import { Renderer } from "./core/renderer";
 import { Camera } from "./scene/camera";
 import { PerfHUD } from "./ui/perf-hud";
 import { DebugPanel } from "./ui/debug-panel";
@@ -74,6 +75,7 @@ async function main() {
 
   const engine = new EngineContext(ctx);
   const camera = new Camera(canvas);
+  const renderer = new Renderer(ctx);
 
   engine.modules.registerModule("pbr", PBR_MODULE);
 
@@ -96,9 +98,6 @@ async function main() {
 
   let demoFolder: ReturnType<typeof panel.addFolder> | null = null;
   let currentDemo: Demo | null = null;
-  let startTime = performance.now();
-  let lastTime = startTime;
-  let animId = 0;
 
   function registerDemoShaders(demo: Demo) {
     engine.shaderReload.clear();
@@ -117,6 +116,9 @@ async function main() {
   }
 
   function switchDemo(index: number) {
+    renderer.stop();
+    renderer.clearPasses();
+
     if (currentDemo) {
       currentDemo.destroy();
       currentDemo = null;
@@ -130,52 +132,43 @@ async function main() {
     const demo = demoFactories[index].create();
     const result = demo.init(ctx, camera, engine);
 
-    const setupGUI = () => {
+    const setupDemo = () => {
+      registerDemoShaders(demo);
+
+      const passes = demo.createPasses();
+      for (const pass of passes) {
+        renderer.addPass(pass);
+      }
+
       if (demo.registerGUI) {
         if (demoFolder) { demoFolder.destroy(); demoFolder = null; }
         demoFolder = panel.addFolder(demo.label);
         demo.registerGUI(demoFolder);
       }
+
+      renderer.resetTime();
+      renderer.start();
     };
 
     if (result instanceof Promise) {
-      result.then(() => {
-        registerDemoShaders(demo);
-        setupGUI();
-      });
+      result.then(setupDemo);
     } else {
-      registerDemoShaders(demo);
-      setupGUI();
+      setupDemo();
     }
     currentDemo = demo;
-    startTime = performance.now();
-    lastTime = startTime;
   }
 
-  function frame() {
-    if (!currentDemo) {
-      animId = requestAnimationFrame(frame);
-      return;
-    }
-
+  // Wire demo lifecycle into renderer hooks
+  renderer.onUpdate = (renderCtx) => {
+    if (!currentDemo) return;
     hud.begin();
+    currentDemo.update(renderCtx.time, renderCtx.deltaTime);
+  };
 
-    const now = performance.now();
-    const time = (now - startTime) / 1000;
-    const deltaTime = (now - lastTime) / 1000;
-    lastTime = now;
-
-    currentDemo.update(time, deltaTime);
-
-    const encoder = ctx.device.createCommandEncoder();
-    const view = ctx.context.getCurrentTexture().createView();
-    currentDemo.render(encoder, view);
-    ctx.device.queue.submit([encoder.finish()]);
-
+  renderer.onPostSubmit = () => {
+    if (!currentDemo) return;
     hud.end(currentDemo.stats?.());
-
-    animId = requestAnimationFrame(frame);
-  }
+  };
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "h" || e.key === "H") hud.toggle();
@@ -243,7 +236,6 @@ async function main() {
   document.body.appendChild(hint);
 
   switchDemo(0);
-  frame();
 
   console.log("[AfterglowWeb] Engine started. Press H for HUD, G for GUI.");
 }

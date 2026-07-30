@@ -2,6 +2,7 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
+import type { RenderPass } from "../core/renderer";
 
 const INSTANCE_COUNT = 10000;
 
@@ -357,43 +358,48 @@ export class IndirectDrawDemo implements Demo {
     }
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    this.ensureDepth();
-    this.ensureBindGroups();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        this.ensureDepth();
+        this.ensureBindGroups();
 
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(this.cullPipeline);
-    computePass.setBindGroup(0, this.cullBindGroups[this.current]);
-    computePass.dispatchWorkgroups(Math.ceil(INSTANCE_COUNT / 256));
-    computePass.setPipeline(this.finalizePipeline);
-    computePass.setBindGroup(0, this.cullBindGroups[this.current]);
-    computePass.dispatchWorkgroups(1);
-    computePass.end();
+        const computePass = encoder.beginComputePass();
+        computePass.setPipeline(this.cullPipeline);
+        computePass.setBindGroup(0, this.cullBindGroups[this.current]);
+        computePass.dispatchWorkgroups(Math.ceil(INSTANCE_COUNT / 256));
+        computePass.setPipeline(this.finalizePipeline);
+        computePass.setBindGroup(0, this.cullBindGroups[this.current]);
+        computePass.dispatchWorkgroups(1);
+        computePass.end();
 
-    this.current = 1 - this.current;
+        this.current = 1 - this.current;
 
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view,
-          clearValue: { r: 0.02, g: 0.02, b: 0.04, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
-      depthStencilAttachment: {
-        view: this.cachedDepthView!,
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view,
+              clearValue: { r: 0.02, g: 0.02, b: 0.04, a: 1 },
+              loadOp: "clear",
+              storeOp: "store",
+            },
+          ],
+          depthStencilAttachment: {
+            view: this.cachedDepthView!,
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+          },
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroups[this.current]);
+        renderPass.setVertexBuffer(0, this.vertexBuffer);
+        renderPass.setIndexBuffer(this.indexBuffer, "uint16");
+        renderPass.drawIndexedIndirect(this.drawArgsBuffer, 0);
+        renderPass.end();
       },
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroups[this.current]);
-    renderPass.setVertexBuffer(0, this.vertexBuffer);
-    renderPass.setIndexBuffer(this.indexBuffer, "uint16");
-    renderPass.drawIndexedIndirect(this.drawArgsBuffer, 0);
-    renderPass.end();
+    }];
   }
 
   private extractFrustumPlanes(vp: number[]): number[][] {

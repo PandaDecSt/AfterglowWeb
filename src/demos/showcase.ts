@@ -7,6 +7,7 @@ import { PostProcessPass } from "../passes/post-process";
 import { createCubeGeometry } from "../utils/geometry";
 import { mat4 } from "wgpu-matrix";
 import type { EngineContext } from "../core/engine";
+import type { RenderPass } from "../core/renderer";
 
 const sceneVS = `
 struct Uniforms {
@@ -295,57 +296,62 @@ export class ShowcaseDemo implements Demo {
     this.bloomPass.bloomIntensity = this.bloomIntensity;
   }
 
-  render(encoder: GPUCommandEncoder, screenView: GPUTextureView) {
-    this.passManager.resize(this.ctx.canvas.width, this.ctx.canvas.height);
-    this.ensureMipTargets();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, screenView: GPUTextureView) => {
+        this.passManager.resize(this.ctx.canvas.width, this.ctx.canvas.height);
+        this.ensureMipTargets();
 
-    const sceneRT = this.passManager.getOrCreateTarget("scene-color", "rgba16float");
-    const depthTarget = this.passManager.getOrCreateDepth("scene-depth");
-    const bloomRT = this.passManager.getOrCreateTarget("bloom-combined", "rgba16float");
+        const sceneRT = this.passManager.getOrCreateTarget("scene-color", "rgba16float");
+        const depthTarget = this.passManager.getOrCreateDepth("scene-depth");
+        const bloomRT = this.passManager.getOrCreateTarget("bloom-combined", "rgba16float");
 
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: sceneRT.view,
-            clearValue: { r: 0.01, g: 0.01, b: 0.02, a: 1 },
-            loadOp: "clear",
-            storeOp: "store",
-          },
-        ],
-        depthStencilAttachment: {
-          view: depthTarget.view,
-          depthClearValue: 1.0,
-          depthLoadOp: "clear",
-          depthStoreOp: "store",
-        },
-      });
-      pass.setPipeline(this.scenePipeline);
-      pass.setBindGroup(0, this.bindGroup);
-      pass.setVertexBuffer(0, this.vertexBuffer);
-      pass.setIndexBuffer(this.indexBuffer, "uint16");
-      pass.drawIndexed(this.indexCount);
-      pass.end();
-    }
+        {
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [
+              {
+                view: sceneRT.view,
+                clearValue: { r: 0.01, g: 0.01, b: 0.02, a: 1 },
+                loadOp: "clear",
+                storeOp: "store",
+              },
+            ],
+            depthStencilAttachment: {
+              view: depthTarget.view,
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "store",
+            },
+          });
+          pass.setPipeline(this.scenePipeline);
+          pass.setBindGroup(0, this.bindGroup);
+          pass.setVertexBuffer(0, this.vertexBuffer);
+          pass.setIndexBuffer(this.indexBuffer, "uint16");
+          pass.drawIndexed(this.indexCount);
+          pass.end();
+        }
 
-    this.bloomPass.execute(encoder, sceneRT.texture, this.mipTargets, bloomRT.view);
+        this.bloomPass.execute(encoder, sceneRT.texture, this.mipTargets, bloomRT.view);
 
-    // Pass camera/light info to post-process
-    const pp = this.postProcessPass;
-    pp.cameraPos = [this.camera.position[0], this.camera.position[1], this.camera.position[2]];
-    const aspect = this.ctx.canvas.width / this.ctx.canvas.height;
-    const invVP = mat4.inverse(this.camera.getViewProjectionMatrix(aspect));
-    pp.invVP.set(invVP as unknown as ArrayLike<number>);
-    pp.lightDir = [-0.5, -1.0, -0.3];
+        // Pass camera/light info to post-process
+        const pp = this.postProcessPass;
+        pp.cameraPos = [this.camera.position[0], this.camera.position[1], this.camera.position[2]];
+        const aspect = this.ctx.canvas.width / this.ctx.canvas.height;
+        const invVP = mat4.inverse(this.camera.getViewProjectionMatrix(aspect));
+        pp.invVP.set(invVP as unknown as ArrayLike<number>);
+        pp.lightDir = [-0.5, -1.0, -0.3];
 
-    pp.execute(
-      encoder,
-      bloomRT.texture,
-      depthTarget.texture,
-      screenView,
-      [this.ctx.canvas.width, this.ctx.canvas.height],
-      performance.now() / 1000
-    );
+        pp.execute(
+          encoder,
+          bloomRT.texture,
+          depthTarget.texture,
+          screenView,
+          [this.ctx.canvas.width, this.ctx.canvas.height],
+          performance.now() / 1000
+        );
+      },
+    }];
   }
 
   stats() {

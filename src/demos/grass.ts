@@ -3,6 +3,7 @@ import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { GPUTerrain } from "../utils/gpu-terrain";
 import { GPUWindField } from "../utils/gpu-wind-field";
+import type { RenderPass } from "../core/renderer";
 
 const GRASS_COUNT = 65536;
 const BLADE_SEGMENTS = 4;
@@ -325,40 +326,45 @@ export class GrassDemo implements Demo {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, this.uniformData as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    if (!this.terrainInitialized) {
-      this.terrain.dispatchOnce(encoder);
-      this.terrainInitialized = true;
-    }
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        if (!this.terrainInitialized) {
+          this.terrain.dispatchOnce(encoder);
+          this.terrainInitialized = true;
+        }
 
-    this.windField.dispatch(encoder, performance.now() / 1000);
+        this.windField.dispatch(encoder, performance.now() / 1000);
 
-    // Update grass instances
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(this.computePipeline);
-    computePass.setBindGroup(0, this.computeBindGroup);
-    computePass.dispatchWorkgroups(Math.ceil(GRASS_COUNT / 256));
-    computePass.end();
+        // Update grass instances
+        const computePass = encoder.beginComputePass();
+        computePass.setPipeline(this.computePipeline);
+        computePass.setBindGroup(0, this.computeBindGroup);
+        computePass.dispatchWorkgroups(Math.ceil(GRASS_COUNT / 256));
+        computePass.end();
 
-    // Render grass
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.4, g: 0.6, b: 0.8, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-      depthStencilAttachment: {
-        view: this.depthTexture.createView(),
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
+        // Render grass
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.4, g: 0.6, b: 0.8, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+          depthStencilAttachment: {
+            view: this.depthTexture.createView(),
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+          },
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroup);
+        renderPass.draw(GRASS_COUNT * BLADE_VERTS);
+        renderPass.end();
       },
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroup);
-    renderPass.draw(GRASS_COUNT * BLADE_VERTS);
-    renderPass.end();
+    }];
   }
 
   stats() {

@@ -1,6 +1,7 @@
 import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
+import type { RenderPass } from "../core/renderer";
 
 const METEO_SIZE = 128;
 
@@ -471,61 +472,66 @@ export class MeteorographDemo implements Demo {
     this.frameCount++;
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    const deltaTime = 1 / 60;
-    const d = new Float32Array(8);
-    d[0] = METEO_SIZE;
-    d[1] = performance.now() / 1000;
-    d[2] = deltaTime * this.simulationSpeed;
-    d[3] = this.windSourceIntensity;
-    d[4] = this.evaporationRate;
-    d[5] = this.rainCapacity;
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        const deltaTime = 1 / 60;
+        const d = new Float32Array(8);
+        d[0] = METEO_SIZE;
+        d[1] = performance.now() / 1000;
+        d[2] = deltaTime * this.simulationSpeed;
+        d[3] = this.windSourceIntensity;
+        d[4] = this.evaporationRate;
+        d[5] = this.rainCapacity;
 
-    // Multiple simulation steps per frame
-    const steps = Math.max(1, Math.round(this.simulationSpeed));
-    for (let i = 0; i < steps; i++) {
-      this.device.queue.writeBuffer(this.paramBuffer, 0, d);
+        // Multiple simulation steps per frame
+        const steps = Math.max(1, Math.round(this.simulationSpeed));
+        for (let i = 0; i < steps; i++) {
+          this.device.queue.writeBuffer(this.paramBuffer, 0, d);
 
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(this.updatePipeline);
-      pass.setBindGroup(0, this.useBufferA ? this.updateBindGroupA : this.updateBindGroupB);
-      pass.dispatchWorkgroups(Math.ceil(METEO_SIZE / 16), Math.ceil(METEO_SIZE / 16));
-      pass.end();
-      this.useBufferA = !this.useBufferA;
-    }
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(this.updatePipeline);
+          pass.setBindGroup(0, this.useBufferA ? this.updateBindGroupA : this.updateBindGroupB);
+          pass.dispatchWorkgroups(Math.ceil(METEO_SIZE / 16), Math.ceil(METEO_SIZE / 16));
+          pass.end();
+          this.useBufferA = !this.useBufferA;
+        }
 
-    // Update visualize bind group to read from current buffer
-    const currentBuffer = this.useBufferA ? this.meteoBufferA : this.meteoBufferB;
-    this.visualizeBindGroup = this.device.createBindGroup({
-      layout: this.visualizePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.paramBuffer } },
-        { binding: 1, resource: { buffer: currentBuffer } },
-        { binding: 2, resource: this.sampler },
-        { binding: 3, resource: this.outputView },
-      ],
-    });
+        // Update visualize bind group to read from current buffer
+        const currentBuffer = this.useBufferA ? this.meteoBufferA : this.meteoBufferB;
+        this.visualizeBindGroup = this.device.createBindGroup({
+          layout: this.visualizePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: this.paramBuffer } },
+            { binding: 1, resource: { buffer: currentBuffer } },
+            { binding: 2, resource: this.sampler },
+            { binding: 3, resource: this.outputView },
+          ],
+        });
 
-    // Visualize
-    const visPass = encoder.beginComputePass();
-    visPass.setPipeline(this.visualizePipeline);
-    visPass.setBindGroup(0, this.visualizeBindGroup);
-    visPass.dispatchWorkgroups(Math.ceil(METEO_SIZE / 16), Math.ceil(METEO_SIZE / 16));
-    visPass.end();
+        // Visualize
+        const visPass = encoder.beginComputePass();
+        visPass.setPipeline(this.visualizePipeline);
+        visPass.setBindGroup(0, this.visualizeBindGroup);
+        visPass.dispatchWorkgroups(Math.ceil(METEO_SIZE / 16), Math.ceil(METEO_SIZE / 16));
+        visPass.end();
 
-    // Render to screen
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroup);
-    renderPass.draw(3);
-    renderPass.end();
+        // Render to screen
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0, g: 0, b: 0, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroup);
+        renderPass.draw(3);
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

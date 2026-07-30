@@ -2,6 +2,7 @@ node_modules/
 dist/
 original/
 *.glb
+.arts/
 test-errors.txt
 test-output.txt
 test-screenshots/

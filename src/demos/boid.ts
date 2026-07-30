@@ -2,6 +2,7 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { GPUTerrain } from "../utils/gpu-terrain";
+import type { RenderPass } from "../core/renderer";
 
 const BOID_COUNT = 512;
 
@@ -517,41 +518,46 @@ export class BoidDemo implements Demo {
     this.device.queue.writeBuffer(this.renderUniformBuffer, 0, this.renderData as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    if (!this.initialized) {
-      this.terrain.dispatchOnce(encoder);
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        if (!this.initialized) {
+          this.terrain.dispatchOnce(encoder);
 
-      this.device.queue.writeBuffer(this.initUniformBuffer, 0, new Float32Array([BOID_COUNT, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
-      const initPass = encoder.beginComputePass();
-      initPass.setPipeline(this.initPipeline);
-      initPass.setBindGroup(0, this.initBindGroup);
-      initPass.dispatchWorkgroups(Math.ceil(BOID_COUNT / 256));
-      initPass.end();
-      this.initialized = true;
-    }
+          this.device.queue.writeBuffer(this.initUniformBuffer, 0, new Float32Array([BOID_COUNT, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
+          const initPass = encoder.beginComputePass();
+          initPass.setPipeline(this.initPipeline);
+          initPass.setBindGroup(0, this.initBindGroup);
+          initPass.dispatchWorkgroups(Math.ceil(BOID_COUNT / 256));
+          initPass.end();
+          this.initialized = true;
+        }
 
-    // Simulate
-    const simPass = encoder.beginComputePass();
-    simPass.setPipeline(this.computePipeline);
-    simPass.setBindGroup(0, this.computeBindGroups[this.current]);
-    simPass.dispatchWorkgroups(Math.ceil(BOID_COUNT / 256));
-    simPass.end();
+        // Simulate
+        const simPass = encoder.beginComputePass();
+        simPass.setPipeline(this.computePipeline);
+        simPass.setBindGroup(0, this.computeBindGroups[this.current]);
+        simPass.dispatchWorkgroups(Math.ceil(BOID_COUNT / 256));
+        simPass.end();
 
-    this.current = 1 - this.current;
+        this.current = 1 - this.current;
 
-    // Render
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.03, g: 0.03, b: 0.08, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroups[this.current]);
-    renderPass.draw(BOID_COUNT * 18);
-    renderPass.end();
+        // Render
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.03, g: 0.03, b: 0.08, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroups[this.current]);
+        renderPass.draw(BOID_COUNT * 18);
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

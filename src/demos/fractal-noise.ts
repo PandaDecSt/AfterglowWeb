@@ -1,6 +1,7 @@
 import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
+import type { RenderPass } from "../core/renderer";
 
 const NOISE_SIZE = 256;
 
@@ -267,21 +268,26 @@ export class FractalNoiseDemo implements Demo {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view,
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
-    });
-    pass.setPipeline(this.displayPipeline);
-    pass.setBindGroup(0, this.displayBindGroup);
-    pass.draw(6);
-    pass.end();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [
+            {
+              view,
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              loadOp: "clear",
+              storeOp: "store",
+            },
+          ],
+        });
+        pass.setPipeline(this.displayPipeline);
+        pass.setBindGroup(0, this.displayBindGroup);
+        pass.draw(6);
+        pass.end();
+      },
+    }];
   }
 
   stats() {

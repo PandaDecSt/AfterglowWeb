@@ -1,6 +1,7 @@
 import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
+import type { RenderPass } from "../core/renderer";
 
 const GRID_W = 32;
 const GRID_H = 32;
@@ -327,31 +328,36 @@ export class GreedySnakeDemo implements Demo {
     this.device.queue.writeBuffer(this.renderUniformBuffer, 0, this.renderUniformData as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    if (!this.initialized) {
-      this.initGame();
-    }
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        if (!this.initialized) {
+          this.initGame();
+        }
 
-    // Compute: update snake
-    const computePass = encoder.beginComputePass();
-    computePass.setPipeline(this.computePipeline);
-    computePass.setBindGroup(0, this.computeBindGroup);
-    computePass.dispatchWorkgroups(1);
-    computePass.end();
+        // Compute: update snake
+        const computePass = encoder.beginComputePass();
+        computePass.setPipeline(this.computePipeline);
+        computePass.setBindGroup(0, this.computeBindGroup);
+        computePass.dispatchWorkgroups(1);
+        computePass.end();
 
-    // Render: display grid
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.02, g: 0.02, b: 0.04, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroup);
-    renderPass.draw(GRID_W * GRID_H * 6);
-    renderPass.end();
+        // Render: display grid
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.02, g: 0.02, b: 0.04, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroup);
+        renderPass.draw(GRID_W * GRID_H * 6);
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

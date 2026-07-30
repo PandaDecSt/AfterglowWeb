@@ -1,6 +1,7 @@
 import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import type { Demo } from "./types";
+import type { RenderPass } from "../core/renderer";
 
 const acesShader = `
 struct Params {
@@ -191,16 +192,21 @@ export class ACESPipelineDemo implements Demo {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, params);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
-    });
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }],
+        });
 
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.bindGroup);
-    pass.draw(3);
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.bindGroup);
+        pass.draw(3);
 
-    pass.end();
+        pass.end();
+      },
+    }];
   }
 
   destroy() {}

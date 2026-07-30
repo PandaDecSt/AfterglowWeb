@@ -3,6 +3,7 @@ import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { GPUWindField } from "../utils/gpu-wind-field";
 import { GPUTerrain } from "../utils/gpu-terrain";
+import type { RenderPass } from "../core/renderer";
 
 const PARTICLE_COUNT = 8192;
 
@@ -446,47 +447,52 @@ export class ParticleDemo implements Demo {
     this.device.queue.writeBuffer(this.renderUniformBuffer, 0, this.renderData as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    // Initialize particles once
-    if (!this.initialized) {
-      // Generate terrain first
-      this.terrain.dispatchOnce(encoder);
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        // Initialize particles once
+        if (!this.initialized) {
+          // Generate terrain first
+          this.terrain.dispatchOnce(encoder);
 
-      // Init particles
-      this.device.queue.writeBuffer(this.initUniformBuffer, 0, new Float32Array([PARTICLE_COUNT, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
-      const initPass = encoder.beginComputePass();
-      initPass.setPipeline(this.initPipeline);
-      initPass.setBindGroup(0, this.initBindGroup);
-      initPass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / 256));
-      initPass.end();
-      this.initialized = true;
-    }
+          // Init particles
+          this.device.queue.writeBuffer(this.initUniformBuffer, 0, new Float32Array([PARTICLE_COUNT, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
+          const initPass = encoder.beginComputePass();
+          initPass.setPipeline(this.initPipeline);
+          initPass.setBindGroup(0, this.initBindGroup);
+          initPass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / 256));
+          initPass.end();
+          this.initialized = true;
+        }
 
-    // Update wind field
-    this.windField.dispatch(encoder, performance.now() / 1000);
+        // Update wind field
+        this.windField.dispatch(encoder, performance.now() / 1000);
 
-    // Simulate particles
-    const simPass = encoder.beginComputePass();
-    simPass.setPipeline(this.computePipeline);
-    simPass.setBindGroup(0, this.computeBindGroups[this.current]);
-    simPass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / 256));
-    simPass.end();
+        // Simulate particles
+        const simPass = encoder.beginComputePass();
+        simPass.setPipeline(this.computePipeline);
+        simPass.setBindGroup(0, this.computeBindGroups[this.current]);
+        simPass.dispatchWorkgroups(Math.ceil(PARTICLE_COUNT / 256));
+        simPass.end();
 
-    this.current = 1 - this.current;
+        this.current = 1 - this.current;
 
-    // Render
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.02, g: 0.02, b: 0.05, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroups[this.current]);
-    renderPass.draw(PARTICLE_COUNT * 6);
-    renderPass.end();
+        // Render
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.02, g: 0.02, b: 0.05, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroups[this.current]);
+        renderPass.draw(PARTICLE_COUNT * 6);
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

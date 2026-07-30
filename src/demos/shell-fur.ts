@@ -2,6 +2,7 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
+import type { RenderPass } from "../core/renderer";
 
 const SHELL_COUNT = 16;
 const SHELL_SLOT_SIZE = 256; // must be 256-byte aligned for dynamic offsets
@@ -264,27 +265,32 @@ export class ShellFurDemo implements Demo {
     this.device.queue.writeBuffer(this.sharedUniformBuffer, 0, d as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.1, g: 0.1, b: 0.15, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.1, g: 0.1, b: 0.15, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
 
-    renderPass.setPipeline(this.pipeline);
-    renderPass.setBindGroup(0, this.sharedBindGroup);
-    renderPass.setVertexBuffer(0, this.vertexBuffer);
-    renderPass.setIndexBuffer(this.indexBuffer, "uint16");
+        renderPass.setPipeline(this.pipeline);
+        renderPass.setBindGroup(0, this.sharedBindGroup);
+        renderPass.setVertexBuffer(0, this.vertexBuffer);
+        renderPass.setIndexBuffer(this.indexBuffer, "uint16");
 
-    for (let i = 0; i < SHELL_COUNT; i++) {
-      renderPass.setBindGroup(1, this.shellBindGroup, [i * SHELL_SLOT_SIZE]);
-      renderPass.drawIndexed(this.indexCount);
-    }
+        for (let i = 0; i < SHELL_COUNT; i++) {
+          renderPass.setBindGroup(1, this.shellBindGroup, [i * SHELL_SLOT_SIZE]);
+          renderPass.drawIndexed(this.indexCount);
+        }
 
-    renderPass.end();
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

@@ -2,6 +2,7 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import type { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
+import type { RenderPass } from "../core/renderer";
 
 const toonTexturedShader = `
 struct Uniforms {
@@ -325,28 +326,33 @@ export class ToonTexturedDemo implements Demo {
     this.device.queue.writeBuffer(this.uniformBuffer, 0, ubo as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    this.ensureDepth();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        this.ensureDepth();
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0.15, g: 0.15, b: 0.2, a: 1 } }],
-      depthStencilAttachment: { view: this.cachedDepthView!, depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 1.0 },
-    });
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0.15, g: 0.15, b: 0.2, a: 1 } }],
+          depthStencilAttachment: { view: this.cachedDepthView!, depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 1.0 },
+        });
 
-    // Main toon pass first
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.mainBindGroup);
-    pass.setBindGroup(1, this.rampBindGroup);
-    pass.setVertexBuffer(0, this.vertexBuffer);
-    pass.setIndexBuffer(this.indexBuffer, "uint16");
-    pass.drawIndexed(1920);
+        // Main toon pass first
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.mainBindGroup);
+        pass.setBindGroup(1, this.rampBindGroup);
+        pass.setVertexBuffer(0, this.vertexBuffer);
+        pass.setIndexBuffer(this.indexBuffer, "uint16");
+        pass.drawIndexed(1920);
 
-    // Outline pass after (back faces, slightly expanded)
-    pass.setPipeline(this.outlinePipeline);
-    pass.setBindGroup(0, this.outlineBindGroup);
-    pass.drawIndexed(1920);
+        // Outline pass after (back faces, slightly expanded)
+        pass.setPipeline(this.outlinePipeline);
+        pass.setBindGroup(0, this.outlineBindGroup);
+        pass.drawIndexed(1920);
 
-    pass.end();
+        pass.end();
+      },
+    }];
   }
 
   destroy() {

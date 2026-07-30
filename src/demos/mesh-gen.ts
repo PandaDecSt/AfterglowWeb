@@ -3,6 +3,7 @@ import { Camera } from "../scene/camera";
 import { Demo, ShaderStageDesc } from "./types";
 import { mat4 } from "wgpu-matrix";
 import type { EngineContext } from "../core/engine";
+import type { RenderPass } from "../core/renderer";
 
 const GRID_SIZE = 64;
 const VERTEX_COUNT = GRID_SIZE * GRID_SIZE;
@@ -302,38 +303,43 @@ export class MeshGenDemo implements Demo {
     this.device.queue.writeBuffer(this.renderUBO, 0, this.renderData as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    // Generate indices + draw args once (topology is static)
-    if (!this.indicesGenerated) {
-      const idxPass = encoder.beginComputePass();
-      idxPass.setPipeline(this.genIndicesPipeline);
-      idxPass.setBindGroup(0, this.genBindGroup);
-      idxPass.dispatchWorkgroups(1);
-      idxPass.end();
-      this.indicesGenerated = true;
-    }
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        // Generate indices + draw args once (topology is static)
+        if (!this.indicesGenerated) {
+          const idxPass = encoder.beginComputePass();
+          idxPass.setPipeline(this.genIndicesPipeline);
+          idxPass.setBindGroup(0, this.genBindGroup);
+          idxPass.dispatchWorkgroups(1);
+          idxPass.end();
+          this.indicesGenerated = true;
+        }
 
-    // Generate vertices every frame (animated height field)
-    const vertPass = encoder.beginComputePass();
-    vertPass.setPipeline(this.genVerticesPipeline);
-    vertPass.setBindGroup(0, this.genBindGroup);
-    vertPass.dispatchWorkgroups(Math.ceil(GRID_SIZE / 8), Math.ceil(GRID_SIZE / 8));
-    vertPass.end();
+        // Generate vertices every frame (animated height field)
+        const vertPass = encoder.beginComputePass();
+        vertPass.setPipeline(this.genVerticesPipeline);
+        vertPass.setBindGroup(0, this.genBindGroup);
+        vertPass.dispatchWorkgroups(Math.ceil(GRID_SIZE / 8), Math.ceil(GRID_SIZE / 8));
+        vertPass.end();
 
-    // Render via indirect draw (GPU decides index count)
-    const renderPass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.02, g: 0.02, b: 0.05, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-    });
-    renderPass.setPipeline(this.renderPipeline);
-    renderPass.setBindGroup(0, this.renderBindGroup);
-    renderPass.setIndexBuffer(this.indexBuffer, "uint32");
-    renderPass.drawIndexedIndirect(this.drawArgsBuffer, 0);
-    renderPass.end();
+        // Render via indirect draw (GPU decides index count)
+        const renderPass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.02, g: 0.02, b: 0.05, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+        });
+        renderPass.setPipeline(this.renderPipeline);
+        renderPass.setBindGroup(0, this.renderBindGroup);
+        renderPass.setIndexBuffer(this.indexBuffer, "uint32");
+        renderPass.drawIndexedIndirect(this.drawArgsBuffer, 0);
+        renderPass.end();
+      },
+    }];
   }
 
   stats() {

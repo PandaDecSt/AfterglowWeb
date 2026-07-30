@@ -3,6 +3,7 @@ import { Camera } from "../scene/camera";
 import { Demo, ShaderStageDesc } from "./types";
 import { mat4, vec3, type Mat4 } from "wgpu-matrix";
 import type { EngineContext } from "../core/engine";
+import type { RenderPass } from "../core/renderer";
 
 const SHADOW_SIZE = 2048;
 
@@ -553,64 +554,69 @@ export class PBRShadowDemo implements Demo {
     this.device.queue.writeBuffer(this.shadowGroundUBO, 0, shg as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    this.ensureDepth();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        this.ensureDepth();
 
-    // Pass 1: Shadow map
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [],
-        depthStencilAttachment: {
-          view: this.shadowView,
-          depthClearValue: 1.0,
-          depthLoadOp: "clear",
-          depthStoreOp: "store",
-        },
-      });
-      pass.setPipeline(this.shadowPipeline);
-      pass.setVertexBuffer(0, this.sphereVB);
-      pass.setIndexBuffer(this.sphereIB, "uint16");
-      pass.setBindGroup(0, this.shadowBindGroup);
-      pass.drawIndexed(this.sphereIndexCount);
+        // Pass 1: Shadow map
+        {
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [],
+            depthStencilAttachment: {
+              view: this.shadowView,
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "store",
+            },
+          });
+          pass.setPipeline(this.shadowPipeline);
+          pass.setVertexBuffer(0, this.sphereVB);
+          pass.setIndexBuffer(this.sphereIB, "uint16");
+          pass.setBindGroup(0, this.shadowBindGroup);
+          pass.drawIndexed(this.sphereIndexCount);
 
-      pass.setVertexBuffer(0, this.groundVB);
-      pass.setIndexBuffer(this.groundIB, "uint16");
-      pass.setBindGroup(0, this.shadowGroundBindGroup);
-      pass.drawIndexed(this.groundIndexCount);
-      pass.end();
-    }
+          pass.setVertexBuffer(0, this.groundVB);
+          pass.setIndexBuffer(this.groundIB, "uint16");
+          pass.setBindGroup(0, this.shadowGroundBindGroup);
+          pass.drawIndexed(this.groundIndexCount);
+          pass.end();
+        }
 
-    // Pass 2: PBR render
-    {
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view,
-          clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        }],
-        depthStencilAttachment: {
-          view: this.cachedDepthView!,
-          depthClearValue: 1.0,
-          depthLoadOp: "clear",
-          depthStoreOp: "store",
-        },
-      });
+        // Pass 2: PBR render
+        {
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [{
+              view,
+              clearValue: { r: 0.05, g: 0.05, b: 0.08, a: 1 },
+              loadOp: "clear",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: {
+              view: this.cachedDepthView!,
+              depthClearValue: 1.0,
+              depthLoadOp: "clear",
+              depthStoreOp: "store",
+            },
+          });
 
-      pass.setPipeline(this.groundPipeline);
-      pass.setBindGroup(0, this.groundBindGroup);
-      pass.setVertexBuffer(0, this.groundVB);
-      pass.setIndexBuffer(this.groundIB, "uint16");
-      pass.drawIndexed(this.groundIndexCount);
+          pass.setPipeline(this.groundPipeline);
+          pass.setBindGroup(0, this.groundBindGroup);
+          pass.setVertexBuffer(0, this.groundVB);
+          pass.setIndexBuffer(this.groundIB, "uint16");
+          pass.drawIndexed(this.groundIndexCount);
 
-      pass.setPipeline(this.pbrPipeline);
-      pass.setBindGroup(0, this.pbrBindGroup);
-      pass.setVertexBuffer(0, this.sphereVB);
-      pass.setIndexBuffer(this.sphereIB, "uint16");
-      pass.drawIndexed(this.sphereIndexCount);
+          pass.setPipeline(this.pbrPipeline);
+          pass.setBindGroup(0, this.pbrBindGroup);
+          pass.setVertexBuffer(0, this.sphereVB);
+          pass.setIndexBuffer(this.sphereIB, "uint16");
+          pass.drawIndexed(this.sphereIndexCount);
 
-      pass.end();
-    }
+          pass.end();
+        }
+      },
+    }];
   }
 
   stats() {

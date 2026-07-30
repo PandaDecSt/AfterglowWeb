@@ -2,6 +2,7 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import type { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
+import type { RenderPass } from "../core/renderer";
 
 const hairEyeShader = `
 struct Uniforms {
@@ -310,28 +311,33 @@ export class HairEyeShadowDemo implements Demo {
     this.device.queue.writeBuffer(this.eyeUBO, 0, eyeUbo as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    this.ensureDepth();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        this.ensureDepth();
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0.15, g: 0.15, b: 0.2, a: 1 } }],
-      depthStencilAttachment: { view: this.cachedDepthView!, depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 1.0 },
-    });
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view, loadOp: "clear", storeOp: "store", clearValue: { r: 0.15, g: 0.15, b: 0.2, a: 1 } }],
+          depthStencilAttachment: { view: this.cachedDepthView!, depthLoadOp: "clear", depthStoreOp: "store", depthClearValue: 1.0 },
+        });
 
-    pass.setPipeline(this.pipeline);
-    pass.setVertexBuffer(0, this.vertexBuffer);
-    pass.setIndexBuffer(this.indexBuffer, "uint16");
+        pass.setPipeline(this.pipeline);
+        pass.setVertexBuffer(0, this.vertexBuffer);
+        pass.setIndexBuffer(this.indexBuffer, "uint16");
 
-    // Draw hair
-    pass.setBindGroup(0, this.hairBindGroup);
-    pass.drawIndexed(16 * 16 * 6, 1, 0);
+        // Draw hair
+        pass.setBindGroup(0, this.hairBindGroup);
+        pass.drawIndexed(16 * 16 * 6, 1, 0);
 
-    // Draw eye
-    const hairVertCount = 17 * 17;
-    pass.setBindGroup(0, this.eyeBindGroup);
-    pass.drawIndexed(16 * 16 * 6, 1, hairVertCount);
+        // Draw eye
+        const hairVertCount = 17 * 17;
+        pass.setBindGroup(0, this.eyeBindGroup);
+        pass.drawIndexed(16 * 16 * 6, 1, hairVertCount);
 
-    pass.end();
+        pass.end();
+      },
+    }];
   }
 
   destroy() {

@@ -3,6 +3,7 @@ import { Camera } from "../scene/camera";
 import { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
 import { loadGLTF, interleaveMesh, type MeshData, type MaterialData } from "../utils/gltf-loader";
+import type { RenderPass } from "../core/renderer";
 
 // === Material Classification ===
 type MaterialCategory = "body" | "face" | "hair" | "eye" | "eyelash" | "other";
@@ -681,53 +682,58 @@ export class GLBViewerDemo implements Demo {
     this.device.queue.writeBuffer(this.frameUbo, 0, d as unknown as GPUAllowSharedBufferSource);
   }
 
-  render(encoder: GPUCommandEncoder, view: GPUTextureView) {
-    if (!this.loaded || this.meshBuffers.length === 0) return;
-    this.ensureDepth();
+  createPasses(): RenderPass[] {
+    return [{
+      label: this.label,
+      execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
+        if (!this.loaded || this.meshBuffers.length === 0) return;
+        this.ensureDepth();
 
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{
-        view,
-        clearValue: { r: 0.08, g: 0.08, b: 0.12, a: 1 },
-        loadOp: "clear",
-        storeOp: "store",
-      }],
-      depthStencilAttachment: {
-        view: this.cachedDepthView!,
-        depthClearValue: 1.0,
-        depthLoadOp: "clear",
-        depthStoreOp: "store",
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{
+            view,
+            clearValue: { r: 0.08, g: 0.08, b: 0.12, a: 1 },
+            loadOp: "clear",
+            storeOp: "store",
+          }],
+          depthStencilAttachment: {
+            view: this.cachedDepthView!,
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+          },
+        });
+
+        // Outline pass (backface expansion, rendered first)
+        if (this.showOutline) {
+          pass.setPipeline(this.outlinePipeline);
+          pass.setBindGroup(0, this.frameBindGroup);
+          for (const mb of this.meshBuffers) {
+            if (!mb.visible) continue;
+            const matRes = this.materialResources[Math.min(mb.materialIndex, this.materialResources.length - 1)];
+            if (matRes.outlineWidth < 0.001) continue;
+            pass.setBindGroup(1, matRes.bindGroup);
+            pass.setVertexBuffer(0, mb.vertexBuffer);
+            pass.setIndexBuffer(mb.indexBuffer, mb.use32bit ? "uint32" : "uint16");
+            pass.drawIndexed(mb.indexCount);
+          }
+        }
+
+        // Main pass
+        pass.setPipeline(this.pipeline);
+        pass.setBindGroup(0, this.frameBindGroup);
+        for (const mb of this.meshBuffers) {
+          if (!mb.visible) continue;
+          const matRes = this.materialResources[Math.min(mb.materialIndex, this.materialResources.length - 1)];
+          pass.setBindGroup(1, matRes.bindGroup);
+          pass.setVertexBuffer(0, mb.vertexBuffer);
+          pass.setIndexBuffer(mb.indexBuffer, mb.use32bit ? "uint32" : "uint16");
+          pass.drawIndexed(mb.indexCount);
+        }
+
+        pass.end();
       },
-    });
-
-    // Outline pass (backface expansion, rendered first)
-    if (this.showOutline) {
-      pass.setPipeline(this.outlinePipeline);
-      pass.setBindGroup(0, this.frameBindGroup);
-      for (const mb of this.meshBuffers) {
-        if (!mb.visible) continue;
-        const matRes = this.materialResources[Math.min(mb.materialIndex, this.materialResources.length - 1)];
-        if (matRes.outlineWidth < 0.001) continue;
-        pass.setBindGroup(1, matRes.bindGroup);
-        pass.setVertexBuffer(0, mb.vertexBuffer);
-        pass.setIndexBuffer(mb.indexBuffer, mb.use32bit ? "uint32" : "uint16");
-        pass.drawIndexed(mb.indexCount);
-      }
-    }
-
-    // Main pass
-    pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, this.frameBindGroup);
-    for (const mb of this.meshBuffers) {
-      if (!mb.visible) continue;
-      const matRes = this.materialResources[Math.min(mb.materialIndex, this.materialResources.length - 1)];
-      pass.setBindGroup(1, matRes.bindGroup);
-      pass.setVertexBuffer(0, mb.vertexBuffer);
-      pass.setIndexBuffer(mb.indexBuffer, mb.use32bit ? "uint32" : "uint16");
-      pass.drawIndexed(mb.indexCount);
-    }
-
-    pass.end();
+    }];
   }
 
   // === Preset System ===
