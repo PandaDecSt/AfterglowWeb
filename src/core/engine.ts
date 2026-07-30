@@ -6,6 +6,8 @@ import { AutoBinder } from "./auto-bind";
 import { ShaderHotReload } from "../shader/hotreload";
 import { ShaderModuleSystem } from "../shader/module-system";
 import { RenderGraph } from "./render-graph";
+import { compileGraph } from "../shader/graph";
+import type { ShaderGraph, CompiledGraph } from "../shader/graph";
 
 export class EngineContext {
   readonly gpu: GPUContext;
@@ -32,6 +34,15 @@ export class EngineContext {
 
   compileShader(label: string, code: string): GPUShaderModule {
     return this.modules.resolveAndCompile(this.device, label, code);
+  }
+
+  compileShaderGraph(graph: ShaderGraph): CompiledGraph {
+    return compileGraph(graph);
+  }
+
+  createShaderModuleFromGraph(label: string, graph: ShaderGraph): GPUShaderModule {
+    const compiled = compileGraph(graph);
+    return this.device.createShaderModule({ label, code: compiled.wgsl });
   }
 
   get canvas() {
