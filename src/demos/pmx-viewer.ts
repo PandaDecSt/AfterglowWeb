@@ -15,6 +15,7 @@ import { decodeTGA } from "../utils/tga-loader";
 
 const HDR_FORMAT = "rgba16float";
 
+
 type RenderClass = "auto" | "eye" | "hair";
 
 interface PresetConfig {
@@ -708,7 +709,7 @@ export class PMXDemo implements Demo {
     this.hdrTarget = new HDRRenderTarget(this.device, HDR_FORMAT, "depth24plus-stencil8");
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
-    this.bloom = new BloomPass(this.device, HDR_FORMAT);
+    this.bloom = new BloomPass(this.device, this.ctx.supportsRG11B10 ? "rg11b10ufloat" as GPUTextureFormat : "rgba16float" as GPUTextureFormat);
 
 
     if (pmx.bones.length > 0) {

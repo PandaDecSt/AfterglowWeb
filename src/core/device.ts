@@ -3,6 +3,7 @@ export class GPUContext {
   context!: GPUCanvasContext;
   format!: GPUTextureFormat;
   canvas!: HTMLCanvasElement;
+  supportsRG11B10 = false;
 
   static async create(canvas: HTMLCanvasElement): Promise<GPUContext> {
     const ctx = new GPUContext();
@@ -19,10 +20,15 @@ export class GPUContext {
       throw new Error("Failed to get GPU adapter.");
     }
 
+    const features: GPUFeatureName[] = [];
+    if (adapter.features.has("timestamp-query")) features.push("timestamp-query");
+    if (adapter.features.has("rg11b10ufloat-renderable")) {
+      features.push("rg11b10ufloat-renderable");
+      ctx.supportsRG11B10 = true;
+    }
+
     ctx.device = await adapter.requestDevice({
-      requiredFeatures: adapter.features.has("timestamp-query")
-        ? ["timestamp-query"]
-        : [],
+      requiredFeatures: features,
       requiredLimits: {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxBufferSize: adapter.limits.maxBufferSize,
