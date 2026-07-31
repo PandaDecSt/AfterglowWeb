@@ -76,10 +76,12 @@ export class Camera {
     return mat4.mul(this.getProjectionMatrix(aspect), this.getViewMatrix());
   }
 
-  orbit(target: Vec3, distance: number, near?: number, far?: number): void {
+  orbit(target: Vec3, distance: number, near?: number, far?: number, yaw?: number, pitch?: number): void {
     this.target = target;
     this.distance = distance;
     if (near !== undefined) this.near = near;
     if (far !== undefined) this.far = far;
+    if (yaw !== undefined) this.yaw = yaw;
+    if (pitch !== undefined) this.pitch = pitch;
   }
 }

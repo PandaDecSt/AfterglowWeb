@@ -558,7 +558,7 @@ export class PMXDemo implements Demo {
     const center = [(minPos[0] + maxPos[0]) / 2, (minPos[1] + maxPos[1]) / 2, (minPos[2] + maxPos[2]) / 2];
     const extent = [maxPos[0] - minPos[0], maxPos[1] - minPos[1], maxPos[2] - minPos[2]];
     const radius = Math.sqrt(extent[0] ** 2 + extent[1] ** 2 + extent[2] ** 2) / 2;
-    this.camera.orbit(vec3.create(center[0], center[1], center[2]), radius * 2.5, radius * 0.01, radius * 20);
+    this.camera.orbit(vec3.create(center[0], center[1], center[2]), radius * 2.5, radius * 0.01, radius * 20, Math.PI / 2, 0);
     console.log(`[PMXDemo] Bounds: center=[${center.map(v => v.toFixed(2))}] radius=${radius.toFixed(2)} orbitDist=${(radius * 2.5).toFixed(2)}`);
 
     this.vertexBuffer = this.device.createBuffer({ label: "pmx-vb", size: vertexBuf.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, mappedAtCreation: true });
@@ -905,7 +905,7 @@ export class PMXDemo implements Demo {
 
     }
     const viewProj = this.camera.getViewProjectionMatrix(w / h);
-    const model = mat4.scaling(vec3.create(-1, 1, 1));
+    const model = mat4.scaling(vec3.create(1, 1, -1));
 
     this.sceneData.set(viewProj as unknown as ArrayLike<number>, 0);
     this.sceneData.set(model as unknown as ArrayLike<number>, 16);
@@ -932,7 +932,7 @@ export class PMXDemo implements Demo {
     const slen = Math.sqrt(slx * slx + sly * sly + slz * slz) || 1;
     const sdx = slx / slen, sdy = sly / slen, sdz = slz / slen;
     const shadowTarget = vec3.create(0, 11, 0);
-    const shadowEye = vec3.create(shadowTarget[0] - sdx * 72, shadowTarget[1] - sdy * 72, shadowTarget[2] - sdz * 72);
+    const shadowEye = vec3.create(shadowTarget[0] + sdx * 72, shadowTarget[1] + sdy * 72, shadowTarget[2] + sdz * 72);
     this.shadowMap.lightPosition = shadowEye;
     this.shadowMap.lightTarget = shadowTarget;
     this.shadowMap.updateLightVP();
