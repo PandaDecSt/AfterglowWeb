@@ -10,6 +10,7 @@ export class HDRRenderTarget {
   colorTarget!: RenderTarget;
   depthTarget!: DepthTarget;
   format: GPUTextureFormat;
+  private depthFormat: GPUTextureFormat;
 
   toneMapping: ToneMappingMode = "aces";
   exposure = 1.0;
@@ -20,9 +21,10 @@ export class HDRRenderTarget {
   private toneUniformBuffer!: GPUBuffer;
   private toneUniformData = new Float32Array(8);
 
-  constructor(device: GPUDevice, format: GPUTextureFormat = "rgba16float") {
+  constructor(device: GPUDevice, format: GPUTextureFormat = "rgba16float", depthFormat: GPUTextureFormat = "depth24plus") {
     this.device = device;
     this.format = format;
+    this.depthFormat = depthFormat;
     this.toneUniformBuffer = device.createBuffer({
       label: "tone-mapping-ubo",
       size: 32,
@@ -42,7 +44,7 @@ export class HDRRenderTarget {
       this.device, width, height, this.format, "hdr-color",
       GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC
     );
-    this.depthTarget = new DepthTarget(this.device, width, height, "hdr-depth");
+    this.depthTarget = new DepthTarget(this.device, width, height, "hdr-depth", this.depthFormat);
 
     this.tonePipeline = null;
     this.toneBindGroup = null;

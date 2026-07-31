@@ -48,10 +48,10 @@ function detectPreset(name: string, isTransparent: boolean): PresetConfig {
   if (n.includes("目") || n.includes("眼") || n.includes("eye") || n.includes("瞳")) return PRESETS.eye;
   if (n.includes("金属") || n.includes("metal") || n.includes("メタル")) return PRESETS.metal;
   if (n.includes("ストッキング") || n.includes("靴下") || n.includes("stocking") || n.includes("ニーソ")) return PRESETS.stockings;
-  if (isTransparent) return PRESETS.stockings;
   if (n.includes("服") || n.includes("衣") || n.includes("cloth") || n.includes("シャツ") || n.includes("スカート")) return PRESETS.cloth_smooth;
   if (n.includes("肌") || n.includes("体") || n.includes("body") || n.includes("skin")) return PRESETS.body;
-  return PRESETS.body;
+  if (isTransparent) return PRESETS.stockings;
+  return PRESETS.default;
 }
 
 const SCENE_VS = `
@@ -476,6 +476,7 @@ export class PMXDemo implements Demo {
   private toneUBO!: GPUBuffer;
   private gradeUBO!: GPUBuffer;
   private grade2UBO!: GPUBuffer;
+  private toneSampler!: GPUSampler;
 
   private matRenders: MatRenderData[] = [];
   private gpuTextures: GPUTexture[] = [];
@@ -693,7 +694,7 @@ export class PMXDemo implements Demo {
 
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    this.hdrTarget = new HDRRenderTarget(this.device, HDR_FORMAT);
+    this.hdrTarget = new HDRRenderTarget(this.device, HDR_FORMAT, "depth24plus-stencil8");
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
     this.bloom = new BloomPass(this.device, HDR_FORMAT);
@@ -1091,7 +1092,7 @@ export class PMXDemo implements Demo {
     if (!this.tonePipeline) {
       const lut = this.buildFilmicLUT();
       const code = `
-struct Params { exposure: f32, gamma: f32, contrast: f32, pad: f32 };
+struct Params { exposure: f32, gamma: f32, contrast: f32, flags: u32 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var srcTex: texture_2d<f32>;
 @group(0) @binding(2) var srcSampler: sampler;
@@ -1126,8 +1127,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let dims = vec2<f32>(textureDimensions(srcTex));
   let uv = pos.xy / dims;
   var color = textureSample(srcTex, srcSampler, uv).rgb * p.exposure;
-  let doTonemap = (p.pad > 0.5 && p.pad < 1.5) || p.pad > 2.5;
-  let doGrade = p.pad > 1.5;
+  let doTonemap = (p.flags & 1u) != 0u;
+  let doGrade = (p.flags & 2u) != 0u;
   if (doTonemap) {
     color = vec3f(filmicLUT(color.r), filmicLUT(color.g), filmicLUT(color.b));
   } else {
@@ -1159,21 +1160,27 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     }
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    const flags = (this.tonemapEnabled ? 1 : 0) + (this.gradeEnabled ? 2 : 0);
-    const data = new Float32Array([this.exposure, this.gamma, this.contrast, flags]);
-    this.device.queue.writeBuffer(this.toneUBO, 0, data as unknown as GPUAllowSharedBufferSource);
+    const flags = (this.tonemapEnabled ? 1 : 0) | (this.gradeEnabled ? 2 : 0);
+    const data = new ArrayBuffer(16);
+    const f32 = new Float32Array(data);
+    const u32 = new Uint32Array(data);
+    f32[0] = this.exposure; f32[1] = this.gamma; f32[2] = this.contrast; u32[3] = flags;
+    this.device.queue.writeBuffer(this.toneUBO, 0, data);
     const gd = new Float32Array([this.slope, this.slope, this.slope, this.offset]);
     this.device.queue.writeBuffer(this.gradeUBO, 0, gd as unknown as GPUAllowSharedBufferSource);
     const gd2 = new Float32Array([this.power, this.power, this.power, this.saturation]);
     this.device.queue.writeBuffer(this.grade2UBO, 0, gd2 as unknown as GPUAllowSharedBufferSource);
 
+    if (!this.toneSampler) {
+      this.toneSampler = this.device.createSampler({ magFilter: "linear", minFilter: "linear" });
+    }
     const lutView = this.filmicLUT!.createView();
     const bg = this.device.createBindGroup({
       layout: this.tonePipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.toneUBO } },
         { binding: 1, resource: srcView },
-        { binding: 2, resource: this.device.createSampler({ magFilter: "linear", minFilter: "linear" }) },
+        { binding: 2, resource: this.toneSampler },
         { binding: 3, resource: lutView },
         { binding: 4, resource: { buffer: this.gradeUBO } },
         { binding: 5, resource: { buffer: this.grade2UBO } },

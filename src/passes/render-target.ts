@@ -38,13 +38,13 @@ export class DepthTarget {
   width: number;
   height: number;
 
-  constructor(device: GPUDevice, width: number, height: number, label: string) {
+  constructor(device: GPUDevice, width: number, height: number, label: string, format: GPUTextureFormat = "depth24plus") {
     this.width = width;
     this.height = height;
     this.texture = device.createTexture({
       label,
       size: [width, height],
-      format: "depth24plus-stencil8",
+      format,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.view = this.texture.createView();

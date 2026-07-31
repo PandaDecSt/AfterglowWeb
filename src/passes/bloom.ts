@@ -142,6 +142,7 @@ export class BloomPass {
   private mipCount = 0;
   private cachedSceneTex: GPUTexture | null = null;
   private cachedSceneView: GPUTextureView | null = null;
+  private whiteTex!: GPUTexture;
   private whiteTexView!: GPUTextureView;
 
   bloomIntensity = 0.05;
@@ -180,8 +181,9 @@ export class BloomPass {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    const whiteTex = this.device.createTexture({ label: "bloom-white-mask", size: [1, 1], format: "rg8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-    this.device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255, 255, 0, 0]), { bytesPerRow: 4 }, [1, 1]);
+    const whiteTex = this.device.createTexture({ label: "bloom-white-mask", size: [1, 1], format: "r8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    this.device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255]), { bytesPerRow: 1 }, [1, 1]);
+    this.whiteTex = whiteTex;
     this.whiteTexView = whiteTex.createView();
 
     const blitModule = this.device.createShaderModule({ code: bloomBlitShader });
@@ -399,6 +401,7 @@ export class BloomPass {
     this.blitUBO.destroy();
     this.upsampleUBO.destroy();
     this.combineUBO.destroy();
+    this.whiteTex?.destroy();
     for (const t of this.bloomDown) t.destroy();
     for (const t of this.bloomUp) t.destroy();
   }
