@@ -37,7 +37,7 @@ export class ShadowMap {
 
     this.shadowSampler = this.device.createSampler({
       label: "shadow-comparison",
-      compare: "less-equal",
+      compare: "less",
       magFilter: "linear",
       minFilter: "linear",
     });
@@ -83,7 +83,10 @@ export class ShadowMap {
   }
 
   updateLightVP(): void {
-    const up = vec3.create(0, 1, 0);
+    const dir = vec3.subtract(this.lightPosition, this.lightTarget);
+    const len = vec3.length(dir) || 1;
+    const nd = vec3.divide(dir, vec3.create(len, len, len));
+    const up = Math.abs(nd[1]) > 0.99 ? vec3.create(0, 0, -1) : vec3.create(0, 1, 0);
     const view = mat4.lookAt(this.lightPosition, this.lightTarget, up);
     const half = this.orthoSize / 2;
     const proj = mat4.ortho(-half, half, -half, half, this.near, this.far);
@@ -143,25 +146,29 @@ fn sampleShadowPCF(
   shadowSampler: sampler_comparison,
   lightVP: mat4x4<f32>,
   worldPos: vec3<f32>,
-  bias: f32
+  normal: vec3<f32>,
+  lightDir: vec3<f32>
 ) -> f32 {
-  let lightPos = lightVP * vec4<f32>(worldPos, 1.0);
-  let projXY = lightPos.xy / lightPos.w;
-  let shadowCoord = clamp(vec2<f32>(projXY.x * 0.5 + 0.5, -projXY.y * 0.5 + 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
-  let depth = lightPos.z / lightPos.w - bias;
-
-  let texelSize = 1.0 / vec2<f32>(textureDimensions(shadowTexture));
-
-  var shadow = 0.0;
-  for (var y = -1; y <= 1; y++) {
-    for (var x = -1; x <= 1; x++) {
-      let offset = vec2<f32>(f32(x), f32(y)) * texelSize;
-      shadow += textureSampleCompare(
-        shadowTexture, shadowSampler,
-        clamp(shadowCoord + offset, vec2<f32>(0.0), vec2<f32>(1.0)), depth
-      );
-    }
-  }
-  return shadow / 9.0;
+  if (dot(normal, lightDir) <= 0.0) { return 1.0; }
+  let biasedPos = worldPos + normal * 0.08;
+  let lclip = lightVP * vec4<f32>(biasedPos, 1.0);
+  let ndc = lclip.xyz / max(lclip.w, 1e-6);
+  let suv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+  let cmpZ = ndc.z - 0.001;
+  let ts = 1.0 / f32(textureDimensions(shadowTexture).x);
+  let s00 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f(-ts, -ts), cmpZ);
+  let s10 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f(0.0, -ts), cmpZ);
+  let s20 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f( ts, -ts), cmpZ);
+  let s01 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f(-ts, 0.0), cmpZ);
+  let s11 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv, cmpZ);
+  let s21 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f( ts, 0.0), cmpZ);
+  let s02 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f(-ts,  ts), cmpZ);
+  let s12 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f(0.0,  ts), cmpZ);
+  let s22 = textureSampleCompareLevel(shadowTexture, shadowSampler, suv + vec2f( ts,  ts), cmpZ);
+  var vis = (s00 + s10 + s20 + s01 + s11 + s21 + s02 + s12 + s22) * (1.0 / 9.0);
+  let inZ = select(0.0, 1.0, ndc.z > 0.0 && ndc.z < 1.0);
+  let frustum = (1.0 - smoothstep(0.88, 0.96, abs(ndc.x)))
+              * (1.0 - smoothstep(0.88, 0.96, abs(ndc.y))) * inZ;
+  return mix(1.0, vis, frustum);
 }
 `;

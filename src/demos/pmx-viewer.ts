@@ -213,7 +213,7 @@ fn fs_main(in: VSOut) -> FSOut {
   let VH = max(dot(v, h), 0.0);
 
   let baseColor = tex_s.rgb * mat.diffuseColor_alpha.xyz;
-  let shadow = sampleShadowPCF(shadowTex, shadowSampler, lightVP, in.worldPos, 0.002);
+  let shadow = sampleShadowPCF(shadowTex, shadowSampler, lightVP, in.worldPos, n, l);
 
   let toonT = clamp(NL * 0.5 + 0.5, 0.0, 1.0);
   let toonShade = textureSample(toonTex, texSampler, vec2<f32>(toonT, 0.5)).r;
@@ -230,14 +230,14 @@ fn fs_main(in: VSOut) -> FSOut {
   let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
   let G = smithG2(NL, NV, k);
   let F = fresnelSchlick(VH, F0);
-  let pbrSpecular = D * G * F / max(4.0 * NL * NV, 0.001) * shadow;
+  let pbrSpecular = D * G * F * shadow;
 
   let nprMix = mat.pbrParams.w;
   let diffuse = mix(pbrDiffuse, nprDiffuse, nprMix);
   let specular = mix(pbrSpecular, nprSpecular, nprMix);
 
   let rimFactor = pow(1.0 - NV, mat.rimPower_pad.x) * mat.rimColor_strength.w;
-  let rim = mat.rimColor_strength.xyz * rimFactor * shadow;
+  let rim = mat.rimColor_strength.xyz * rimFactor; // * shadow; 边缘光本质是视角效应，不需要被阴影遮挡。
 
   let emission = baseColor * mat.pbrParams.z;
 
@@ -388,6 +388,7 @@ interface MatRenderData {
   isTransparent: boolean;
   hasEdge: boolean;
   renderClass: RenderClass;
+  castsShadow: boolean;
 }
 
 function create1x1Texture(device: GPUDevice, r: number, g: number, b: number, a: number, label: string): GPUTexture {
@@ -573,8 +574,9 @@ export class PMXDemo implements Demo {
     this.indexBuffer.unmap();
 
     this.shadowMap = new ShadowMap(this.device, 4096);
-    this.shadowMap.orthoSize = radius * 3;
-    this.shadowMap.far = radius * 6;
+    this.shadowMap.orthoSize = 64;
+    this.shadowMap.near = 1;
+    this.shadowMap.far = 140;
 
     this.buildPipelines();
 
@@ -688,7 +690,8 @@ export class PMXDemo implements Demo {
         });
       }
 
-      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass });
+      const castsShadow = (m.flag & 0x04) !== 0;
+      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass, castsShadow });
       indexOffset += matIndexCount;
     }
 
@@ -925,8 +928,13 @@ export class PMXDemo implements Demo {
       }
     }
 
-    this.shadowMap.lightPosition = vec3.create(this.lightX, this.lightY, this.lightZ);
-    this.shadowMap.lightTarget = vec3.create(0, 10, 0);
+    const slx = this.lightX, sly = this.lightY, slz = this.lightZ;
+    const slen = Math.sqrt(slx * slx + sly * sly + slz * slz) || 1;
+    const sdx = slx / slen, sdy = sly / slen, sdz = slz / slen;
+    const shadowTarget = vec3.create(0, 11, 0);
+    const shadowEye = vec3.create(shadowTarget[0] - sdx * 72, shadowTarget[1] - sdy * 72, shadowTarget[2] - sdz * 72);
+    this.shadowMap.lightPosition = shadowEye;
+    this.shadowMap.lightTarget = shadowTarget;
     this.shadowMap.updateLightVP();
 
     this.shadowSceneData.set(this.shadowMap.lightVP as unknown as ArrayLike<number>, 0);
@@ -954,7 +962,10 @@ export class PMXDemo implements Demo {
         shadowPass.setBindGroup(1, this.skinBG);
         shadowPass.setVertexBuffer(0, this.vertexBuffer);
         shadowPass.setIndexBuffer(this.indexBuffer, this.use32bit ? "uint32" : "uint16");
-        shadowPass.drawIndexed(this.totalIndexCount);
+        for (const mr of this.matRenders) {
+          if (!mr.castsShadow) continue;
+          shadowPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
+        }
         shadowPass.end();
 
         const mainPass = encoder.beginRenderPass({
