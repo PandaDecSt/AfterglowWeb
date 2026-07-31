@@ -1,222 +1,205 @@
-const bloomDownsampleShader = `
-@group(0) @binding(0) var srcTex: texture_2d<f32>;
-@group(0) @binding(1) var srcSampler: sampler;
+// EEVEE 3.6 bloom pyramid: blit (Karis prefilter) → 13-tap downsamples → 9-tap tent upsamples → combine.
+// Mirrors source/blender/draw/engines/eevee/shaders/effect_bloom_frag.glsl.
 
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
-  var pos = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
-  );
-  var out: VSOut;
-  out.position = vec4<f32>(pos[vi], 0.0, 1.0);
-  out.uv = pos[vi] * 0.5 + 0.5;
-  return out;
-}
-
-@fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-  let texSize = vec2<f32>(textureDimensions(srcTex));
-  let texel = 1.0 / texSize;
-
-  let a = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>(-2.0, -2.0)).rgb;
-  let b = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 0.0, -2.0)).rgb;
-  let c = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 2.0, -2.0)).rgb;
-  let d = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>(-2.0,  0.0)).rgb;
-  let e = textureSample(srcTex, srcSampler, in.uv).rgb;
-  let f = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 2.0,  0.0)).rgb;
-  let g = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>(-2.0,  2.0)).rgb;
-  let h = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 0.0,  2.0)).rgb;
-  let i = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 2.0,  2.0)).rgb;
-  let j = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>(-1.0, -1.0)).rgb;
-  let k = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 1.0, -1.0)).rgb;
-  let l = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>(-1.0,  1.0)).rgb;
-  let m = textureSample(srcTex, srcSampler, in.uv + texel * vec2<f32>( 1.0,  1.0)).rgb;
-
-  var color = (a + c + g + i) * 0.03125;
-  color += (b + d + f + h) * 0.0625;
-  color += (j + k + l + m) * 0.125;
-  color += e * 0.125;
-
-  let brightness = max(color.r, max(color.g, color.b));
-  let threshold = 0.8;
-  let contribution = max(brightness - threshold, 0.0) / max(brightness, 0.001);
-
-  return vec4<f32>(color * contribution, 1.0);
+const FULLSCREEN_VS = /* wgsl */ `
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+  let x = f32((vi & 1u) << 2u) - 1.0;
+  let y = f32((vi & 2u) << 1u) - 1.0;
+  return vec4f(x, y, 0.0, 1.0);
 }
 `;
 
-const bloomBlurShader = `
-struct BlurParams {
-  direction: vec2<f32>,
-  mipLevel: f32,
-  pad: f32,
-};
+const bloomBlitShader = /* wgsl */ `${FULLSCREEN_VS}
+@group(0) @binding(0) var hdrTex: texture_2d<f32>;
+@group(0) @binding(1) var<uniform> prefilter: vec4<f32>;
 
-@group(0) @binding(0) var srcTex: texture_2d<f32>;
-@group(0) @binding(1) var srcSampler: sampler;
-@group(0) @binding(2) var<uniform> params: BlurParams;
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
-  var pos = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
-  );
-  var out: VSOut;
-  out.position = vec4<f32>(pos[vi], 0.0, 1.0);
-  out.uv = pos[vi] * 0.5 + 0.5;
-  return out;
+fn luminance(c: vec3f) -> f32 {
+  return dot(max(c, vec3f(0.0)), vec3f(0.2126, 0.7152, 0.0722));
 }
 
-@fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-  let texSize = vec2<f32>(textureDimensions(srcTex));
-  let texel = params.direction / texSize;
+fn fetch(c: vec2<i32>, clampV: f32) -> vec3f {
+  let d = vec2<i32>(textureDimensions(hdrTex));
+  let cc = clamp(c, vec2<i32>(0), d - vec2<i32>(1));
+  let s = textureLoad(hdrTex, cc, 0).rgb;
+  return select(s, min(s, vec3f(clampV)), clampV > 0.0);
+}
 
-  let weights = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
-
-  var color = textureSample(srcTex, srcSampler, in.uv).rgb * weights[0];
-  for (var i = 1; i < 5; i++) {
-    let offset = texel * f32(i) * (1.0 + params.mipLevel * 0.5);
-    color += textureSample(srcTex, srcSampler, in.uv + offset).rgb * weights[i];
-    color += textureSample(srcTex, srcSampler, in.uv - offset).rgb * weights[i];
-  }
-
-  return vec4<f32>(color, 1.0);
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let dst = vec2<i32>(p.xy - vec2f(0.5));
+  let base = dst * 2;
+  let clampV = prefilter.z;
+  let a = fetch(base + vec2<i32>(0, 0), clampV);
+  let b = fetch(base + vec2<i32>(1, 0), clampV);
+  let c = fetch(base + vec2<i32>(0, 1), clampV);
+  let d = fetch(base + vec2<i32>(1, 1), clampV);
+  let wa = 1.0 / (1.0 + luminance(a));
+  let wb = 1.0 / (1.0 + luminance(b));
+  let wc = 1.0 / (1.0 + luminance(c));
+  let wd = 1.0 / (1.0 + luminance(d));
+  let avg = (a * wa + b * wb + c * wc + d * wd) / max(wa + wb + wc + wd, 1e-6);
+  let bright = max(avg.r, max(avg.g, avg.b));
+  let soft = clamp(bright - prefilter.x + prefilter.y, 0.0, 2.0 * prefilter.y);
+  let q = (soft * soft) / (4.0 * max(prefilter.y, 1e-4) + 1e-6);
+  let contrib = max(q, bright - prefilter.x) / max(bright, 1e-4);
+  return vec4f(max(avg * contrib, vec3f(0.0)), 1.0);
 }
 `;
 
-const bloomCombineShader = `
-struct CombineParams {
-  bloomIntensity: f32,
-  pad0: f32,
-  pad1: f32,
-  pad2: f32,
-};
+const bloomDownsampleShader = /* wgsl */ `${FULLSCREEN_VS}
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var srcSamp: sampler;
 
+fn samp(uv: vec2f, off: vec2f) -> vec3f {
+  return textureSampleLevel(srcTex, srcSamp, uv + off, 0.0).rgb;
+}
+
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let srcDims = vec2f(textureDimensions(srcTex));
+  let t = 1.0 / srcDims;
+  let dstDims = srcDims * 0.5;
+  let uv = p.xy / max(dstDims, vec2f(1.0));
+  let A = samp(uv, t * vec2f(-2.0, -2.0));
+  let B = samp(uv, t * vec2f( 0.0, -2.0));
+  let C = samp(uv, t * vec2f( 2.0, -2.0));
+  let D = samp(uv, t * vec2f(-1.0, -1.0));
+  let E = samp(uv, t * vec2f( 1.0, -1.0));
+  let F = samp(uv, t * vec2f(-2.0,  0.0));
+  let G = samp(uv, t * vec2f( 0.0,  0.0));
+  let H = samp(uv, t * vec2f( 2.0,  0.0));
+  let I = samp(uv, t * vec2f(-1.0,  1.0));
+  let J = samp(uv, t * vec2f( 1.0,  1.0));
+  let K = samp(uv, t * vec2f(-2.0,  2.0));
+  let L = samp(uv, t * vec2f( 0.0,  2.0));
+  let M = samp(uv, t * vec2f( 2.0,  2.0));
+  var o = (D + E + I + J) * (0.5 / 4.0);
+  o = o + (A + B + G + F) * (0.125 / 4.0);
+  o = o + (B + C + H + G) * (0.125 / 4.0);
+  o = o + (F + G + L + K) * (0.125 / 4.0);
+  o = o + (G + H + M + L) * (0.125 / 4.0);
+  return vec4f(o, 1.0);
+}
+`;
+
+const bloomUpsampleShader = /* wgsl */ `${FULLSCREEN_VS}
+@group(0) @binding(0) var srcTex: texture_2d<f32>;
+@group(0) @binding(1) var baseTex: texture_2d<f32>;
+@group(0) @binding(2) var srcSamp: sampler;
+@group(0) @binding(3) var<uniform> upU: vec4<f32>;
+
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let srcDims = vec2f(textureDimensions(srcTex));
+  let baseDims = vec2f(textureDimensions(baseTex));
+  let uv = p.xy / max(baseDims, vec2f(1.0));
+  let t = upU.x / srcDims;
+  var o = textureSampleLevel(srcTex, srcSamp, uv + t * vec2f(-1.0, -1.0), 0.0).rgb * 1.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f( 0.0, -1.0), 0.0).rgb * 2.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f( 1.0, -1.0), 0.0).rgb * 1.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f(-1.0,  0.0), 0.0).rgb * 2.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f( 0.0,  0.0), 0.0).rgb * 4.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f( 1.0,  0.0), 0.0).rgb * 2.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f(-1.0,  1.0), 0.0).rgb * 1.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f( 0.0,  1.0), 0.0).rgb * 2.0;
+  o = o + textureSampleLevel(srcTex, srcSamp, uv + t * vec2f( 1.0,  1.0), 0.0).rgb * 1.0;
+  o = o * (1.0 / 16.0);
+  let base = textureSampleLevel(baseTex, srcSamp, uv, 0.0).rgb;
+  return vec4f(o + base, 1.0);
+}
+`;
+
+const bloomCombineShader = /* wgsl */ `${FULLSCREEN_VS}
 @group(0) @binding(0) var sceneTex: texture_2d<f32>;
 @group(0) @binding(1) var bloomTex: texture_2d<f32>;
-@group(0) @binding(2) var texSampler: sampler;
-@group(0) @binding(3) var<uniform> params: CombineParams;
+@group(0) @binding(2) var texSamp: sampler;
+@group(0) @binding(3) var<uniform> combineParams: vec4<f32>;
 
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
-  var pos = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0)
-  );
-  var out: VSOut;
-  out.position = vec4<f32>(pos[vi], 0.0, 1.0);
-  out.uv = pos[vi] * 0.5 + 0.5;
-  return out;
-}
-
-@fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
-  let scene = textureSample(sceneTex, texSampler, in.uv).rgb;
-  let bloom = textureSample(bloomTex, texSampler, in.uv).rgb;
-  return vec4<f32>(scene + bloom * params.bloomIntensity, 1.0);
+@fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+  let dims = vec2f(textureDimensions(sceneTex));
+  let uv = p.xy / dims;
+  let scene = textureSampleLevel(sceneTex, texSamp, uv, 0.0).rgb;
+  let bloom = textureSampleLevel(bloomTex, texSamp, uv, 0.0).rgb;
+  return vec4f(scene + bloom * combineParams.x, 1.0);
 }
 `;
-
-const BLUR_SLOT = 256;
 
 export class BloomPass {
   private device: GPUDevice;
   private format: GPUTextureFormat;
+  private blitPipeline!: GPURenderPipeline;
   private downsamplePipeline!: GPURenderPipeline;
-  private blurPipeline!: GPURenderPipeline;
+  private upsamplePipeline!: GPURenderPipeline;
   private combinePipeline!: GPURenderPipeline;
-  private sampler!: GPUSampler;
-  private blurParamBuffer!: GPUBuffer;
-  private combineParamBuffer!: GPUBuffer;
-  private pingPong: GPUTexture[] = [];
-  private pingPongViews: GPUTextureView[] = [];
-  private mipLevels = 5;
-  private blurParamData: Float32Array;
-  private combineParamData = new Float32Array(4);
-  private cachedSceneTexture: GPUTexture | null = null;
+  private linearSampler!: GPUSampler;
+  private blitUBO!: GPUBuffer;
+  private upsampleUBO!: GPUBuffer;
+  private combineUBO!: GPUBuffer;
+  private bloomDown: GPUTexture[] = [];
+  private bloomDownViews: GPUTextureView[] = [];
+  private bloomUp: GPUTexture[] = [];
+  private bloomUpViews: GPUTextureView[] = [];
+  private mipCount = 0;
+  private cachedSceneTex: GPUTexture | null = null;
   private cachedSceneView: GPUTextureView | null = null;
-  private cachedMipViews: GPUTextureView[] = [];
-  private cachedMipTextures: GPUTexture[] = [];
-  private lastBloomIntensity = -1;
 
-  bloomIntensity = 0.6;
+  bloomIntensity = 0.05;
+  threshold = 0.5;
+  knee = 0.5;
+  radius = 4.0;
+  clamp = 0.0;
 
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
     this.format = format;
-    this.blurParamData = new Float32Array(this.mipLevels * 2 * (BLUR_SLOT / 4));
-    for (let i = 0; i < this.mipLevels; i++) {
-      const hBase = i * 2 * (BLUR_SLOT / 4);
-      this.blurParamData[hBase + 0] = 1.0;
-      this.blurParamData[hBase + 1] = 0.0;
-      this.blurParamData[hBase + 2] = i;
-      this.blurParamData[hBase + 3] = 0.0;
-      const vBase = (i * 2 + 1) * (BLUR_SLOT / 4);
-      this.blurParamData[vBase + 0] = 0.0;
-      this.blurParamData[vBase + 1] = 1.0;
-      this.blurParamData[vBase + 2] = i;
-      this.blurParamData[vBase + 3] = 0.0;
-    }
     this.init();
   }
 
   private init() {
-    this.sampler = this.device.createSampler({
+    this.linearSampler = this.device.createSampler({
       magFilter: "linear",
       minFilter: "linear",
       addressModeU: "clamp-to-edge",
       addressModeV: "clamp-to-edge",
     });
 
-    this.blurParamBuffer = this.device.createBuffer({
-      label: "blur-params",
-      size: this.mipLevels * 2 * BLUR_SLOT,
+    this.blitUBO = this.device.createBuffer({
+      label: "bloom-blit-ubo",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.upsampleUBO = this.device.createBuffer({
+      label: "bloom-upsample-ubo",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.combineUBO = this.device.createBuffer({
+      label: "bloom-combine-ubo",
+      size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    this.combineParamBuffer = this.device.createBuffer({
-      label: "combine-params",
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    const blitModule = this.device.createShaderModule({ code: bloomBlitShader });
+    this.blitPipeline = this.device.createRenderPipeline({
+      label: "bloom-blit",
+      layout: "auto",
+      vertex: { module: blitModule, entryPoint: "vs" },
+      fragment: { module: blitModule, entryPoint: "fs", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-list" },
     });
 
     const dsModule = this.device.createShaderModule({ code: bloomDownsampleShader });
     this.downsamplePipeline = this.device.createRenderPipeline({
       label: "bloom-downsample",
       layout: "auto",
-      vertex: { module: dsModule, entryPoint: "vs_main" },
-      fragment: { module: dsModule, entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module: dsModule, entryPoint: "vs" },
+      fragment: { module: dsModule, entryPoint: "fs", targets: [{ format: this.format }] },
       primitive: { topology: "triangle-list" },
     });
 
-    const blurModule = this.device.createShaderModule({ code: bloomBlurShader });
-    const blurBGL = this.device.createBindGroupLayout({
-      entries: [
-        { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
-        { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
-        { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform", hasDynamicOffset: true } },
-      ],
-    });
-    this.blurPipeline = this.device.createRenderPipeline({
-      label: "bloom-blur",
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [blurBGL] }),
-      vertex: { module: blurModule, entryPoint: "vs_main" },
-      fragment: { module: blurModule, entryPoint: "fs_main", targets: [{ format: this.format }] },
+    const upModule = this.device.createShaderModule({ code: bloomUpsampleShader });
+    this.upsamplePipeline = this.device.createRenderPipeline({
+      label: "bloom-upsample",
+      layout: "auto",
+      vertex: { module: upModule, entryPoint: "vs" },
+      fragment: { module: upModule, entryPoint: "fs", targets: [{ format: this.format }] },
       primitive: { topology: "triangle-list" },
     });
 
@@ -224,80 +207,113 @@ export class BloomPass {
     this.combinePipeline = this.device.createRenderPipeline({
       label: "bloom-combine",
       layout: "auto",
-      vertex: { module: combineModule, entryPoint: "vs_main" },
-      fragment: { module: combineModule, entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module: combineModule, entryPoint: "vs" },
+      fragment: { module: combineModule, entryPoint: "fs", targets: [{ format: this.format }] },
       primitive: { topology: "triangle-list" },
     });
   }
 
+  private ensureTextures(w: number, h: number) {
+    const shortSide = Math.min(w, h);
+    const newMipCount = Math.min(5, Math.max(2, Math.floor(Math.log2(shortSide)) - 1));
+    if (newMipCount === this.mipCount && this.bloomDown.length > 0 &&
+        this.bloomDown[0].width === Math.floor(w / 2)) return;
+
+    for (const t of this.bloomDown) t.destroy();
+    for (const t of this.bloomUp) t.destroy();
+    this.bloomDown = [];
+    this.bloomUp = [];
+    this.bloomDownViews = [];
+    this.bloomUpViews = [];
+    this.mipCount = newMipCount;
+
+    let mw = Math.floor(w / 2);
+    let mh = Math.floor(h / 2);
+    for (let i = 0; i < this.mipCount; i++) {
+      const tex = this.device.createTexture({
+        label: `bloom-down-${i}`,
+        size: [Math.max(1, mw), Math.max(1, mh)],
+        format: this.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.bloomDown.push(tex);
+      this.bloomDownViews.push(tex.createView());
+      mw = Math.floor(mw / 2);
+      mh = Math.floor(mh / 2);
+    }
+
+    mw = Math.floor(w / 2);
+    mh = Math.floor(h / 2);
+    for (let i = 0; i < this.mipCount - 1; i++) {
+      const tex = this.device.createTexture({
+        label: `bloom-up-${i}`,
+        size: [Math.max(1, mw), Math.max(1, mh)],
+        format: this.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.bloomUp.push(tex);
+      this.bloomUpViews.push(tex.createView());
+      mw = Math.floor(mw / 2);
+      mh = Math.floor(mh / 2);
+    }
+  }
+
   private getSceneView(tex: GPUTexture): GPUTextureView {
-    if (this.cachedSceneTexture === tex && this.cachedSceneView) return this.cachedSceneView;
-    this.cachedSceneTexture = tex;
+    if (this.cachedSceneTex === tex && this.cachedSceneView) return this.cachedSceneView;
+    this.cachedSceneTex = tex;
     this.cachedSceneView = tex.createView();
     return this.cachedSceneView;
   }
 
-  private syncMipViews(mipTargets: GPUTexture[]) {
-    for (let i = 0; i < this.mipLevels; i++) {
-      if (this.cachedMipTextures[i] !== mipTargets[i]) {
-        this.cachedMipTextures[i] = mipTargets[i];
-        this.cachedMipViews[i] = mipTargets[i].createView();
-      }
-    }
-  }
+  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, outputTarget: GPUTextureView) {
+    const w = sceneTexture.width;
+    const h = sceneTexture.height;
+    this.ensureTextures(w, h);
 
-  execute(
-    encoder: GPUCommandEncoder,
-    sceneTexture: GPUTexture,
-    mipTargets: GPUTexture[],
-    outputTarget: GPUTextureView
-  ) {
     const sceneView = this.getSceneView(sceneTexture);
-    this.syncMipViews(mipTargets);
 
-    this.device.queue.writeBuffer(this.blurParamBuffer, 0, this.blurParamData as unknown as GPUAllowSharedBufferSource);
+    const blitData = new Float32Array([this.threshold, this.knee * 0.5, this.clamp, 0.0]);
+    this.device.queue.writeBuffer(this.blitUBO, 0, blitData as unknown as GPUAllowSharedBufferSource);
 
-    if (this.bloomIntensity !== this.lastBloomIntensity) {
-      this.lastBloomIntensity = this.bloomIntensity;
-      this.combineParamData[0] = this.bloomIntensity;
-      this.device.queue.writeBuffer(this.combineParamBuffer, 0, this.combineParamData as unknown as GPUAllowSharedBufferSource);
-    }
+    const upData = new Float32Array([Math.max(0.5, this.radius), 0.0, 0.0, 0.0]);
+    this.device.queue.writeBuffer(this.upsampleUBO, 0, upData as unknown as GPUAllowSharedBufferSource);
 
-    // Downsample scene to mip0
+    const combineData = new Float32Array([this.bloomIntensity, 0.0, 0.0, 0.0]);
+    this.device.queue.writeBuffer(this.combineUBO, 0, combineData as unknown as GPUAllowSharedBufferSource);
+
     {
       const bg = this.device.createBindGroup({
-        layout: this.downsamplePipeline.getBindGroupLayout(0),
+        layout: this.blitPipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: sceneView },
-          { binding: 1, resource: this.sampler },
+          { binding: 1, resource: { buffer: this.blitUBO } },
         ],
       });
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
-          view: this.cachedMipViews[0],
+          view: this.bloomDownViews[0],
           clearValue: { r: 0, g: 0, b: 0, a: 1 },
           loadOp: "clear",
           storeOp: "store",
         }],
       });
-      pass.setPipeline(this.downsamplePipeline);
+      pass.setPipeline(this.blitPipeline);
       pass.setBindGroup(0, bg);
       pass.draw(3);
       pass.end();
     }
 
-    // Progressive downsample through mip chain
-    for (let i = 1; i < this.mipLevels; i++) {
+    for (let i = 1; i < this.mipCount; i++) {
       const bg = this.device.createBindGroup({
         layout: this.downsamplePipeline.getBindGroupLayout(0),
         entries: [
-          { binding: 0, resource: this.cachedMipViews[i - 1] },
-          { binding: 1, resource: this.sampler },
+          { binding: 0, resource: this.bloomDownViews[i - 1] },
+          { binding: 1, resource: this.linearSampler },
         ],
       });
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
-          view: this.cachedMipViews[i],
+          view: this.bloomDownViews[i],
           clearValue: { r: 0, g: 0, b: 0, a: 1 },
           loadOp: "clear",
           storeOp: "store",
@@ -309,72 +325,46 @@ export class BloomPass {
       pass.end();
     }
 
-    // Blur each mip with dynamic offset into shared param buffer
-    const blurLayout = this.blurPipeline.getBindGroupLayout(0);
-    for (let i = 0; i < this.mipLevels; i++) {
-      const src = mipTargets[i];
-      const pp = this.getPingPong(i, src.width, src.height);
-      const ppView = this.pingPongViews[i];
-
-      const bgH = this.device.createBindGroup({
-        layout: blurLayout,
-        entries: [
-          { binding: 0, resource: this.cachedMipViews[i] },
-          { binding: 1, resource: this.sampler },
-          { binding: 2, resource: { buffer: this.blurParamBuffer, size: BLUR_SLOT } },
-        ],
-      });
-
-      // Horizontal: src -> pingpong
-      {
+    const upSteps = this.mipCount - 1;
+    if (upSteps > 0) {
+      const topIdx = this.mipCount - 1;
+      for (let k = 0; k < upSteps; k++) {
+        const outIdx = upSteps - 1 - k;
+        const srcView = k === 0 ? this.bloomDownViews[topIdx] : this.bloomUpViews[outIdx + 1];
+        const baseView = this.bloomDownViews[outIdx];
+        const bg = this.device.createBindGroup({
+          layout: this.upsamplePipeline.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: srcView },
+            { binding: 1, resource: baseView },
+            { binding: 2, resource: this.linearSampler },
+            { binding: 3, resource: { buffer: this.upsampleUBO } },
+          ],
+        });
         const pass = encoder.beginRenderPass({
           colorAttachments: [{
-            view: ppView,
+            view: this.bloomUpViews[outIdx],
             clearValue: { r: 0, g: 0, b: 0, a: 1 },
             loadOp: "clear",
             storeOp: "store",
           }],
         });
-        pass.setPipeline(this.blurPipeline);
-        pass.setBindGroup(0, bgH, [i * 2 * BLUR_SLOT]);
-        pass.draw(3);
-        pass.end();
-      }
-
-      const bgV = this.device.createBindGroup({
-        layout: blurLayout,
-        entries: [
-          { binding: 0, resource: ppView },
-          { binding: 1, resource: this.sampler },
-          { binding: 2, resource: { buffer: this.blurParamBuffer, size: BLUR_SLOT } },
-        ],
-      });
-
-      // Vertical: pingpong -> src
-      {
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [{
-            view: this.cachedMipViews[i],
-            loadOp: "clear",
-            storeOp: "store",
-          }],
-        });
-        pass.setPipeline(this.blurPipeline);
-        pass.setBindGroup(0, bgV, [(i * 2 + 1) * BLUR_SLOT]);
+        pass.setPipeline(this.upsamplePipeline);
+        pass.setBindGroup(0, bg);
         pass.draw(3);
         pass.end();
       }
     }
 
-    // Combine: scene + bloom
+    const bloomResultView = upSteps > 0 ? this.bloomUpViews[0] : this.bloomDownViews[0];
     {
       const bg = this.device.createBindGroup({
         layout: this.combinePipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: sceneView },
-          { binding: 1, resource: this.cachedMipViews[0] },
-          { binding: 2, resource: this.sampler },
-          { binding: 3, resource: { buffer: this.combineParamBuffer } },
+          { binding: 1, resource: bloomResultView },
+          { binding: 2, resource: this.linearSampler },
+          { binding: 3, resource: { buffer: this.combineUBO } },
         ],
       });
       const pass = encoder.beginRenderPass({
@@ -391,25 +381,11 @@ export class BloomPass {
     }
   }
 
-  private getPingPong(mipIndex: number, width: number, height: number): GPUTexture {
-    const existing = this.pingPong[mipIndex];
-    if (existing && existing.width === width && existing.height === height) {
-      return existing;
-    }
-    existing?.destroy();
-    this.pingPong[mipIndex] = this.device.createTexture({
-      label: `bloom-pingpong-${mipIndex}`,
-      size: [width, height],
-      format: this.format,
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-    });
-    this.pingPongViews[mipIndex] = this.pingPong[mipIndex].createView();
-    return this.pingPong[mipIndex];
-  }
-
   destroy() {
-    this.blurParamBuffer.destroy();
-    this.combineParamBuffer.destroy();
-    for (const t of this.pingPong) t.destroy();
+    this.blitUBO.destroy();
+    this.upsampleUBO.destroy();
+    this.combineUBO.destroy();
+    for (const t of this.bloomDown) t.destroy();
+    for (const t of this.bloomUp) t.destroy();
   }
 }

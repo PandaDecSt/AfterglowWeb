@@ -336,7 +336,7 @@ export class PMXDemo implements Demo {
   private shadowBGLayout!: GPUBindGroupLayout;
   private hdrTarget!: HDRRenderTarget;
   private bloom!: BloomPass;
-  private bloomMips: GPUTexture[] = [];
+
   private resolvedHDR: GPUTexture | null = null;
   private bloomOutput: GPUTexture | null = null;
   private bloomOutputView: GPUTextureView | null = null;
@@ -553,7 +553,7 @@ export class PMXDemo implements Demo {
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
     this.bloom = new BloomPass(this.device, HDR_FORMAT);
-    this.ensureBloomMips(w, h);
+
 
     if (pmx.bones.length > 0) {
       const boneDescs: BoneDesc[] = pmx.bones.map((b, i) => {
@@ -685,17 +685,6 @@ export class PMXDemo implements Demo {
     });
   }
 
-  private ensureBloomMips(w: number, h: number): void {
-    const mipCount = 5;
-    for (let i = 0; i < mipCount; i++) {
-      const mw = Math.max(1, Math.floor(w / (2 ** (i + 1))));
-      const mh = Math.max(1, Math.floor(h / (2 ** (i + 1))));
-      const existing = this.bloomMips[i];
-      if (existing && existing.width === mw && existing.height === mh) continue;
-      existing?.destroy();
-      this.bloomMips[i] = this.device.createTexture({ label: `bloom-mip-${i}`, size: [mw, mh], format: HDR_FORMAT, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
-    }
-  }
 
   update(time: number, deltaTime: number): void {
     if (!this.loaded) return;
@@ -714,7 +703,7 @@ export class PMXDemo implements Demo {
     const h = this.ctx.canvas.height;
     if (w !== this.hdrTarget.w || h !== this.hdrTarget.h) {
       this.hdrTarget.resize(w, h);
-      this.ensureBloomMips(w, h);
+
     }
     const viewProj = this.camera.getViewProjectionMatrix(w / h);
     const model = mat4.identity(mat4.create());
@@ -754,7 +743,7 @@ export class PMXDemo implements Demo {
         if (!this.loaded) return;
         const w = this.ctx.canvas.width;
         const h = this.ctx.canvas.height;
-        if (this.hdrTarget.w !== w || this.hdrTarget.h !== h) { this.hdrTarget.resize(w, h); this.ensureBloomMips(w, h); }
+        if (this.hdrTarget.w !== w || this.hdrTarget.h !== h) { this.hdrTarget.resize(w, h); }
 
         const shadowPass = this.shadowMap.beginShadowPass(encoder);
         shadowPass.setPipeline(this.shadowPipeline);
@@ -814,7 +803,7 @@ export class PMXDemo implements Demo {
         encoder.copyTextureToTexture({ texture: this.hdrTarget.colorTarget.texture }, { texture: this.resolvedHDR }, [w, h]);
 
         if (this.bloomEnabled) {
-          this.bloom.execute(encoder, this.resolvedHDR, this.bloomMips, this.bloomOutputView!);
+          this.bloom.execute(encoder, this.resolvedHDR, this.bloomOutputView!);
           this.applyTonemap(encoder, view, this.ctx.format, this.bloomOutputView!);
         } else {
           const hdrView = this.resolvedHDR.createView();
@@ -889,7 +878,10 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
   registerGUI(gui: any) {
     gui.add(this, "bloomEnabled").name("Bloom");
-    gui.add(this.bloom, "bloomIntensity", 0, 2, 0.01).name("Bloom Intensity");
+    gui.add(this.bloom, "bloomIntensity", 0, 1, 0.01).name("Bloom Intensity");
+    gui.add(this.bloom, "threshold", 0, 2, 0.01).name("Bloom Threshold");
+    gui.add(this.bloom, "knee", 0, 1, 0.01).name("Bloom Knee");
+    gui.add(this.bloom, "radius", 0.5, 10, 0.1).name("Bloom Radius");
   }
 
   destroy(): void {
@@ -906,7 +898,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.bloomOutput?.destroy();
     this.toneUBO?.destroy();
     this._depthTex?.destroy();
-    for (const t of this.bloomMips) t?.destroy();
+
     for (const t of this.gpuTextures) t.destroy();
     this.gpuTextures = [];
     this.matRenders = [];

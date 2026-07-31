@@ -113,12 +113,12 @@ export class ShowcaseDemo implements Demo {
   private uniformBuffer!: GPUBuffer;
   private bindGroup!: GPUBindGroup;
   private indexCount = 0;
-  private mipTargets: GPUTexture[] = [];
+
 
   private vsCode = sceneVS;
   private fsCode = sceneFS;
 
-  bloomIntensity = 0.6;
+  bloomIntensity = 0.05;
   emissive = 2.0;
 
   init(ctx: GPUContext, camera: Camera, engine?: EngineContext) {
@@ -233,29 +233,6 @@ export class ShowcaseDemo implements Demo {
     return this.buildPipeline();
   }
 
-  private ensureMipTargets() {
-    const w = this.ctx.canvas.width;
-    const h = this.ctx.canvas.height;
-    if (this.mipTargets.length > 0 && this.mipTargets[0].width === Math.floor(w / 2)) return;
-
-    for (const t of this.mipTargets) t.destroy();
-    this.mipTargets = [];
-
-    let mw = Math.floor(w / 2);
-    let mh = Math.floor(h / 2);
-    for (let i = 0; i < 5; i++) {
-      this.mipTargets.push(
-        this.device.createTexture({
-          label: `bloom-mip-${i}`,
-          size: [Math.max(1, mw), Math.max(1, mh)],
-          format: "rgba16float",
-          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
-        })
-      );
-      mw = Math.floor(mw / 2);
-      mh = Math.floor(mh / 2);
-    }
-  }
 
   private uboData = new Float32Array(64);
 
@@ -301,7 +278,7 @@ export class ShowcaseDemo implements Demo {
       label: this.label,
       execute: (encoder: GPUCommandEncoder, screenView: GPUTextureView) => {
         this.passManager.resize(this.ctx.canvas.width, this.ctx.canvas.height);
-        this.ensureMipTargets();
+
 
         const sceneRT = this.passManager.getOrCreateTarget("scene-color", "rgba16float");
         const depthTarget = this.passManager.getOrCreateDepth("scene-depth");
@@ -332,7 +309,7 @@ export class ShowcaseDemo implements Demo {
           pass.end();
         }
 
-        this.bloomPass.execute(encoder, sceneRT.texture, this.mipTargets, bloomRT.view);
+        this.bloomPass.execute(encoder, sceneRT.texture, bloomRT.view);
 
         // Pass camera/light info to post-process
         const pp = this.postProcessPass;
@@ -356,7 +333,7 @@ export class ShowcaseDemo implements Demo {
 
   stats() {
     return {
-      drawCalls: 1 + 5 * 2 + 1 + 1,
+      drawCalls: 1 + 1 + 1 + 1,
       triangles: this.indexCount / 3,
       custom: {
         "Bloom Mips": 5,
@@ -366,7 +343,7 @@ export class ShowcaseDemo implements Demo {
   }
 
   registerGUI(gui: any) {
-    gui.add(this, "bloomIntensity", 0, 3, 0.01).name("Bloom Intensity");
+    gui.add(this, "bloomIntensity", 0, 1, 0.01).name("Bloom Intensity");
     gui.add(this, "emissive", 0, 5, 0.1).name("Emissive");
     const pp = this.postProcessPass.params;
     const fxFolder = gui.addFolder("Post Process");
@@ -386,7 +363,7 @@ export class ShowcaseDemo implements Demo {
   }
 
   destroy() {
-    for (const t of this.mipTargets) t.destroy();
+
     this.vertexBuffer.destroy();
     this.indexBuffer.destroy();
     this.uniformBuffer.destroy();
