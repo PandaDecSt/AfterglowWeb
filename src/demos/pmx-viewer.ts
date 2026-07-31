@@ -468,6 +468,7 @@ export class PMXDemo implements Demo {
   private bloom!: BloomPass;
 
   private resolvedHDR: GPUTexture | null = null;
+  private resolvedHDRView: GPUTextureView | null = null;
   private bloomMaskTex: GPUTexture | null = null;
   private bloomMaskView: GPUTextureView | null = null;
   private bloomOutput: GPUTexture | null = null;
@@ -480,6 +481,7 @@ export class PMXDemo implements Demo {
   private toneSampler!: GPUSampler;
 
   private matRenders: MatRenderData[] = [];
+  private opaqueOrder: MatRenderData[] = [];
   private gpuTextures: GPUTexture[] = [];
 
   private skeleton: Skeleton | null = null;
@@ -501,6 +503,7 @@ export class PMXDemo implements Demo {
   lightX = 5;
   lightY = 10;
   lightZ = 8;
+  shadowRes = 2048;
 
   private loaded = false;
   private _renderLogOnce = true;
@@ -573,7 +576,7 @@ export class PMXDemo implements Demo {
     else { new Uint16Array(this.indexBuffer.getMappedRange()).set(pmx.indices); }
     this.indexBuffer.unmap();
 
-    this.shadowMap = new ShadowMap(this.device, 4096);
+    this.shadowMap = new ShadowMap(this.device, 2048);
     this.shadowMap.orthoSize = 64;
     this.shadowMap.near = 1;
     this.shadowMap.far = 140;
@@ -694,6 +697,11 @@ export class PMXDemo implements Demo {
       this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass, castsShadow });
       indexOffset += matIndexCount;
     }
+
+    const rcRank = (rc: RenderClass) => rc === "eye" ? 1 : rc === "hair" ? 2 : 0;
+    this.opaqueOrder = this.matRenders
+      .filter(mr => !mr.isTransparent)
+      .sort((a, b) => rcRank(a.renderClass) - rcRank(b.renderClass));
 
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
@@ -987,13 +995,7 @@ export class PMXDemo implements Demo {
         mainPass.setIndexBuffer(this.indexBuffer, this.use32bit ? "uint32" : "uint16");
         mainPass.setStencilReference(1);
 
-        const rcRank = (rc: RenderClass) => rc === "eye" ? 1 : rc === "hair" ? 2 : 0;
-        const opaqueOrder = this.matRenders
-          .map((mr, i) => ({ mr, i }))
-          .filter(x => !x.mr.isTransparent)
-          .sort((a, b) => rcRank(a.mr.renderClass) - rcRank(b.mr.renderClass));
-
-        for (const { mr } of opaqueOrder) {
+        for (const mr of this.opaqueOrder) {
           if (mr.hasEdge && mr.outlineBG) {
             mainPass.setPipeline(this.outlinePipeline);
             mainPass.setBindGroup(0, mr.outlineBG);
@@ -1013,7 +1015,7 @@ export class PMXDemo implements Demo {
         }
 
         if (this.stencilEnabled) {
-          for (const { mr } of opaqueOrder) {
+          for (const mr of this.opaqueOrder) {
             if (mr.renderClass !== "hair") continue;
             mainPass.setPipeline(this.hairOverEyesPipeline);
             mainPass.setBindGroup(0, mr.mainBG);
@@ -1042,22 +1044,15 @@ export class PMXDemo implements Demo {
         if (!this.resolvedHDR || this.resolvedHDR.width !== w || this.resolvedHDR.height !== h) {
           this.resolvedHDR?.destroy();
           this.resolvedHDR = this.device.createTexture({ label: "resolved-hdr", size: [w, h], format: HDR_FORMAT, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING });
-        }
-        if (!this.bloomOutput || this.bloomOutput.width !== w || this.bloomOutput.height !== h) {
-          this.bloomOutput?.destroy();
-          this.bloomOutput = this.device.createTexture({ label: "bloom-output", size: [w, h], format: HDR_FORMAT, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
-          this.bloomOutputView = this.bloomOutput.createView();
-          this.tonePipeline = null;
-          this.toneBindGroup = null;
+          this.resolvedHDRView = this.resolvedHDR.createView();
         }
         encoder.copyTextureToTexture({ texture: this.hdrTarget.colorTarget.texture }, { texture: this.resolvedHDR }, [w, h]);
 
         if (this.bloomEnabled) {
-          this.bloom.execute(encoder, this.resolvedHDR, this.bloomOutputView!, this.bloomMaskTex!);
-          this.applyTonemap(encoder, view, this.ctx.format, this.bloomOutputView!);
+          const bloomView = this.bloom.execute(encoder, this.resolvedHDR, this.bloomMaskView!);
+          this.applyTonemap(encoder, view, this.ctx.format, this.resolvedHDRView!, bloomView, this.bloom.bloomIntensity);
         } else {
-          const hdrView = this.resolvedHDR.createView();
-          this.applyTonemap(encoder, view, this.ctx.format, hdrView);
+          this.applyTonemap(encoder, view, this.ctx.format, this.resolvedHDRView!, null, 0);
         }
       },
     }];
@@ -1071,6 +1066,12 @@ export class PMXDemo implements Demo {
   saturation = 1.0;
   contrast = 1.0;
   private filmicLUT: GPUTexture | null = null;
+  private filmicLUTView: GPUTextureView | null = null;
+  private toneBGSceneView: GPUTextureView | null = null;
+  private toneBGBloomView: GPUTextureView | null = null;
+  private blackTex: GPUTexture | null = null;
+  private blackTexView: GPUTextureView | null = null;
+  private bloomParamsUBO!: GPUBuffer;
 
   private buildFilmicLUT(): GPUTexture {
     if (this.filmicLUT) return this.filmicLUT;
@@ -1096,10 +1097,11 @@ export class PMXDemo implements Demo {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
     this.device.queue.writeTexture({ texture: this.filmicLUT }, data as unknown as GPUAllowSharedBufferSource, { bytesPerRow: LUT_W * 16 }, [LUT_W, 1]);
+    this.filmicLUTView = this.filmicLUT.createView();
     return this.filmicLUT;
   }
 
-  private applyTonemap(encoder: GPUCommandEncoder, screenView: GPUTextureView, screenFormat: GPUTextureFormat, srcView: GPUTextureView): void {
+  private applyTonemap(encoder: GPUCommandEncoder, screenView: GPUTextureView, screenFormat: GPUTextureFormat, sceneView: GPUTextureView, bloomView: GPUTextureView | null, bloomIntensity: number): void {
     if (!this.tonePipeline) {
       const lut = this.buildFilmicLUT();
       const code = `
@@ -1110,6 +1112,8 @@ struct Params { exposure: f32, gamma: f32, contrast: f32, flags: u32 };
 @group(0) @binding(3) var filmicLut: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> grade: vec4<f32>;
 @group(0) @binding(5) var<uniform> grade2: vec4<f32>;
+@group(0) @binding(6) var bloomTex: texture_2d<f32>;
+@group(0) @binding(7) var<uniform> bloomParams: vec4<f32>;
 
 fn filmicLUT(x: f32) -> f32 {
   let t = clamp(log2(max(x, 1e-10)) + 10.0, 0.0, 13.0);
@@ -1137,7 +1141,9 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let dims = vec2<f32>(textureDimensions(srcTex));
   let uv = pos.xy / dims;
-  var color = textureSample(srcTex, srcSampler, uv).rgb * p.exposure;
+  let scene = textureSample(srcTex, srcSampler, uv).rgb;
+  let bloom = textureSample(bloomTex, srcSampler, uv).rgb;
+  var color = (scene + bloom * bloomParams.x) * p.exposure;
   let doTonemap = (p.flags & 1u) != 0u;
   let doGrade = (p.flags & 2u) != 0u;
   if (doTonemap) {
@@ -1169,8 +1175,14 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
       this.gradeUBO = this.device.createBuffer({ label: "grade-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.grade2UBO = this.device.createBuffer({ label: "grade2-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     }
-    const w = this.ctx.canvas.width;
-    const h = this.ctx.canvas.height;
+    if (!this.bloomParamsUBO) {
+      this.bloomParamsUBO = this.device.createBuffer({ label: "bloom-params-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    if (!this.blackTex) {
+      this.blackTex = this.device.createTexture({ label: "tonemap-black", size: [1, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+      this.device.queue.writeTexture({ texture: this.blackTex }, new Uint8Array([0, 0, 0, 0]), { bytesPerRow: 4 }, [1, 1]);
+      this.blackTexView = this.blackTex.createView();
+    }
     const flags = (this.tonemapEnabled ? 1 : 0) | (this.gradeEnabled ? 2 : 0);
     const data = new ArrayBuffer(16);
     const f32 = new Float32Array(data);
@@ -1181,42 +1193,66 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.device.queue.writeBuffer(this.gradeUBO, 0, gd as unknown as GPUAllowSharedBufferSource);
     const gd2 = new Float32Array([this.power, this.power, this.power, this.saturation]);
     this.device.queue.writeBuffer(this.grade2UBO, 0, gd2 as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.bloomParamsUBO, 0, new Float32Array([bloomIntensity, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
 
     if (!this.toneSampler) {
       this.toneSampler = this.device.createSampler({ magFilter: "linear", minFilter: "linear" });
     }
-    const lutView = this.filmicLUT!.createView();
-    const bg = this.device.createBindGroup({
-      layout: this.tonePipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: this.toneUBO } },
-        { binding: 1, resource: srcView },
-        { binding: 2, resource: this.toneSampler },
-        { binding: 3, resource: lutView },
-        { binding: 4, resource: { buffer: this.gradeUBO } },
-        { binding: 5, resource: { buffer: this.grade2UBO } },
-      ],
-    });
+    const effectiveBloomView = bloomView ?? this.blackTexView!;
+    if (!this.toneBindGroup || sceneView !== this.toneBGSceneView || effectiveBloomView !== this.toneBGBloomView) {
+      this.toneBindGroup = this.device.createBindGroup({
+        layout: this.tonePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.toneUBO } },
+          { binding: 1, resource: sceneView },
+          { binding: 2, resource: this.toneSampler },
+          { binding: 3, resource: this.filmicLUTView! },
+          { binding: 4, resource: { buffer: this.gradeUBO } },
+          { binding: 5, resource: { buffer: this.grade2UBO } },
+          { binding: 6, resource: effectiveBloomView },
+          { binding: 7, resource: { buffer: this.bloomParamsUBO } },
+        ],
+      });
+      this.toneBGSceneView = sceneView;
+      this.toneBGBloomView = effectiveBloomView;
+    }
 
     const pass = encoder.beginRenderPass({
       colorAttachments: [{ view: screenView, loadOp: "clear", storeOp: "store" }],
     });
     pass.setPipeline(this.tonePipeline);
-    pass.setBindGroup(0, bg);
+    pass.setBindGroup(0, this.toneBindGroup);
     pass.draw(3);
     pass.end();
   }
 
+
+  private setShadowResolution(size: number): void {
+    if (size === this.shadowMap.size) return;
+    this.shadowMap.resize(size);
+    for (const mr of this.matRenders) {
+      mr.shadowBG = this.device.createBindGroup({
+        layout: this.shadowBGLayout,
+        entries: [
+          { binding: 0, resource: this.shadowMap.view },
+          { binding: 1, resource: this.shadowMap.sampler },
+          { binding: 2, resource: { buffer: this.shadowMap.getVPBuffer() } },
+        ],
+      });
+    }
+  }
 
   registerGUI(gui: any) {
     gui.add(this, "bloomEnabled").name("Bloom");
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
     gui.add(this, "gradeEnabled").name("Color Grading");
     gui.add(this, "stencilEnabled").name("Eye Stencil");
+    gui.add(this, "shadowRes", [1024, 2048, 4096]).name("Shadow Res").onChange((v: number) => this.setShadowResolution(v));
     gui.add(this.bloom, "bloomIntensity", 0, 1, 0.01).name("Bloom Intensity");
     gui.add(this.bloom, "threshold", 0, 2, 0.01).name("Bloom Threshold");
     gui.add(this.bloom, "knee", 0, 1, 0.01).name("Bloom Knee");
     gui.add(this.bloom, "radius", 0.5, 10, 0.1).name("Bloom Radius");
+    gui.add(this.bloom, "maxMips", [2, 3, 4, 5]).name("Bloom Mips");
     const toneFolder = gui.addFolder("Tone Mapping");
     toneFolder.add(this, "exposure", 0.1, 3, 0.01).name("Exposure");
     toneFolder.add(this, "gamma", 1.0, 3.0, 0.01).name("Gamma");

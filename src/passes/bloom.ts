@@ -144,12 +144,20 @@ export class BloomPass {
   private cachedSceneView: GPUTextureView | null = null;
   private whiteTex!: GPUTexture;
   private whiteTexView!: GPUTextureView;
+  private downBGs: GPUBindGroup[] = [];
+  private upBGs: GPUBindGroup[] = [];
+  private blitBG: GPUBindGroup | null = null;
+  private combineBG: GPUBindGroup | null = null;
+  private bgSceneView: GPUTextureView | null = null;
+  private bgMaskView: GPUTextureView | null = null;
+  private bgDirty = true;
 
   bloomIntensity = 0.05;
   threshold = 0.5;
   knee = 0.5;
   radius = 4.0;
   clamp = 0.0;
+  maxMips = 5;
 
   constructor(device: GPUDevice, format: GPUTextureFormat) {
     this.device = device;
@@ -225,7 +233,7 @@ export class BloomPass {
 
   private ensureTextures(w: number, h: number) {
     const shortSide = Math.min(w, h);
-    const newMipCount = Math.min(5, Math.max(2, Math.floor(Math.log2(shortSide)) - 1));
+    const newMipCount = Math.min(this.maxMips, Math.max(2, Math.floor(Math.log2(shortSide)) - 1));
     if (newMipCount === this.mipCount && this.bloomDown.length > 0 &&
         this.bloomDown[0].width === Math.floor(w / 2)) return;
 
@@ -266,6 +274,40 @@ export class BloomPass {
       mw = Math.floor(mw / 2);
       mh = Math.floor(mh / 2);
     }
+
+    this.rebuildMipBindGroups();
+    this.bgDirty = true;
+  }
+
+  private rebuildMipBindGroups() {
+    this.downBGs = [];
+    for (let i = 1; i < this.mipCount; i++) {
+      this.downBGs.push(this.device.createBindGroup({
+        layout: this.downsamplePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.bloomDownViews[i - 1] },
+          { binding: 1, resource: this.linearSampler },
+        ],
+      }));
+    }
+
+    this.upBGs = [];
+    const upSteps = this.mipCount - 1;
+    const topIdx = this.mipCount - 1;
+    for (let k = 0; k < upSteps; k++) {
+      const outIdx = upSteps - 1 - k;
+      const srcView = k === 0 ? this.bloomDownViews[topIdx] : this.bloomUpViews[outIdx + 1];
+      const baseView = this.bloomDownViews[outIdx];
+      this.upBGs.push(this.device.createBindGroup({
+        layout: this.upsamplePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: srcView },
+          { binding: 1, resource: baseView },
+          { binding: 2, resource: this.linearSampler },
+          { binding: 3, resource: { buffer: this.upsampleUBO } },
+        ],
+      }));
+    }
   }
 
   private getSceneView(tex: GPUTexture): GPUTextureView {
@@ -275,12 +317,13 @@ export class BloomPass {
     return this.cachedSceneView;
   }
 
-  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, outputTarget: GPUTextureView, maskTexture?: GPUTexture) {
+  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, maskView?: GPUTextureView): GPUTextureView {
     const w = sceneTexture.width;
     const h = sceneTexture.height;
     this.ensureTextures(w, h);
 
     const sceneView = this.getSceneView(sceneTexture);
+    const effectiveMaskView = maskView ?? this.whiteTexView;
 
     const blitData = new Float32Array([this.threshold, this.knee * 0.5, this.clamp, 0.0]);
     this.device.queue.writeBuffer(this.blitUBO, 0, blitData as unknown as GPUAllowSharedBufferSource);
@@ -288,23 +331,24 @@ export class BloomPass {
     const upData = new Float32Array([Math.max(0.5, this.radius), 0.0, 0.0, 0.0]);
     this.device.queue.writeBuffer(this.upsampleUBO, 0, upData as unknown as GPUAllowSharedBufferSource);
 
-    const combineData = new Float32Array([this.bloomIntensity, 0.0, 0.0, 0.0]);
-    this.device.queue.writeBuffer(this.combineUBO, 0, combineData as unknown as GPUAllowSharedBufferSource);
+    const upSteps = this.mipCount - 1;
+    const bloomResultView = upSteps > 0 ? this.bloomUpViews[0] : this.bloomDownViews[0];
+
+    if (this.bgDirty || sceneView !== this.bgSceneView || effectiveMaskView !== this.bgMaskView) {
+      this.blitBG = this.device.createBindGroup({
+        layout: this.blitPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: sceneView },
+          { binding: 1, resource: { buffer: this.blitUBO } },
+          { binding: 2, resource: effectiveMaskView },
+        ],
+      });
+      this.bgSceneView = sceneView;
+      this.bgMaskView = effectiveMaskView;
+      this.bgDirty = false;
+    }
 
     {
-      const blitEntries: GPUBindGroupEntry[] = [
-        { binding: 0, resource: sceneView },
-        { binding: 1, resource: { buffer: this.blitUBO } },
-      ];
-      if (maskTexture) {
-        blitEntries.push({ binding: 2, resource: maskTexture.createView() });
-      } else {
-        blitEntries.push({ binding: 2, resource: this.whiteTexView });
-      }
-      const bg = this.device.createBindGroup({
-        layout: this.blitPipeline.getBindGroupLayout(0),
-        entries: blitEntries,
-      });
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
           view: this.bloomDownViews[0],
@@ -314,19 +358,12 @@ export class BloomPass {
         }],
       });
       pass.setPipeline(this.blitPipeline);
-      pass.setBindGroup(0, bg);
+      pass.setBindGroup(0, this.blitBG);
       pass.draw(3);
       pass.end();
     }
 
     for (let i = 1; i < this.mipCount; i++) {
-      const bg = this.device.createBindGroup({
-        layout: this.downsamplePipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: this.bloomDownViews[i - 1] },
-          { binding: 1, resource: this.linearSampler },
-        ],
-      });
       const pass = encoder.beginRenderPass({
         colorAttachments: [{
           view: this.bloomDownViews[i],
@@ -336,27 +373,14 @@ export class BloomPass {
         }],
       });
       pass.setPipeline(this.downsamplePipeline);
-      pass.setBindGroup(0, bg);
+      pass.setBindGroup(0, this.downBGs[i - 1]);
       pass.draw(3);
       pass.end();
     }
 
-    const upSteps = this.mipCount - 1;
     if (upSteps > 0) {
-      const topIdx = this.mipCount - 1;
       for (let k = 0; k < upSteps; k++) {
         const outIdx = upSteps - 1 - k;
-        const srcView = k === 0 ? this.bloomDownViews[topIdx] : this.bloomUpViews[outIdx + 1];
-        const baseView = this.bloomDownViews[outIdx];
-        const bg = this.device.createBindGroup({
-          layout: this.upsamplePipeline.getBindGroupLayout(0),
-          entries: [
-            { binding: 0, resource: srcView },
-            { binding: 1, resource: baseView },
-            { binding: 2, resource: this.linearSampler },
-            { binding: 3, resource: { buffer: this.upsampleUBO } },
-          ],
-        });
         const pass = encoder.beginRenderPass({
           colorAttachments: [{
             view: this.bloomUpViews[outIdx],
@@ -366,35 +390,13 @@ export class BloomPass {
           }],
         });
         pass.setPipeline(this.upsamplePipeline);
-        pass.setBindGroup(0, bg);
+        pass.setBindGroup(0, this.upBGs[k]);
         pass.draw(3);
         pass.end();
       }
     }
 
-    const bloomResultView = upSteps > 0 ? this.bloomUpViews[0] : this.bloomDownViews[0];
-    {
-      const bg = this.device.createBindGroup({
-        layout: this.combinePipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: sceneView },
-          { binding: 1, resource: bloomResultView },
-          { binding: 2, resource: this.linearSampler },
-          { binding: 3, resource: { buffer: this.combineUBO } },
-        ],
-      });
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: outputTarget,
-          loadOp: "clear",
-          storeOp: "store",
-        }],
-      });
-      pass.setPipeline(this.combinePipeline);
-      pass.setBindGroup(0, bg);
-      pass.draw(3);
-      pass.end();
-    }
+    return bloomResultView;
   }
 
   destroy() {
