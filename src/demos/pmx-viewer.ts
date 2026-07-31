@@ -36,6 +36,7 @@ const PRESETS: Record<string, PresetConfig> = {
   face:         { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.5, rimColor: [1, 0.9, 0.8], rimStrength: 0.2, rimPower: 4.0, renderClass: "auto" },
   hair:         { metallic: 0.0, roughness: 0.3, emissionStrength: 0.0, nprMix: 0.2, rimColor: [1, 1, 1], rimStrength: 0.4, rimPower: 2.5, renderClass: "hair" },
   eye:          { metallic: 0.0, roughness: 0.1, emissionStrength: 1.5, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.0, rimPower: 3.0, renderClass: "eye" },
+  eyelash:      { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.3, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.0, renderClass: "eye" },
   metal:        { metallic: 1.0, roughness: 0.3, emissionStrength: 0.0, nprMix: 0.3, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 5.0, renderClass: "auto" },
   stockings:    { metallic: 0.0, roughness: 0.8, emissionStrength: 0.0, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.0, alphaMode: 1, renderClass: "auto" },
   cloth_smooth: { metallic: 0.0, roughness: 0.6, emissionStrength: 0.0, nprMix: 0.1, rimColor: [1, 1, 1], rimStrength: 0.15, rimPower: 3.0, renderClass: "auto" },
@@ -45,6 +46,7 @@ const PRESETS: Record<string, PresetConfig> = {
 function detectPreset(name: string, isTransparent: boolean): PresetConfig {
   const n = name.toLowerCase();
   if (n.includes("顔") || n.includes("面") || n.includes("face")) return PRESETS.face;
+  if (n.includes("睫") || n.includes("まつげ") || n.includes("まつ毛") || n.includes("eyelash")) return PRESETS.eyelash;
   if (n.includes("髪") || n.includes("毛") || n.includes("hair")) return PRESETS.hair;
   if (n.includes("目") || n.includes("眼") || n.includes("eye") || n.includes("瞳")) return PRESETS.eye;
   if (n.includes("金属") || n.includes("metal") || n.includes("メタル")) return PRESETS.metal;
@@ -117,6 +119,7 @@ fn vs_main(in: VSIn) -> VSOut {
 
 const MAIN_FS = `
 override IS_OVER_EYES: bool = false;
+override IS_EYE: bool = false;
 
 struct Scene {
   viewProj: mat4x4<f32>,
@@ -193,6 +196,7 @@ struct FSOut {
 
 @fragment
 fn fs_main(in: VSOut) -> FSOut {
+  if (IS_EYE && scene.cameraPos.z < in.worldPos.z) { discard; }
   let tex_s = textureSample(diffuseTex, texSampler, in.uv);
   let alpha = mat.diffuseColor_alpha.w * tex_s.a;
   if (mat.rimPower_pad.y > 0.5) {
@@ -816,8 +820,8 @@ export class PMXDemo implements Demo {
       label: "pmx-eye",
       layout: mainLayout,
       vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
-      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
+      fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets, constants: { IS_EYE: 1 } },
+      primitive: { topology: "triangle-list", cullMode: "back", frontFace: "cw" },
       depthStencil: {
         format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less", depthBias: -1, depthBiasSlopeScale: 0.0,
         stencilFront: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
@@ -997,7 +1001,7 @@ export class PMXDemo implements Demo {
         mainPass.setStencilReference(1);
 
         for (const mr of this.opaqueOrder) {
-          if (mr.hasEdge && mr.outlineBG) {
+          if (mr.hasEdge && mr.outlineBG && mr.renderClass !== "eye") {
             mainPass.setPipeline(this.outlinePipeline);
             mainPass.setBindGroup(0, mr.outlineBG);
             mainPass.setBindGroup(1, this.skinBG);
@@ -1013,17 +1017,6 @@ export class PMXDemo implements Demo {
           mainPass.setBindGroup(1, mr.shadowBG);
           mainPass.setBindGroup(2, this.skinBG);
           mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
-        }
-
-        if (this.stencilEnabled) {
-          for (const mr of this.opaqueOrder) {
-            if (mr.renderClass !== "hair") continue;
-            mainPass.setPipeline(this.hairOverEyesPipeline);
-            mainPass.setBindGroup(0, mr.mainBG);
-            mainPass.setBindGroup(1, mr.shadowBG);
-            mainPass.setBindGroup(2, this.skinBG);
-            mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
-          }
         }
 
         for (const mr of this.matRenders) {
