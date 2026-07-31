@@ -44,7 +44,7 @@ export class DepthTarget {
     this.texture = device.createTexture({
       label,
       size: [width, height],
-      format: "depth24plus",
+      format: "depth24plus-stencil8",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
     this.view = this.texture.createView();

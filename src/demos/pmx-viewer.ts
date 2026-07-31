@@ -15,6 +15,45 @@ import { decodeTGA } from "../utils/tga-loader";
 
 const HDR_FORMAT = "rgba16float";
 
+type RenderClass = "auto" | "eye" | "hair";
+
+interface PresetConfig {
+  metallic: number;
+  roughness: number;
+  emissionStrength: number;
+  nprMix: number;
+  rimColor: [number, number, number];
+  rimStrength: number;
+  rimPower: number;
+  alphaMode?: number;
+  renderClass: RenderClass;
+}
+
+const PRESETS: Record<string, PresetConfig> = {
+  default:      { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.0, rimPower: 3.0, renderClass: "auto" },
+  body:         { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.5, rimColor: [1, 0.85, 0.7], rimStrength: 0.3, rimPower: 3.0, renderClass: "auto" },
+  face:         { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.5, rimColor: [1, 0.9, 0.8], rimStrength: 0.2, rimPower: 4.0, renderClass: "auto" },
+  hair:         { metallic: 0.0, roughness: 0.3, emissionStrength: 0.0, nprMix: 0.2, rimColor: [1, 1, 1], rimStrength: 0.4, rimPower: 2.5, renderClass: "hair" },
+  eye:          { metallic: 0.0, roughness: 0.1, emissionStrength: 1.5, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.0, rimPower: 3.0, renderClass: "eye" },
+  metal:        { metallic: 1.0, roughness: 0.3, emissionStrength: 0.0, nprMix: 0.3, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 5.0, renderClass: "auto" },
+  stockings:    { metallic: 0.0, roughness: 0.8, emissionStrength: 0.0, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.0, alphaMode: 1, renderClass: "auto" },
+  cloth_smooth: { metallic: 0.0, roughness: 0.6, emissionStrength: 0.0, nprMix: 0.1, rimColor: [1, 1, 1], rimStrength: 0.15, rimPower: 3.0, renderClass: "auto" },
+  cloth_rough:  { metallic: 0.0, roughness: 0.82, emissionStrength: 0.0, nprMix: 0.1, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.5, renderClass: "auto" },
+};
+
+function detectPreset(name: string, isTransparent: boolean): PresetConfig {
+  const n = name.toLowerCase();
+  if (n.includes("顔") || n.includes("面") || n.includes("face")) return PRESETS.face;
+  if (n.includes("髪") || n.includes("毛") || n.includes("hair")) return PRESETS.hair;
+  if (n.includes("目") || n.includes("眼") || n.includes("eye") || n.includes("瞳")) return PRESETS.eye;
+  if (n.includes("金属") || n.includes("metal") || n.includes("メタル")) return PRESETS.metal;
+  if (n.includes("ストッキング") || n.includes("靴下") || n.includes("stocking") || n.includes("ニーソ")) return PRESETS.stockings;
+  if (isTransparent) return PRESETS.stockings;
+  if (n.includes("服") || n.includes("衣") || n.includes("cloth") || n.includes("シャツ") || n.includes("スカート")) return PRESETS.cloth_smooth;
+  if (n.includes("肌") || n.includes("体") || n.includes("body") || n.includes("skin")) return PRESETS.body;
+  return PRESETS.body;
+}
+
 const SCENE_VS = `
 struct Scene {
   viewProj: mat4x4<f32>,
@@ -42,9 +81,19 @@ struct VSOut {
   @location(2) uv: vec2<f32>,
 };
 
+fn safe_normal(n: vec3<f32>) -> vec3<f32> {
+  let l2 = dot(n, n);
+  if (l2 < 1e-12) { return vec3<f32>(0.0, 1.0, 0.0); }
+  return n * inverseSqrt(l2);
+}
+
 @vertex
 fn vs_main(in: VSIn) -> VSOut {
   var out: VSOut;
+
+  let weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+  let invW = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
+  let w = select(vec4<f32>(1.0, 0.0, 0.0, 0.0), in.weights * invW, weightSum > 0.0001);
 
   var skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
   var skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -52,14 +101,13 @@ fn vs_main(in: VSIn) -> VSOut {
   let nrm4 = vec4<f32>(in.normal, 0.0);
   for (var i = 0u; i < 4u; i++) {
     let j = in.joints[i];
-    let w = in.weights[i];
-    skinPos += skinMatrices[j] * pos4 * w;
-    skinNrm += skinMatrices[j] * nrm4 * w;
+    skinPos += skinMatrices[j] * pos4 * w[i];
+    skinNrm += skinMatrices[j] * nrm4 * w[i];
   }
 
   let worldPos = (scene.model * skinPos).xyz;
   out.position = scene.viewProj * vec4<f32>(worldPos, 1.0);
-  out.worldNormal = normalize((scene.model * skinNrm).xyz);
+  out.worldNormal = safe_normal((scene.model * skinNrm).xyz);
   out.worldPos = worldPos;
   out.uv = in.uv;
   return out;
@@ -67,6 +115,8 @@ fn vs_main(in: VSIn) -> VSOut {
 `;
 
 const MAIN_FS = `
+override IS_OVER_EYES: bool = false;
+
 struct Scene {
   viewProj: mat4x4<f32>,
   model: mat4x4<f32>,
@@ -77,13 +127,12 @@ struct Scene {
 @group(0) @binding(0) var<uniform> scene: Scene;
 
 struct Mat {
-  diffuseColor: vec3<f32>,
-  alpha: f32,
-  ambient: vec3<f32>,
-  shininess: f32,
-  specular: vec3<f32>,
-  sphereMode: f32,
-  _p0: f32, _p1: f32, _p2: f32,
+  diffuseColor_alpha: vec4<f32>,
+  ambient_shininess: vec4<f32>,
+  specular_sphereMode: vec4<f32>,
+  pbrParams: vec4<f32>,
+  rimColor_strength: vec4<f32>,
+  rimPower_pad: vec4<f32>,
 };
 @group(0) @binding(1) var<uniform> mat: Mat;
 
@@ -105,11 +154,52 @@ struct VSOut {
 
 ${SHADOW_WGSL}
 
+fn ggxNDF(NH: f32, a2: f32) -> f32 {
+  let d = NH * NH * (a2 - 1.0) + 1.0;
+  return a2 / (3.14159265 * d * d);
+}
+
+fn smithG2(NL: f32, NV: f32, k: f32) -> f32 {
+  return 1.0 / (4.0 * (NL * (1.0 - k) + k) * (NV * (1.0 - k) + k));
+}
+
+fn fresnelSchlick(VH: f32, F0: vec3<f32>) -> vec3<f32> {
+  return F0 + (1.0 - F0) * pow(1.0 - VH, 5.0);
+}
+
+fn hash3(p3: vec3<f32>) -> f32 {
+  var p = fract(p3 * 0.1031);
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.x + p.y) * p.z);
+}
+
+fn hashedAlphaThreshold(co: vec3<f32>, alphaHashScale: f32) -> f32 {
+  let dx = dpdx(co);
+  let dy = dpdy(co);
+  let maxDeriv = max(length(dx), length(dy));
+  let pixScale = 1.0 / max(alphaHashScale * maxDeriv, 1e-6);
+  let pixScaleFloor = floor(pixScale);
+  let baseHash = hash3(floor(co * pixScaleFloor));
+  let nextHash = hash3(floor(co * pixScaleFloor) + vec3<f32>(1.0));
+  let fracPart = fract(pixScale);
+  return mix(baseHash, nextHash, fracPart);
+}
+
+struct FSOut {
+  @location(0) color: vec4<f32>,
+  @location(1) mask: vec4<f32>,
+};
+
 @fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VSOut) -> FSOut {
   let tex_s = textureSample(diffuseTex, texSampler, in.uv);
-  let alpha = mat.alpha * tex_s.a;
-  if (alpha < 0.001) { discard; }
+  let alpha = mat.diffuseColor_alpha.w * tex_s.a;
+  if (mat.rimPower_pad.y > 0.5) {
+    let threshold = hashedAlphaThreshold(in.worldPos, 1.0);
+    if (alpha < threshold) { discard; }
+  } else {
+    if (alpha < 0.001) { discard; }
+  }
 
   var n = normalize(in.worldNormal);
   let v = normalize(scene.cameraPos.xyz - in.worldPos);
@@ -118,32 +208,59 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let l = normalize(scene.lightDir.xyz);
   let h = normalize(v + l);
   let NL = max(dot(n, l), 0.0);
+  let NV = max(dot(n, v), 0.0);
   let NH = max(dot(n, h), 0.0);
+  let VH = max(dot(v, h), 0.0);
 
-  let baseColor = tex_s.rgb * mat.diffuseColor;
+  let baseColor = tex_s.rgb * mat.diffuseColor_alpha.xyz;
   let shadow = sampleShadowPCF(shadowTex, shadowSampler, lightVP, in.worldPos, 0.002);
 
   let toonT = clamp(NL * 0.5 + 0.5, 0.0, 1.0);
   let toonShade = textureSample(toonTex, texSampler, vec2<f32>(toonT, 0.5)).r;
 
-  let ambient = baseColor * mat.ambient;
-  let diffuse = baseColor * toonShade * shadow;
-  let spec = pow(NH, max(mat.shininess, 1.0)) * mat.specular * shadow;
-  let specular = spec * scene.lightColor.rgb;
+  let nprDiffuse = baseColor * toonShade * shadow;
+  let nprSpecular = pow(NH, max(mat.ambient_shininess.w, 1.0)) * mat.specular_sphereMode.xyz * shadow;
+
+  let metallic = mat.pbrParams.x;
+  let roughness = max(mat.pbrParams.y, 0.04);
+  let a2 = roughness * roughness * roughness * roughness;
+  let F0 = mix(vec3<f32>(0.04), baseColor, metallic);
+  let pbrDiffuse = baseColor * (1.0 - metallic) / 3.14159265 * NL * shadow;
+  let D = ggxNDF(NH, a2);
+  let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+  let G = smithG2(NL, NV, k);
+  let F = fresnelSchlick(VH, F0);
+  let pbrSpecular = D * G * F / max(4.0 * NL * NV, 0.001) * shadow;
+
+  let nprMix = mat.pbrParams.w;
+  let diffuse = mix(pbrDiffuse, nprDiffuse, nprMix);
+  let specular = mix(pbrSpecular, nprSpecular, nprMix);
+
+  let rimFactor = pow(1.0 - NV, mat.rimPower_pad.x) * mat.rimColor_strength.w;
+  let rim = mat.rimColor_strength.xyz * rimFactor * shadow;
+
+  let emission = baseColor * mat.pbrParams.z;
 
   var sphereAdd = vec3<f32>(0.0);
-  if (mat.sphereMode > 0.5 && mat.sphereMode < 1.5) {
+  if (mat.specular_sphereMode.w > 0.5 && mat.specular_sphereMode.w < 1.5) {
     let viewN = (scene.viewProj * vec4<f32>(n, 0.0)).xy;
     let sphereUV = viewN * 0.5 + vec2<f32>(0.5, 0.5);
     sphereAdd = textureSample(sphereTex, texSampler, sphereUV).rgb * baseColor;
-  } else if (mat.sphereMode > 1.5) {
+  } else if (mat.specular_sphereMode.w > 1.5) {
     sphereAdd = textureSample(sphereTex, texSampler, in.uv).rgb * baseColor;
   }
 
-  let color = ambient + diffuse * scene.lightColor.rgb + specular + sphereAdd;
-  return vec4<f32>(color, alpha);
+  let ambient = baseColor * mat.ambient_shininess.xyz;
+  let color = ambient + (diffuse + specular) * scene.lightColor.rgb + rim + emission + sphereAdd;
+  var outAlpha = alpha;
+  if (IS_OVER_EYES) { outAlpha = alpha * 0.25; }
+  var out: FSOut;
+  out.color = vec4<f32>(color, outAlpha);
+  out.mask = vec4<f32>(1.0, outAlpha, 0.0, 0.0);
+  return out;
 }
 `;
+
 
 const SHADOW_VS = `
 struct ShadowScene {
@@ -246,11 +363,19 @@ struct VSOut {
   @location(0) uv: vec2<f32>,
 };
 
+struct OutlineFSOut {
+  @location(0) color: vec4<f32>,
+  @location(1) mask: vec4<f32>,
+};
+
 @fragment
-fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VSOut) -> OutlineFSOut {
   let texA = textureSample(diffuseTex, texSampler, in.uv).a;
   if (texA < 0.05) { discard; }
-  return vec4<f32>(omat.edgeColor.rgb, omat.edgeColor.a * texA);
+  var out: OutlineFSOut;
+  out.color = vec4<f32>(omat.edgeColor.rgb, omat.edgeColor.a * texA);
+  out.mask = vec4<f32>(1.0, omat.edgeColor.a * texA, 0.0, 0.0);
+  return out;
 }
 `;
 
@@ -262,6 +387,7 @@ interface MatRenderData {
   outlineBG: GPUBindGroup | null;
   isTransparent: boolean;
   hasEdge: boolean;
+  renderClass: RenderClass;
 }
 
 function create1x1Texture(device: GPUDevice, r: number, g: number, b: number, a: number, label: string): GPUTexture {
@@ -323,6 +449,9 @@ export class PMXDemo implements Demo {
   private camera!: Camera;
 
   private mainPipeline!: GPURenderPipeline;
+  private eyePipeline!: GPURenderPipeline;
+  private hairPipeline!: GPURenderPipeline;
+  private hairOverEyesPipeline!: GPURenderPipeline;
   private shadowPipeline!: GPURenderPipeline;
   private outlinePipeline!: GPURenderPipeline;
   private sceneBuffer!: GPUBuffer;
@@ -338,11 +467,15 @@ export class PMXDemo implements Demo {
   private bloom!: BloomPass;
 
   private resolvedHDR: GPUTexture | null = null;
+  private bloomMaskTex: GPUTexture | null = null;
+  private bloomMaskView: GPUTextureView | null = null;
   private bloomOutput: GPUTexture | null = null;
   private bloomOutputView: GPUTextureView | null = null;
   private tonePipeline: GPURenderPipeline | null = null;
   private toneBindGroup: GPUBindGroup | null = null;
   private toneUBO!: GPUBuffer;
+  private gradeUBO!: GPUBuffer;
+  private grade2UBO!: GPUBuffer;
 
   private matRenders: MatRenderData[] = [];
   private gpuTextures: GPUTexture[] = [];
@@ -360,6 +493,12 @@ export class PMXDemo implements Demo {
   private shadowSceneBG!: GPUBindGroup;
 
   bloomEnabled = true;
+  tonemapEnabled = true;
+  stencilEnabled = true;
+  gradeEnabled = true;
+  lightX = 5;
+  lightY = 10;
+  lightZ = 8;
 
   private loaded = false;
   private _renderLogOnce = true;
@@ -492,11 +631,16 @@ export class PMXDemo implements Demo {
       const isTransparent = m.diffuse[3] < 1.0 - 0.001;
       const hasEdge = (m.flag & 0x10) !== 0 && m.edgeScale > 0;
 
-      const matBuf = this.device.createBuffer({ label: `pmx-mat-${mi}`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      const matData = new Float32Array(16);
+      const matBuf = this.device.createBuffer({ label: `pmx-mat-${mi}`, size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const preset = detectPreset(m.name, isTransparent);
+      const matData = new Float32Array(24);
       matData[0] = m.diffuse[0]; matData[1] = m.diffuse[1]; matData[2] = m.diffuse[2]; matData[3] = m.diffuse[3];
       matData[4] = m.ambient[0]; matData[5] = m.ambient[1]; matData[6] = m.ambient[2]; matData[7] = m.specularPower;
       matData[8] = m.specular[0]; matData[9] = m.specular[1]; matData[10] = m.specular[2]; matData[11] = m.sphereMode;
+      matData[12] = preset.metallic; matData[13] = preset.roughness; matData[14] = preset.emissionStrength; matData[15] = preset.nprMix;
+      matData[16] = preset.rimColor[0]; matData[17] = preset.rimColor[1]; matData[18] = preset.rimColor[2]; matData[19] = preset.rimStrength;
+      matData[20] = preset.rimPower;
+      matData[21] = preset.alphaMode ?? 0;
       this.device.queue.writeBuffer(matBuf, 0, matData as unknown as GPUAllowSharedBufferSource);
 
       const diffuseTex = (m.textureIndex >= 0 && m.textureIndex + 1 < loadedTextures.length && loadedTextures[m.textureIndex + 1]) ? loadedTextures[m.textureIndex + 1]! : defaultTex;
@@ -543,7 +687,7 @@ export class PMXDemo implements Demo {
         });
       }
 
-      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, outlineBG, isTransparent, hasEdge });
+      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass });
       indexOffset += matIndexCount;
     }
 
@@ -642,13 +786,59 @@ export class PMXDemo implements Demo {
       ],
     });
 
+    const DS_FORMAT: GPUTextureFormat = "depth24plus-stencil8";
+    const mainLayout = this.device.createPipelineLayout({ bindGroupLayouts: [mainGroup0, this.shadowBGLayout, this.skinBGL] });
+    const mainTargets = [{ format: HDR_FORMAT as GPUTextureFormat, blend: blendState }, { format: "rg8unorm" as GPUTextureFormat }];
+
     this.mainPipeline = this.device.createRenderPipeline({
       label: "pmx-main",
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [mainGroup0, this.shadowBGLayout, this.skinBGL] }),
+      layout: mainLayout,
       vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module: fsModule, entryPoint: "fs_main", targets: [{ format: HDR_FORMAT, blend: blendState }] },
+      fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
       primitive: { topology: "triangle-list", cullMode: "none" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+      depthStencil: { format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
+    });
+
+    this.eyePipeline = this.device.createRenderPipeline({
+      label: "pmx-eye",
+      layout: mainLayout,
+      vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: {
+        format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less", depthBias: -1, depthBiasSlopeScale: 0.0,
+        stencilFront: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
+        stencilBack: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
+        stencilReadMask: 0xff, stencilWriteMask: 0xff,
+      },
+    });
+
+    this.hairPipeline = this.device.createRenderPipeline({
+      label: "pmx-hair",
+      layout: mainLayout,
+      vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: {
+        format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less",
+        stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: 0xff, stencilWriteMask: 0,
+      },
+    });
+
+    this.hairOverEyesPipeline = this.device.createRenderPipeline({
+      label: "pmx-hair-over-eyes",
+      layout: mainLayout,
+      vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets, constants: { IS_OVER_EYES: 1 } },
+      primitive: { topology: "triangle-list", cullMode: "none" },
+      depthStencil: {
+        format: DS_FORMAT, depthWriteEnabled: false, depthCompare: "less-equal",
+        stencilFront: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilBack: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: 0xff, stencilWriteMask: 0,
+      },
     });
     console.log(`[PMXDemo] mainPipeline valid=${this.mainPipeline !== null}`);
 
@@ -679,9 +869,14 @@ export class PMXDemo implements Demo {
       label: "pmx-outline",
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [outlineGroup0, this.skinBGL] }),
       vertex: { module: outVSModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module: outFSModule, entryPoint: "fs_main", targets: [{ format: HDR_FORMAT, blend: blendState }] },
+      fragment: { module: outFSModule, entryPoint: "fs_main", targets: [{ format: HDR_FORMAT, blend: blendState }, { format: "rg8unorm" }] },
       primitive: { topology: "triangle-list", cullMode: "front" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less-equal", depthBias: 4, depthBiasSlopeScale: 1 },
+      depthStencil: {
+        format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less-equal", depthBias: 4, depthBiasSlopeScale: 1,
+        stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
+        stencilReadMask: 0xff, stencilWriteMask: 0,
+      },
     });
   }
 
@@ -710,7 +905,9 @@ export class PMXDemo implements Demo {
 
     this.sceneData.set(viewProj as unknown as ArrayLike<number>, 0);
     this.sceneData.set(model as unknown as ArrayLike<number>, 16);
-    this.sceneData[32] = 0.5; this.sceneData[33] = 1.0; this.sceneData[34] = 0.8; this.sceneData[35] = 0;
+    const lx = this.lightX, ly = this.lightY, lz = this.lightZ;
+    const len = Math.sqrt(lx * lx + ly * ly + lz * lz) || 1;
+    this.sceneData[32] = lx / len; this.sceneData[33] = ly / len; this.sceneData[34] = lz / len; this.sceneData[35] = 0;
     this.sceneData[36] = 2.0; this.sceneData[37] = 2.0; this.sceneData[38] = 2.0; this.sceneData[39] = 0;
     this.sceneData[40] = this.camera.position[0]; this.sceneData[41] = this.camera.position[1]; this.sceneData[42] = this.camera.position[2]; this.sceneData[43] = 0;
     this.device.queue.writeBuffer(this.sceneBuffer, 0, this.sceneData as unknown as GPUAllowSharedBufferSource);
@@ -727,7 +924,7 @@ export class PMXDemo implements Demo {
       }
     }
 
-    this.shadowMap.lightPosition = vec3.create(5, 10, 8);
+    this.shadowMap.lightPosition = vec3.create(this.lightX, this.lightY, this.lightZ);
     this.shadowMap.lightTarget = vec3.create(0, 10, 0);
     this.shadowMap.updateLightVP();
 
@@ -744,6 +941,11 @@ export class PMXDemo implements Demo {
         const w = this.ctx.canvas.width;
         const h = this.ctx.canvas.height;
         if (this.hdrTarget.w !== w || this.hdrTarget.h !== h) { this.hdrTarget.resize(w, h); }
+        if (!this.bloomMaskTex || this.bloomMaskTex.width !== w || this.bloomMaskTex.height !== h) {
+          this.bloomMaskTex?.destroy();
+          this.bloomMaskTex = this.device.createTexture({ label: "bloom-mask", size: [w, h], format: "rg8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+          this.bloomMaskView = this.bloomMaskTex.createView();
+        }
 
         const shadowPass = this.shadowMap.beginShadowPass(encoder);
         shadowPass.setPipeline(this.shadowPipeline);
@@ -754,23 +956,59 @@ export class PMXDemo implements Demo {
         shadowPass.drawIndexed(this.totalIndexCount);
         shadowPass.end();
 
-        const mainPass = this.hdrTarget.beginRenderPass(encoder);
+        const mainPass = encoder.beginRenderPass({
+          colorAttachments: [
+            { view: this.hdrTarget.colorTarget.view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
+            { view: this.bloomMaskView!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+          ],
+          depthStencilAttachment: {
+            view: this.hdrTarget.depthTarget.view,
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store",
+            stencilClearValue: 0,
+            stencilLoadOp: "clear",
+            stencilStoreOp: "store",
+          },
+        });
         mainPass.setVertexBuffer(0, this.vertexBuffer);
         mainPass.setIndexBuffer(this.indexBuffer, this.use32bit ? "uint32" : "uint16");
+        mainPass.setStencilReference(1);
 
-        for (const mr of this.matRenders) {
-          if (mr.isTransparent) continue;
+        const rcRank = (rc: RenderClass) => rc === "eye" ? 1 : rc === "hair" ? 2 : 0;
+        const opaqueOrder = this.matRenders
+          .map((mr, i) => ({ mr, i }))
+          .filter(x => !x.mr.isTransparent)
+          .sort((a, b) => rcRank(a.mr.renderClass) - rcRank(b.mr.renderClass));
+
+        for (const { mr } of opaqueOrder) {
           if (mr.hasEdge && mr.outlineBG) {
             mainPass.setPipeline(this.outlinePipeline);
             mainPass.setBindGroup(0, mr.outlineBG);
             mainPass.setBindGroup(1, this.skinBG);
             mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
           }
-          mainPass.setPipeline(this.mainPipeline);
+          const pipeline = this.stencilEnabled
+            ? (mr.renderClass === "eye" ? this.eyePipeline
+              : mr.renderClass === "hair" ? this.hairPipeline
+              : this.mainPipeline)
+            : this.mainPipeline;
+          mainPass.setPipeline(pipeline);
           mainPass.setBindGroup(0, mr.mainBG);
           mainPass.setBindGroup(1, mr.shadowBG);
           mainPass.setBindGroup(2, this.skinBG);
           mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
+        }
+
+        if (this.stencilEnabled) {
+          for (const { mr } of opaqueOrder) {
+            if (mr.renderClass !== "hair") continue;
+            mainPass.setPipeline(this.hairOverEyesPipeline);
+            mainPass.setBindGroup(0, mr.mainBG);
+            mainPass.setBindGroup(1, mr.shadowBG);
+            mainPass.setBindGroup(2, this.skinBG);
+            mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
+          }
         }
 
         for (const mr of this.matRenders) {
@@ -803,7 +1041,7 @@ export class PMXDemo implements Demo {
         encoder.copyTextureToTexture({ texture: this.hdrTarget.colorTarget.texture }, { texture: this.resolvedHDR }, [w, h]);
 
         if (this.bloomEnabled) {
-          this.bloom.execute(encoder, this.resolvedHDR, this.bloomOutputView!);
+          this.bloom.execute(encoder, this.resolvedHDR, this.bloomOutputView!, this.bloomMaskTex!);
           this.applyTonemap(encoder, view, this.ctx.format, this.bloomOutputView!);
         } else {
           const hdrView = this.resolvedHDR.createView();
@@ -813,17 +1051,68 @@ export class PMXDemo implements Demo {
     }];
   }
 
+  exposure = 1.0;
+  gamma = 2.2;
+  slope = 1.0;
+  offset = 0.0;
+  power = 1.0;
+  saturation = 1.0;
+  contrast = 1.0;
+  private filmicLUT: GPUTexture | null = null;
+
+  private buildFilmicLUT(): GPUTexture {
+    if (this.filmicLUT) return this.filmicLUT;
+    const LUT_W = 256;
+    const data = new Float32Array(LUT_W * 4);
+    const A = 0.22, B = 0.30, C = 0.10, D = 0.20, E = 0.01, F = 0.30;
+    const filmicWhite = ((11.2 * (A * 11.2 + C * B) + D * E) / (11.2 * (A * 11.2 + B) + D * F)) - E / F;
+    const whiteScale = 1.0 / filmicWhite;
+    for (let i = 0; i < LUT_W; i++) {
+      const logX = (i / (LUT_W - 1)) * 13.0 - 10.0;
+      const x = Math.pow(2, logX);
+      const filmic = ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+      const v = Math.max(0, filmic * whiteScale);
+      data[i * 4 + 0] = v;
+      data[i * 4 + 1] = v;
+      data[i * 4 + 2] = v;
+      data[i * 4 + 3] = 1.0;
+    }
+    this.filmicLUT = this.device.createTexture({
+      label: "filmic-lut",
+      size: [LUT_W, 1],
+      format: "rgba32float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.device.queue.writeTexture({ texture: this.filmicLUT }, data as unknown as GPUAllowSharedBufferSource, { bytesPerRow: LUT_W * 16 }, [LUT_W, 1]);
+    return this.filmicLUT;
+  }
+
   private applyTonemap(encoder: GPUCommandEncoder, screenView: GPUTextureView, screenFormat: GPUTextureFormat, srcView: GPUTextureView): void {
     if (!this.tonePipeline) {
+      const lut = this.buildFilmicLUT();
       const code = `
-struct Params { exposure: f32, gamma: f32, width: f32, height: f32 };
+struct Params { exposure: f32, gamma: f32, contrast: f32, pad: f32 };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var srcTex: texture_2d<f32>;
 @group(0) @binding(2) var srcSampler: sampler;
+@group(0) @binding(3) var filmicLut: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> grade: vec4<f32>;
+@group(0) @binding(5) var<uniform> grade2: vec4<f32>;
 
-fn filmic(x: vec3<f32>) -> vec3<f32> {
-  let A = 0.22; let B = 0.30; let C = 0.10; let D = 0.20; let E = 0.01; let F = 0.30;
-  return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+fn filmicLUT(x: f32) -> f32 {
+  let t = clamp(log2(max(x, 1e-10)) + 10.0, 0.0, 13.0);
+  let idx = u32(t * 255.0 / 13.0 + 0.5);
+  return textureLoad(filmicLut, vec2u(min(idx, 255u), 0u), 0).r;
+}
+
+fn gradeColor(c: vec3f) -> vec3f {
+  let slope = grade.xyz;
+  let offset = vec3f(grade.w);
+  let power = grade2.xyz;
+  let sat = grade2.w;
+  var x = pow(max(c * slope + offset, vec3f(0.0)), power);
+  let luma = dot(x, vec3f(0.2126, 0.7152, 0.0722));
+  return max(mix(vec3f(luma), x, sat), vec3f(0.0));
 }
 
 @vertex
@@ -834,10 +1123,21 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-  let uv = pos.xy / vec2<f32>(p.width, p.height);
+  let dims = vec2<f32>(textureDimensions(srcTex));
+  let uv = pos.xy / dims;
   var color = textureSample(srcTex, srcSampler, uv).rgb * p.exposure;
-  color = filmic(color);
-  color = pow(color, vec3<f32>(1.0 / p.gamma));
+  let doTonemap = (p.pad > 0.5 && p.pad < 1.5) || p.pad > 2.5;
+  let doGrade = p.pad > 1.5;
+  if (doTonemap) {
+    color = vec3f(filmicLUT(color.r), filmicLUT(color.g), filmicLUT(color.b));
+  } else {
+    color = clamp(color, vec3f(0.0), vec3f(1.0));
+  }
+  if (doGrade) {
+    color = gradeColor(color);
+    color = (color - vec3f(0.5)) * p.contrast + vec3f(0.5);
+  }
+  color = pow(max(color, vec3f(0.0)), vec3f(1.0 / p.gamma));
   return vec4<f32>(color, 1.0);
 }`;
       const module = this.device.createShaderModule({ code });
@@ -853,17 +1153,30 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (!this.toneUBO) {
       this.toneUBO = this.device.createBuffer({ label: "tone-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     }
+    if (!this.gradeUBO) {
+      this.gradeUBO = this.device.createBuffer({ label: "grade-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.grade2UBO = this.device.createBuffer({ label: "grade2-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    const data = new Float32Array([1.0, 2.2, w, h]);
+    const flags = (this.tonemapEnabled ? 1 : 0) + (this.gradeEnabled ? 2 : 0);
+    const data = new Float32Array([this.exposure, this.gamma, this.contrast, flags]);
     this.device.queue.writeBuffer(this.toneUBO, 0, data as unknown as GPUAllowSharedBufferSource);
+    const gd = new Float32Array([this.slope, this.slope, this.slope, this.offset]);
+    this.device.queue.writeBuffer(this.gradeUBO, 0, gd as unknown as GPUAllowSharedBufferSource);
+    const gd2 = new Float32Array([this.power, this.power, this.power, this.saturation]);
+    this.device.queue.writeBuffer(this.grade2UBO, 0, gd2 as unknown as GPUAllowSharedBufferSource);
 
+    const lutView = this.filmicLUT!.createView();
     const bg = this.device.createBindGroup({
       layout: this.tonePipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.toneUBO } },
         { binding: 1, resource: srcView },
         { binding: 2, resource: this.device.createSampler({ magFilter: "linear", minFilter: "linear" }) },
+        { binding: 3, resource: lutView },
+        { binding: 4, resource: { buffer: this.gradeUBO } },
+        { binding: 5, resource: { buffer: this.grade2UBO } },
       ],
     });
 
@@ -876,12 +1189,29 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     pass.end();
   }
 
+
   registerGUI(gui: any) {
     gui.add(this, "bloomEnabled").name("Bloom");
+    gui.add(this, "tonemapEnabled").name("Tone Mapping");
+    gui.add(this, "gradeEnabled").name("Color Grading");
+    gui.add(this, "stencilEnabled").name("Eye Stencil");
     gui.add(this.bloom, "bloomIntensity", 0, 1, 0.01).name("Bloom Intensity");
     gui.add(this.bloom, "threshold", 0, 2, 0.01).name("Bloom Threshold");
     gui.add(this.bloom, "knee", 0, 1, 0.01).name("Bloom Knee");
     gui.add(this.bloom, "radius", 0.5, 10, 0.1).name("Bloom Radius");
+    const toneFolder = gui.addFolder("Tone Mapping");
+    toneFolder.add(this, "exposure", 0.1, 3, 0.01).name("Exposure");
+    toneFolder.add(this, "gamma", 1.0, 3.0, 0.01).name("Gamma");
+    const gradeFolder = gui.addFolder("Color Grading");
+    gradeFolder.add(this, "slope", 0.5, 2.0, 0.01).name("Slope");
+    gradeFolder.add(this, "offset", -0.5, 0.5, 0.01).name("Offset");
+    gradeFolder.add(this, "power", 0.5, 2.0, 0.01).name("Power");
+    gradeFolder.add(this, "saturation", 0, 2, 0.01).name("Saturation");
+    gradeFolder.add(this, "contrast", 0.5, 2.0, 0.01).name("Contrast");
+    const lightFolder = gui.addFolder("Light");
+    lightFolder.add(this, "lightX", -30, 30, 0.5).name("X");
+    lightFolder.add(this, "lightY", -30, 30, 0.5).name("Y");
+    lightFolder.add(this, "lightZ", -30, 30, 0.5).name("Z");
   }
 
   destroy(): void {
@@ -895,8 +1225,12 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.hdrTarget?.destroy();
     this.bloom?.destroy();
     this.resolvedHDR?.destroy();
+    this.bloomMaskTex?.destroy();
     this.bloomOutput?.destroy();
     this.toneUBO?.destroy();
+    this.gradeUBO?.destroy();
+    this.grade2UBO?.destroy();
+    this.filmicLUT?.destroy();
     this._depthTex?.destroy();
 
     for (const t of this.gpuTextures) t.destroy();

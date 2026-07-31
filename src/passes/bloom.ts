@@ -12,6 +12,7 @@ const FULLSCREEN_VS = /* wgsl */ `
 const bloomBlitShader = /* wgsl */ `${FULLSCREEN_VS}
 @group(0) @binding(0) var hdrTex: texture_2d<f32>;
 @group(0) @binding(1) var<uniform> prefilter: vec4<f32>;
+@group(0) @binding(2) var maskTex: texture_2d<f32>;
 
 fn luminance(c: vec3f) -> f32 {
   return dot(max(c, vec3f(0.0)), vec3f(0.2126, 0.7152, 0.0722));
@@ -21,7 +22,9 @@ fn fetch(c: vec2<i32>, clampV: f32) -> vec3f {
   let d = vec2<i32>(textureDimensions(hdrTex));
   let cc = clamp(c, vec2<i32>(0), d - vec2<i32>(1));
   let s = textureLoad(hdrTex, cc, 0).rgb;
-  return select(s, min(s, vec3f(clampV)), clampV > 0.0);
+  let mask = textureLoad(maskTex, cc, 0).r;
+  let masked = s * mask;
+  return select(masked, min(masked, vec3f(clampV)), clampV > 0.0);
 }
 
 @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
@@ -139,6 +142,7 @@ export class BloomPass {
   private mipCount = 0;
   private cachedSceneTex: GPUTexture | null = null;
   private cachedSceneView: GPUTextureView | null = null;
+  private whiteTexView!: GPUTextureView;
 
   bloomIntensity = 0.05;
   threshold = 0.5;
@@ -175,6 +179,10 @@ export class BloomPass {
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    const whiteTex = this.device.createTexture({ label: "bloom-white-mask", size: [1, 1], format: "rg8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+    this.device.queue.writeTexture({ texture: whiteTex }, new Uint8Array([255, 255, 0, 0]), { bytesPerRow: 4 }, [1, 1]);
+    this.whiteTexView = whiteTex.createView();
 
     const blitModule = this.device.createShaderModule({ code: bloomBlitShader });
     this.blitPipeline = this.device.createRenderPipeline({
@@ -265,7 +273,7 @@ export class BloomPass {
     return this.cachedSceneView;
   }
 
-  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, outputTarget: GPUTextureView) {
+  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, outputTarget: GPUTextureView, maskTexture?: GPUTexture) {
     const w = sceneTexture.width;
     const h = sceneTexture.height;
     this.ensureTextures(w, h);
@@ -282,12 +290,18 @@ export class BloomPass {
     this.device.queue.writeBuffer(this.combineUBO, 0, combineData as unknown as GPUAllowSharedBufferSource);
 
     {
+      const blitEntries: GPUBindGroupEntry[] = [
+        { binding: 0, resource: sceneView },
+        { binding: 1, resource: { buffer: this.blitUBO } },
+      ];
+      if (maskTexture) {
+        blitEntries.push({ binding: 2, resource: maskTexture.createView() });
+      } else {
+        blitEntries.push({ binding: 2, resource: this.whiteTexView });
+      }
       const bg = this.device.createBindGroup({
         layout: this.blitPipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: sceneView },
-          { binding: 1, resource: { buffer: this.blitUBO } },
-        ],
+        entries: blitEntries,
       });
       const pass = encoder.beginRenderPass({
         colorAttachments: [{

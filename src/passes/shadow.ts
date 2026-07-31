@@ -146,7 +146,8 @@ fn sampleShadowPCF(
   bias: f32
 ) -> f32 {
   let lightPos = lightVP * vec4<f32>(worldPos, 1.0);
-  let shadowCoord = clamp(lightPos.xy / lightPos.w * 0.5 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+  let projXY = lightPos.xy / lightPos.w;
+  let shadowCoord = clamp(vec2<f32>(projXY.x * 0.5 + 0.5, -projXY.y * 0.5 + 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
   let depth = lightPos.z / lightPos.w - bias;
 
   let texelSize = 1.0 / vec2<f32>(textureDimensions(shadowTexture));
