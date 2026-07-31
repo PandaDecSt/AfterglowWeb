@@ -12,6 +12,7 @@ import { BloomPass } from "../passes/bloom";
 import { HDRRenderTarget } from "../passes/hdr";
 import { mat4, quat, vec3 } from "wgpu-matrix";
 import { decodeTGA } from "../utils/tga-loader";
+import { BrdfLut, BRDF_LUT_SIZE } from "../passes/brdf-lut";
 
 const HDR_FORMAT = "rgba16float";
 
@@ -144,6 +145,7 @@ struct Mat {
 @group(0) @binding(3) var sphereTex: texture_2d<f32>;
 @group(0) @binding(4) var toonTex: texture_2d<f32>;
 @group(0) @binding(5) var texSampler: sampler;
+@group(0) @binding(6) var brdfLut: texture_2d<f32>;
 
 @group(1) @binding(0) var shadowTex: texture_depth_2d;
 @group(1) @binding(1) var shadowSampler: sampler_comparison;
@@ -169,6 +171,26 @@ fn smithG2(NL: f32, NV: f32, k: f32) -> f32 {
 
 fn fresnelSchlick(VH: f32, F0: vec3<f32>) -> vec3<f32> {
   return F0 + (1.0 - F0) * pow(1.0 - VH, 5.0);
+}
+
+fn brdf_lut_sample(NV: f32, roughness: f32) -> vec4<f32> {
+  let LUT_SIZE: f32 = ${BRDF_LUT_SIZE}.0;
+  var uv = vec2f(clamp(roughness, 0.0, 1.0), sqrt(clamp(1.0 - NV, 0.0, 1.0)));
+  uv = uv * ((LUT_SIZE - 1.0) / LUT_SIZE) + 0.5 / LUT_SIZE;
+  return textureSampleLevel(brdfLut, texSampler, uv, 0.0);
+}
+
+fn F_brdf_multi_scatter(f0: vec3<f32>, f90: vec3<f32>, lut: vec2<f32>) -> vec3<f32> {
+  let FssEss = lut.y * f90 + lut.x * f0;
+  let Ess = lut.x + lut.y;
+  let Ems = 1.0 - Ess;
+  let Favg = f0 + (1.0 - f0) / 21.0;
+  let Fms = FssEss * Favg / (1.0 - (1.0 - Ess) * Favg);
+  return FssEss + Fms * Ems;
+}
+
+fn ltc_brdf_scale(lut: vec4<f32>) -> f32 {
+  return (lut.z + lut.w) / max(lut.x + lut.y, 1e-6);
 }
 
 fn hash3(p3: vec3<f32>) -> f32 {
@@ -230,12 +252,16 @@ fn fs_main(in: VSOut) -> FSOut {
   let roughness = max(mat.pbrParams.y, 0.04);
   let a2 = roughness * roughness * roughness * roughness;
   let F0 = mix(vec3<f32>(0.04), baseColor, metallic);
+  let f90 = vec3<f32>(1.0);
+
+  let lut = brdf_lut_sample(NV, roughness);
+  let F_ms = F_brdf_multi_scatter(F0, f90, lut.xy);
+
   let pbrDiffuse = baseColor * (1.0 - metallic) / 3.14159265 * NL * shadow;
   let D = ggxNDF(NH, a2);
   let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
   let G = smithG2(NL, NV, k);
-  let F = fresnelSchlick(VH, F0);
-  let pbrSpecular = D * G * F * shadow;
+  let pbrSpecular = D * G * F_ms * shadow;
 
   let nprMix = mat.pbrParams.w;
   let diffuse = mix(pbrDiffuse, nprDiffuse, nprMix);
@@ -471,6 +497,7 @@ export class PMXDemo implements Demo {
   private shadowBGLayout!: GPUBindGroupLayout;
   private hdrTarget!: HDRRenderTarget;
   private bloom!: BloomPass;
+  private brdfLut!: BrdfLut;
 
   private resolvedHDR: GPUTexture | null = null;
   private resolvedHDRView: GPUTextureView | null = null;
@@ -616,6 +643,9 @@ export class PMXDemo implements Demo {
       entries: [{ binding: 0, resource: { buffer: this.skinMatrixStorageBuffer } }],
     });
 
+    this.brdfLut = new BrdfLut();
+    this.brdfLut.bake(this.device);
+
     const defaultTex = create1x1Texture(this.device, 255, 255, 255, 255, "default-white");
     const toonRampTex = createToonRampTexture(this.device);
     this.gpuTextures.push(defaultTex, toonRampTex);
@@ -668,6 +698,7 @@ export class PMXDemo implements Demo {
           { binding: 3, resource: sphereTex.createView() },
           { binding: 4, resource: toonTex.createView() },
           { binding: 5, resource: sampler },
+          { binding: 6, resource: this.brdfLut.view },
         ],
       });
 
@@ -714,6 +745,7 @@ export class PMXDemo implements Demo {
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
     this.bloom = new BloomPass(this.device, this.ctx.supportsRG11B10 ? "rg11b10ufloat" as GPUTextureFormat : "rgba16float" as GPUTextureFormat);
+
 
 
     if (pmx.bones.length > 0) {
@@ -793,6 +825,7 @@ export class PMXDemo implements Demo {
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 6, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     });
 
