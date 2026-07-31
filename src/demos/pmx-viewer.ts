@@ -799,7 +799,7 @@ export class PMXDemo implements Demo {
       layout: mainLayout,
       vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
       depthStencil: { format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
     });
 
@@ -808,7 +808,7 @@ export class PMXDemo implements Demo {
       layout: mainLayout,
       vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
       depthStencil: {
         format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less", depthBias: -1, depthBiasSlopeScale: 0.0,
         stencilFront: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
@@ -822,7 +822,7 @@ export class PMXDemo implements Demo {
       layout: mainLayout,
       vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
       depthStencil: {
         format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less",
         stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
@@ -836,7 +836,7 @@ export class PMXDemo implements Demo {
       layout: mainLayout,
       vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets, constants: { IS_OVER_EYES: 1 } },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
       depthStencil: {
         format: DS_FORMAT, depthWriteEnabled: false, depthCompare: "less-equal",
         stencilFront: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
@@ -855,7 +855,7 @@ export class PMXDemo implements Demo {
       label: "pmx-shadow",
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [shadowGroup0, this.skinBGL] }),
       vertex: { module: shadowVSModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      primitive: { topology: "triangle-list", cullMode: "none" },
+      primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
       depthStencil: { format: this.shadowMap.format, depthWriteEnabled: true, depthCompare: "less", depthBias: 2, depthBiasSlopeScale: 1.5 },
     });
 
@@ -874,7 +874,7 @@ export class PMXDemo implements Demo {
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [outlineGroup0, this.skinBGL] }),
       vertex: { module: outVSModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: outFSModule, entryPoint: "fs_main", targets: [{ format: HDR_FORMAT, blend: blendState }, { format: "rg8unorm" }] },
-      primitive: { topology: "triangle-list", cullMode: "front" },
+      primitive: { topology: "triangle-list", cullMode: "front", frontFace: "cw" },
       depthStencil: {
         format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less-equal", depthBias: 4, depthBiasSlopeScale: 1,
         stencilFront: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
@@ -905,7 +905,7 @@ export class PMXDemo implements Demo {
 
     }
     const viewProj = this.camera.getViewProjectionMatrix(w / h);
-    const model = mat4.identity(mat4.create());
+    const model = mat4.scaling(vec3.create(-1, 1, 1));
 
     this.sceneData.set(viewProj as unknown as ArrayLike<number>, 0);
     this.sceneData.set(model as unknown as ArrayLike<number>, 16);
