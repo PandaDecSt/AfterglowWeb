@@ -13,6 +13,8 @@ import { HDRRenderTarget } from "../passes/hdr";
 import { mat4, quat, vec3 } from "wgpu-matrix";
 import { decodeTGA } from "../utils/tga-loader";
 import { BrdfLut, BRDF_LUT_SIZE } from "../passes/brdf-lut";
+import { loadVMD, vmdDuration } from "../utils/vmd-loader";
+import { buildIKChains, solveIK, type IKChain } from "../scene/ik-solver";
 
 const HDR_FORMAT = "rgba16float";
 
@@ -339,7 +341,7 @@ struct OutlineMat {
 };
 @group(0) @binding(1) var<uniform> omat: OutlineMat;
 
-@group(1) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
+@group(2) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
 
 struct VSOut {
   @builtin(position) position: vec4<f32>,
@@ -519,6 +521,7 @@ export class PMXDemo implements Demo {
   private skeleton: Skeleton | null = null;
   private skinning: Skinning | null = null;
   private animPlayer: AnimationPlayer | null = null;
+  private ikChains: IKChain[] = [];
 
   private skinMatrixStorageBuffer!: GPUBuffer;
   private skinBGL!: GPUBindGroupLayout;
@@ -532,6 +535,8 @@ export class PMXDemo implements Demo {
   tonemapEnabled = true;
   stencilEnabled = true;
   gradeEnabled = true;
+  debugIK = false;
+  animPaused = false;
   lightX = 5;
   lightY = 10;
   lightZ = 8;
@@ -539,6 +544,12 @@ export class PMXDemo implements Demo {
 
   private loaded = false;
   private _renderLogOnce = true;
+  private _skinDebugOnce = false;
+  private _ikDbgTimer = 0;
+  private _ikDbgTimer2 = 0;
+  private _legVertCount = 0;
+  private _skinDebugOnce2 = false;
+  private _gpuSkinDebug = false;
   private _depthTex: GPUTexture | null = null;
   private _depthW = 0;
   private _depthH = 0;
@@ -588,6 +599,24 @@ export class PMXDemo implements Demo {
       dv.setFloat32(off + 48, bw.length > 2 ? bw[2] : 0, true);
       dv.setFloat32(off + 52, bw.length > 3 ? bw[3] : 0, true);
       for (let k = 0; k < 3; k++) { if (v.position[k] < minPos[k]) minPos[k] = v.position[k]; if (v.position[k] > maxPos[k]) maxPos[k] = v.position[k]; }
+      if (i < 5) {
+        console.log(`[VERT ${i}] boneType=${v.boneType} boneIndices=[${Array.from(v.boneIndices)}] boneWeights=[${Array.from(v.boneWeights).map(w=>w.toFixed(3)).join(",")}]`);
+      }
+      if (i === 1708) {
+        for (const bIdx of v.boneIndices) {
+          if (bIdx < pmx.bones.length) console.log(`  bone ${bIdx} = ${pmx.bones[bIdx].name} parent=${pmx.bones[bIdx].parentIndex}`);
+        }
+      }
+      if ((bj[0] >= 18 && bj[0] <= 21) || (bj[1] >= 18 && bj[1] <= 21) || (bj[2] >= 18 && bj[2] <= 21) || (bj[3] >= 18 && bj[3] <= 21)) {
+        if (this._legVertCount < 10) {
+          const dj0 = dv.getUint16(off + 32, true);
+          const dj1 = dv.getUint16(off + 34, true);
+          const dw0 = dv.getFloat32(off + 40, true);
+          const dw1 = dv.getFloat32(off + 44, true);
+          console.log(`[LEGVERT ${i}] pmx_joints=[${Array.from(bj)}] pmx_weights=[${Array.from(bw).map(w=>w.toFixed(3)).join(",")}] vb_joints=[${dj0},${dj1}] vb_weights=[${dw0.toFixed(3)},${dw1.toFixed(3)}]`);
+          this._legVertCount++;
+        }
+      }
     }
 
     const center = [(minPos[0] + maxPos[0]) / 2, (minPos[1] + maxPos[1]) / 2, (minPos[2] + maxPos[2]) / 2];
@@ -763,6 +792,10 @@ export class PMXDemo implements Demo {
           position: vec3.create(px, py, pz),
           rotation: quat.identity(quat.create()),
           scale: vec3.create(1, 1, 1),
+          appendParentIndex: b.appendParentIndex,
+          appendRatio: b.appendRatio,
+          appendRotate: b.appendRotate,
+          appendMove: b.appendMove,
         };
       });
       this.skeleton = new Skeleton(boneDescs);
@@ -774,6 +807,22 @@ export class PMXDemo implements Demo {
       this.skeleton.computeSkinMatrices(this.skinning.skinMatrixData);
       this.device.queue.writeBuffer(this.skinMatrixStorageBuffer, 0, this.skinning.skinMatrixData as unknown as GPUAllowSharedBufferSource);
       this.animPlayer = new AnimationPlayer(this.skeleton, pmx.morphs.length);
+      this.ikChains = buildIKChains(pmx.bones);
+      console.log(`[PMXDemo] IK chains: ${this.ikChains.length}`);
+      for (const c of this.ikChains) {
+        const linkNames = c.links.map(l => `${pmx.bones[l.index].name}${l.hasLimit ? `[${l.limitMin[0].toFixed(1)},${l.limitMax[0].toFixed(1)}]x[${l.limitMin[1].toFixed(1)},${l.limitMax[1].toFixed(1)}]y[${l.limitMin[2].toFixed(1)},${l.limitMax[2].toFixed(1)}]z` : ""}`).join(" <- ");
+        console.log(`  IK: ${pmx.bones[c.targetIndex].name} -> effector=${pmx.bones[c.effectorIndex].name} iter=${c.iterations} maxAngle=${c.maxAngle.toFixed(3)} links: ${linkNames}`);
+      }
+
+      try {
+        const vmd = await loadVMD("/motion.vmd");
+        const boneNames = pmx.bones.map(b => b.name);
+        const morphNames = pmx.morphs.map(m => m.name);
+        this.animPlayer.playVMD(vmd, boneNames, morphNames, { loop: true });
+        console.log(`[PMXDemo] VMD loaded: "${vmd.name}", duration=${vmdDuration(vmd).toFixed(2)}s, bones=${vmd.boneFrames.size}, morphs=${vmd.morphFrames.size}`);
+      } catch (e) {
+        console.warn("[PMXDemo] VMD load failed:", e);
+      }
     }
   }
 
@@ -917,7 +966,7 @@ export class PMXDemo implements Demo {
 
     this.outlinePipeline = this.device.createRenderPipeline({
       label: "pmx-outline",
-      layout: this.device.createPipelineLayout({ bindGroupLayouts: [outlineGroup0, this.skinBGL] }),
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [outlineGroup0, this.shadowBGLayout, this.skinBGL] }),
       vertex: { module: outVSModule, entryPoint: "vs_main", buffers: [vertexLayout] },
       fragment: { module: outFSModule, entryPoint: "fs_main", targets: [{ format: HDR_FORMAT, blend: blendState }, { format: "rg8unorm" }] },
       primitive: { topology: "triangle-list", cullMode: "front", frontFace: "cw" },
@@ -934,14 +983,47 @@ export class PMXDemo implements Demo {
   update(time: number, deltaTime: number): void {
     if (!this.loaded) return;
 
-    if (this.animPlayer) {
+    if (this.animPlayer && !this.animPaused) {
       this.animPlayer.update(deltaTime);
       this.skeleton!.updateWorldMatrices();
+      if (this.ikChains.length > 0) {
+        solveIK(this.skeleton!, this.ikChains);
+
+        this._ikDbgTimer += deltaTime;
+        if (this._ikDbgTimer > 2.0) {
+          this._ikDbgTimer = 0;
+          const wm = this.skeleton!.worldMatrices;
+          const sk = this.skeleton!;
+          for (const chain of this.ikChains) {
+            const tOff = chain.targetIndex * 16;
+            const eOff = chain.effectorIndex * 16;
+            const dx = wm[tOff+12]-wm[eOff+12], dy = wm[tOff+13]-wm[eOff+13], dz = wm[tOff+14]-wm[eOff+14];
+            const dist = Math.sqrt(dx*dx+dy*dy+dz*dz);
+            const linkRots = chain.links.map(l => {
+              const o4 = l.index * 4;
+              const rw = sk.localRotations[o4+3];
+              const angle = 2 * Math.acos(Math.min(1, Math.abs(rw))) * 180 / Math.PI;
+              return `${sk.boneNames[l.index]}:${angle.toFixed(1)}°`;
+            }).join(" ");
+            console.log(`[IK] ${sk.boneNames[chain.targetIndex]} dist=${dist.toFixed(3)} [${linkRots}]`);
+          }
+        }
+      }
       this.skeleton!.computeSkinMatrices(this.skinning!.skinMatrixData);
-      this.device.queue.writeBuffer(
-        this.skinMatrixStorageBuffer, 0,
-        this.skinning!.skinMatrixData as unknown as GPUAllowSharedBufferSource
-      );
+
+      if (!this._skinDebugOnce2) {
+        this._skinDebugOnce2 = true;
+        const sk = this.skeleton!;
+        const d = this.skinning!.skinMatrixData;
+        const kneeIdx = sk.getBoneIndex("右ひざ");
+        if (kneeIdx >= 0) {
+          const o16 = kneeIdx * 16;
+          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row0=[${d[o16].toFixed(4)},${d[o16+1].toFixed(4)},${d[o16+2].toFixed(4)},${d[o16+3].toFixed(4)}]`);
+          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row1=[${d[o16+4].toFixed(4)},${d[o16+5].toFixed(4)},${d[o16+6].toFixed(4)},${d[o16+7].toFixed(4)}]`);
+          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row2=[${d[o16+8].toFixed(4)},${d[o16+9].toFixed(4)},${d[o16+10].toFixed(4)},${d[o16+11].toFixed(4)}]`);
+          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row3=[${d[o16+12].toFixed(4)},${d[o16+13].toFixed(4)},${d[o16+14].toFixed(4)},${d[o16+15].toFixed(4)}]`);
+        }
+      }
     }
 
     const w = this.ctx.canvas.width;
@@ -962,15 +1044,15 @@ export class PMXDemo implements Demo {
     this.sceneData[40] = this.camera.position[0]; this.sceneData[41] = this.camera.position[1]; this.sceneData[42] = this.camera.position[2]; this.sceneData[43] = 0;
     this.device.queue.writeBuffer(this.sceneBuffer, 0, this.sceneData as unknown as GPUAllowSharedBufferSource);
 
-    if ((time as unknown as number) < 0.001) {
-      const vp = this.sceneData.slice(0, 16);
-      const cam = this.sceneData.slice(40, 44);
-      console.log(`[PMXDemo] VP row0=[${Array.from(vp.slice(0, 4)).map(v => v.toFixed(3))}]`);
-      console.log(`[PMXDemo] Camera pos=[${cam[0].toFixed(2)},${cam[1].toFixed(2)},${cam[2].toFixed(2)}]`);
-      if (this.skinning) {
-        const d = this.skinning.skinMatrixData;
-        console.log(`[PMXDemo] skin[0]: ${d[0]} ${d[1]} ${d[2]} ${d[3]} | ${d[4]} ${d[5]} ${d[6]} ${d[7]} | ${d[8]} ${d[9]} ${d[10]} ${d[11]} | ${d[12]} ${d[13]} ${d[14]} ${d[15]}`);
-        console.log(`[PMXDemo] skin[1]: ${d[16]} ${d[17]} ${d[18]} ${d[19]} | ${d[20]} ${d[21]} ${d[22]} ${d[23]} | ${d[24]} ${d[25]} ${d[26]} ${d[27]} | ${d[28]} ${d[29]} ${d[30]} ${d[31]}`);
+    if (!this._skinDebugOnce && this.skinning) {
+      this._skinDebugOnce = true;
+      const d = this.skinning.skinMatrixData;
+      const sk = this.skeleton!;
+      for (const name of ["右足", "右ひざ", "右足首", "右つま先"]) {
+        const bi = sk.getBoneIndex(name);
+        if (bi < 0) { console.log(`[SKIN] ${name}: NOT FOUND`); continue; }
+        const o = bi * 16;
+        console.log(`[SKIN] ${name} idx=${bi} R00=${d[o].toFixed(4)} R11=${d[o+5].toFixed(4)} T=(${d[o+12].toFixed(3)},${d[o+13].toFixed(3)},${d[o+14].toFixed(3)})`);
       }
     }
 
@@ -1000,6 +1082,21 @@ export class PMXDemo implements Demo {
           this.bloomMaskTex?.destroy();
           this.bloomMaskTex = this.device.createTexture({ label: "bloom-mask", size: [w, h], format: "rg8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
           this.bloomMaskView = this.bloomMaskTex.createView();
+        }
+
+        if (this.skinning) {
+          if (!this._gpuSkinDebug) {
+            this._gpuSkinDebug = true;
+            const d = this.skinning.skinMatrixData;
+            const kneeIdx = this.skeleton!.getBoneIndex("右ひざ");
+            if (kneeIdx >= 0) {
+              const o = kneeIdx * 16;
+              console.log(`[GPU-UPLOAD] 右ひざ skinMatrix row0=[${d[o].toFixed(4)},${d[o+1].toFixed(4)},${d[o+2].toFixed(4)},${d[o+3].toFixed(4)}]`);
+              console.log(`[GPU-UPLOAD] 右ひざ skinMatrix row3=[${d[o+12].toFixed(4)},${d[o+13].toFixed(4)},${d[o+14].toFixed(4)},${d[o+15].toFixed(4)}]`);
+              console.log(`[GPU-UPLOAD] buffer size=${this.skinMatrixStorageBuffer.size} data bytes=${d.byteLength} kneeIdx=${kneeIdx} offset=${o*4}`);
+            }
+          }
+          this.device.queue.writeBuffer(this.skinMatrixStorageBuffer, 0, this.skinning.skinMatrixData as unknown as GPUAllowSharedBufferSource);
         }
 
         const shadowPass = this.shadowMap.beginShadowPass(encoder);
@@ -1037,7 +1134,8 @@ export class PMXDemo implements Demo {
           if (mr.hasEdge && mr.outlineBG && mr.renderClass !== "eye") {
             mainPass.setPipeline(this.outlinePipeline);
             mainPass.setBindGroup(0, mr.outlineBG);
-            mainPass.setBindGroup(1, this.skinBG);
+            mainPass.setBindGroup(1, mr.shadowBG);
+            mainPass.setBindGroup(2, this.skinBG);
             mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
           }
           const pipeline = this.stencilEnabled
@@ -1057,7 +1155,8 @@ export class PMXDemo implements Demo {
           if (mr.hasEdge && mr.outlineBG) {
             mainPass.setPipeline(this.outlinePipeline);
             mainPass.setBindGroup(0, mr.outlineBG);
-            mainPass.setBindGroup(1, this.skinBG);
+            mainPass.setBindGroup(1, mr.shadowBG);
+            mainPass.setBindGroup(2, this.skinBG);
             mainPass.drawIndexed(mr.indexCount, 1, mr.indexOffset);
           }
           mainPass.setPipeline(this.mainPipeline);
@@ -1081,8 +1180,139 @@ export class PMXDemo implements Demo {
         } else {
           this.applyTonemap(encoder, view, this.ctx.format, this.resolvedHDRView!, null, 0);
         }
+
+        if (this.debugIK && this.ikChains.length > 0) {
+          this.drawIKDebug(encoder, view);
+        }
       },
     }];
+  }
+
+  private _ikDebugPipeline: GPURenderPipeline | null = null;
+  private _boneLinePipeline: GPURenderPipeline | null = null;
+  private _ikDebugBuf: GPUBuffer | null = null;
+  private _boneLineBuf: GPUBuffer | null = null;
+  private _ikDebugUBO: GPUBuffer | null = null;
+
+  private drawIKDebug(encoder: GPUCommandEncoder, view: GPUTextureView): void {
+    if (!this._ikDebugPipeline) {
+      const code = `
+struct U { viewProj: mat4x4<f32>, screenSize: vec2<f32>, pad: vec2<f32> };
+@group(0) @binding(0) var<uniform> u: U;
+struct V { @location(0) pos: vec3<f32>, @location(1) color: vec3<f32>, @location(2) size: f32 };
+struct O { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32> };
+@vertex fn vs(v: V) -> O {
+  let clip = u.viewProj * vec4<f32>(v.pos, 1.0);
+  var o: O;
+  o.position = clip;
+  o.color = v.color;
+  return o;
+}
+@fragment fn fs(o: O) -> @location(0) vec4<f32> {
+  return vec4<f32>(o.color, 1.0);
+}`;
+      const mod = this.device.createShaderModule({ code });
+      const vbLayout: GPUVertexBufferLayout = { arrayStride: 28, attributes: [
+        { shaderLocation: 0, offset: 0, format: "float32x3" },
+        { shaderLocation: 1, offset: 12, format: "float32x3" },
+        { shaderLocation: 2, offset: 24, format: "float32" },
+      ]};
+      const dsState: GPUDepthStencilState = { format: "depth24plus-stencil8", depthWriteEnabled: false, depthCompare: "less" };
+      const sharedBGL = this.device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
+      ]});
+      const sharedLayout = this.device.createPipelineLayout({ bindGroupLayouts: [sharedBGL] });
+      this._ikDebugPipeline = this.device.createRenderPipeline({
+        label: "ik-debug-points",
+        layout: sharedLayout,
+        vertex: { module: mod, entryPoint: "vs", buffers: [vbLayout] },
+        fragment: { module: mod, entryPoint: "fs", targets: [{ format: this.ctx.format }] },
+        primitive: { topology: "point-list" },
+        depthStencil: dsState,
+      });
+      this._boneLinePipeline = this.device.createRenderPipeline({
+        label: "ik-debug-lines",
+        layout: sharedLayout,
+        vertex: { module: mod, entryPoint: "vs", buffers: [vbLayout] },
+        fragment: { module: mod, entryPoint: "fs", targets: [{ format: this.ctx.format }] },
+        primitive: { topology: "line-list" },
+        depthStencil: dsState,
+      });
+    }
+
+    const wm = this.skeleton!.worldMatrices;
+    const sk = this.skeleton!;
+
+    // Bone lines: parent→child as cyan lines (Z negated to match model matrix Z-flip)
+    const lines: number[] = [];
+    for (let i = 0; i < sk.boneCount; i++) {
+      const pi = sk.parentIndices[i];
+      if (pi < 0) continue;
+      const cOff = i * 16, pOff = pi * 16;
+      lines.push(wm[pOff+12], wm[pOff+13], -wm[pOff+14], 0, 0.8, 0.8, 1);
+      lines.push(wm[cOff+12], wm[cOff+13], -wm[cOff+14], 0, 0.8, 0.8, 1);
+    }
+
+    // IK points: target=red, effector=green, chain=yellow
+    const pts: number[] = [];
+    for (const chain of this.ikChains) {
+      const tOff = chain.targetIndex * 16;
+      pts.push(wm[tOff+12], wm[tOff+13], -wm[tOff+14], 1, 0, 0, 8);
+      const eOff = chain.effectorIndex * 16;
+      pts.push(wm[eOff+12], wm[eOff+13], -wm[eOff+14], 0, 1, 0, 8);
+      for (const link of chain.links) {
+        const lOff = link.index * 16;
+        pts.push(wm[lOff+12], wm[lOff+13], -wm[lOff+14], 1, 1, 0, 5);
+      }
+    }
+
+    const lineVertCount = lines.length / 7;
+    const lineByteSize = lineVertCount * 28;
+    if (!this._boneLineBuf || this._boneLineBuf.size < lineByteSize) {
+      this._boneLineBuf?.destroy();
+      this._boneLineBuf = this.device.createBuffer({ label: "bone-line-vb", size: Math.max(lineByteSize, 1024), usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    }
+    this.device.queue.writeBuffer(this._boneLineBuf, 0, new Float32Array(lines) as unknown as GPUAllowSharedBufferSource);
+
+    const ptVertCount = pts.length / 7;
+    const ptByteSize = ptVertCount * 28;
+    if (!this._ikDebugBuf || this._ikDebugBuf.size < ptByteSize) {
+      this._ikDebugBuf?.destroy();
+      this._ikDebugBuf = this.device.createBuffer({ label: "ik-debug-vb", size: Math.max(ptByteSize, 256), usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
+    }
+    this.device.queue.writeBuffer(this._ikDebugBuf, 0, new Float32Array(pts) as unknown as GPUAllowSharedBufferSource);
+
+    const w = this.ctx.canvas.width;
+    const h = this.ctx.canvas.height;
+    const viewProj = this.camera.getViewProjectionMatrix(w / h);
+    const uboData = new Float32Array(20);
+    uboData.set(viewProj as unknown as ArrayLike<number>, 0);
+    uboData[16] = w; uboData[17] = h;
+
+    if (!this._ikDebugUBO) {
+      this._ikDebugUBO = this.device.createBuffer({ label: "ik-debug-ubo", size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    }
+    this.device.queue.writeBuffer(this._ikDebugUBO, 0, uboData as unknown as GPUAllowSharedBufferSource);
+
+    const bg = this.device.createBindGroup({
+      layout: this._ikDebugPipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: this._ikDebugUBO } }],
+    });
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view, loadOp: "load", storeOp: "store" }],
+      depthStencilAttachment: { view: this.hdrTarget.depthTarget.view, depthLoadOp: "load", depthStoreOp: "store", depthClearValue: 1.0, stencilLoadOp: "load", stencilStoreOp: "store", stencilClearValue: 0 },
+    });
+    // Draw bone lines
+    pass.setPipeline(this._boneLinePipeline!);
+    pass.setBindGroup(0, bg);
+    pass.setVertexBuffer(0, this._boneLineBuf);
+    pass.draw(lineVertCount);
+    // Draw IK points
+    pass.setPipeline(this._ikDebugPipeline);
+    pass.setVertexBuffer(0, this._ikDebugBuf);
+    pass.draw(ptVertCount);
+    pass.end();
   }
 
   exposure = 1.0;
@@ -1270,11 +1500,19 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   }
 
   registerGUI(gui: any) {
+    gui.add(this, "animPaused").name("Pause Animation");
+    gui.add(this, "debugIK").name("Debug Skeleton");
     gui.add(this, "bloomEnabled").name("Bloom");
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
     gui.add(this, "gradeEnabled").name("Color Grading");
     gui.add(this, "stencilEnabled").name("Eye Stencil");
     gui.add(this, "shadowRes", [1024, 2048, 4096]).name("Shadow Res").onChange((v: number) => this.setShadowResolution(v));
+    const camFolder = gui.addFolder("Camera");
+    camFolder.add(this.camera, "distance", 1, 80, 0.5).name("Distance");
+    camFolder.add(this.camera, "fov", 20, 120, 1).name("FOV");
+    camFolder.add(this.camera.target, "0", -20, 20, 0.1).name("Target X");
+    camFolder.add(this.camera.target, "1", -5, 30, 0.1).name("Target Y");
+    camFolder.add(this.camera.target, "2", -20, 20, 0.1).name("Target Z");
     gui.add(this.bloom, "bloomIntensity", 0, 1, 0.01).name("Bloom Intensity");
     gui.add(this.bloom, "threshold", 0, 2, 0.01).name("Bloom Threshold");
     gui.add(this.bloom, "knee", 0, 1, 0.01).name("Bloom Knee");

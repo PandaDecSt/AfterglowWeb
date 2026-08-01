@@ -39,6 +39,10 @@ export interface PMXBone {
   ikLoopCount: number;
   ikUnitLength: number;
   ikLinks: { linkIndex: number; hasLimit: boolean; limitMin: Float32Array; limitMax: Float32Array }[];
+  appendParentIndex: number;
+  appendRatio: number;
+  appendRotate: boolean;
+  appendMove: boolean;
 }
 
 export interface PMXMorph {
@@ -345,9 +349,15 @@ export function parsePMX(buffer: ArrayBuffer): PMXModel {
       r.readVec3();
     }
 
+    let appendParentIndex = -1;
+    let appendRatio = 0;
+    let appendRotate = false;
+    let appendMove = false;
     if (boneFlag & 0x0100 || boneFlag & 0x0200) {
-      r.readNonVertexIndex(boneIndexSize);
-      r.readFloat32();
+      appendParentIndex = r.readNonVertexIndex(boneIndexSize);
+      appendRatio = r.readFloat32();
+      appendRotate = (boneFlag & 0x0100) !== 0;
+      appendMove = (boneFlag & 0x0200) !== 0;
     }
 
     if (boneFlag & 0x0400) {
@@ -387,6 +397,7 @@ export function parsePMX(buffer: ArrayBuffer): PMXModel {
       parentIndex, transformLevel, position,
       flag: boneFlag,
       ikTargetIndex, ikLoopCount, ikUnitLength, ikLinks,
+      appendParentIndex, appendRatio, appendRotate, appendMove,
     });
   }
 

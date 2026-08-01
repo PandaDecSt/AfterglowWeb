@@ -4,7 +4,7 @@ export { Skinning } from "./skinning";
 export { AnimationClip, sampleTrack } from "./animation-clip";
 export type { Keyframe, BoneTrack, MorphTrack, TrackType } from "./animation-clip";
 export { AnimationPlayer } from "./animation-player";
-export type { AnimationSlot } from "./animation-player";
+export type { VMDAnimationSlot } from "./animation-player";
 export { MorphTarget } from "./morph-target";
 export type { MorphDesc } from "./morph-target";
 export { SkinnedMesh } from "./skinned-mesh";

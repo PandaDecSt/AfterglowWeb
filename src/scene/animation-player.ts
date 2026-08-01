@@ -1,191 +1,154 @@
 import type { Skeleton } from "./skeleton";
-import type { AnimationClip, BoneTrack, MorphTrack } from "./animation-clip";
-import { sampleTrack } from "./animation-clip";
-import { quat } from "wgpu-matrix";
+import type { VMDData, VMDBoneFrame, VMDMorphFrame } from "../utils/vmd-loader";
+import { sampleVMDBone, sampleVMDMorph, vmdDuration } from "../utils/vmd-loader";
 
-export interface AnimationSlot {
-  clip: AnimationClip;
+const FRAME_RATE = 30.0;
+
+function normalizeBoneName(name: string): string {
+  let out = "";
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c >= 0xff01 && c <= 0xff5e) {
+      out += String.fromCharCode(c - 0xfee0);
+    } else if (c === 0x3000) {
+      out += " ";
+    } else {
+      out += name[i];
+    }
+  }
+  return out;
+}
+
+export interface VMDAnimationSlot {
+  data: VMDData;
   time: number;
   playing: boolean;
   loop: boolean;
-  weight: number;
   speed: number;
-  priority: number;
-  blendIn: number;
-  blendOut: number;
-  blendWeight: number;
+  boneMap: Map<string, number>;
+  morphMap: Map<string, number>;
 }
 
 export class AnimationPlayer {
   private skeleton: Skeleton;
-  private slots: AnimationSlot[] = [];
-  private morphWeights: Float32Array = new Float32Array(0);
-  private morphCount = 0;
+  private slots: VMDAnimationSlot[] = [];
+  private morphWeights: Float32Array;
+  private morphCount: number;
+  private bindPositions: Float32Array;
+  private bindRotations: Float32Array;
 
   constructor(skeleton: Skeleton, morphCount = 0) {
     this.skeleton = skeleton;
     this.morphCount = morphCount;
     this.morphWeights = new Float32Array(morphCount);
+    this.bindPositions = new Float32Array(skeleton.localPositions);
+    this.bindRotations = new Float32Array(skeleton.localRotations);
   }
 
   getMorphWeights(): Float32Array {
     return this.morphWeights;
   }
 
-  play(
-    clip: AnimationClip,
-    options?: {
-      loop?: boolean;
-      weight?: number;
-      speed?: number;
-      priority?: number;
-      blendIn?: number;
+  playVMD(
+    data: VMDData,
+    boneNames: string[],
+    morphNames: string[],
+    options?: { loop?: boolean; speed?: number }
+  ): VMDAnimationSlot {
+    const boneMap = new Map<string, number>();
+    for (let i = 0; i < boneNames.length; i++) {
+      boneMap.set(normalizeBoneName(boneNames[i]), i);
     }
-  ): AnimationSlot {
-    const slot: AnimationSlot = {
-      clip,
+    const morphMap = new Map<string, number>();
+    for (let i = 0; i < morphNames.length; i++) {
+      morphMap.set(normalizeBoneName(morphNames[i]), i);
+    }
+
+    const slot: VMDAnimationSlot = {
+      data,
       time: 0,
       playing: true,
       loop: options?.loop ?? true,
-      weight: options?.weight ?? 1.0,
       speed: options?.speed ?? 1.0,
-      priority: options?.priority ?? 0,
-      blendIn: options?.blendIn ?? 0,
-      blendOut: 0,
-      blendWeight: options?.blendIn ? 0 : 1,
+      boneMap,
+      morphMap,
     };
     this.slots.push(slot);
     return slot;
   }
 
-  stop(clipName?: string): void {
-    if (clipName) {
-      this.slots = this.slots.filter((s) => s.clip.name !== clipName);
-    } else {
-      this.slots = [];
-    }
+  stop(): void {
+    this.slots = [];
   }
 
-  isPlaying(clipName?: string): boolean {
-    if (clipName) return this.slots.some((s) => s.clip.name === clipName && s.playing);
-    return this.slots.some((s) => s.playing);
+  isPlaying(): boolean {
+    return this.slots.some(s => s.playing);
   }
 
   update(deltaTime: number): void {
+    if (this.slots.length === 0) return;
+
+    this.skeleton.localPositions.set(this.bindPositions);
+    this.skeleton.localRotations.set(this.bindRotations);
     this.morphWeights.fill(0);
 
-    const sortedSlots = this.slots
-      .filter((s) => s.playing)
-      .sort((a, b) => b.priority - a.priority);
+    for (const slot of this.slots) {
+      if (!slot.playing) continue;
 
-    for (const slot of sortedSlots) {
       slot.time += deltaTime * slot.speed;
 
+      const duration = vmdDuration(slot.data);
+      if (duration <= 0) continue;
+
       if (slot.loop) {
-        slot.time = slot.time % slot.clip.duration;
-      } else if (slot.time >= slot.clip.duration) {
-        slot.time = slot.clip.duration;
+        slot.time = slot.time % duration;
+      } else if (slot.time >= duration) {
+        slot.time = duration;
         slot.playing = false;
       }
 
-      if (slot.blendIn > 0 && slot.blendWeight < 1) {
-        slot.blendWeight = Math.min(1, slot.blendWeight + deltaTime / slot.blendIn);
-      }
-
-      const effectiveWeight = slot.weight * slot.blendWeight;
-      if (effectiveWeight <= 0) continue;
-
-      this.applyBoneTracks(slot.clip.boneTracks, slot.time, effectiveWeight);
-      this.applyMorphTracks(slot.clip.morphTracks, slot.time, effectiveWeight);
+      const frameNum = slot.time * FRAME_RATE;
+      this.applyVMD(slot, frameNum);
     }
 
-    this.slots = this.slots.filter((s) => s.playing || s.blendWeight > 0);
+    this.slots = this.slots.filter(s => s.playing);
   }
 
-  private applyBoneTracks(tracks: BoneTrack[], time: number, weight: number): void {
-    for (const track of tracks) {
-      const boneIdx = track.boneIndex;
-      if (boneIdx < 0 || boneIdx >= this.skeleton.boneCount) continue;
+  private _unmatchedLogged = false;
 
-      switch (track.type) {
-        case "rotation": {
-          const rx = sampleTrack(track.keyframes, time);
-          const ry = sampleTrack(track.keyframes, time);
-          const rz = sampleTrack(track.keyframes, time);
-          if (weight >= 0.999) {
-            this.skeleton.setLocalRotation(boneIdx, rx, ry, rz, 0);
-            this.normalizeBoneRotation(boneIdx);
-          } else {
-            this.blendRotation(boneIdx, rx, ry, rz, weight);
-          }
-          break;
-        }
-        case "position": {
-          const x = sampleTrack(track.keyframes, time);
-          const y = sampleTrack(track.keyframes, time);
-          const z = sampleTrack(track.keyframes, time);
-          if (weight >= 0.999) {
-            this.skeleton.setLocalPosition(boneIdx, x, y, z);
-          } else {
-            this.blendPosition(boneIdx, x, y, z, weight);
-          }
-          break;
-        }
-        case "scale": {
-          break;
-        }
+  private applyVMD(slot: VMDAnimationSlot, frameNum: number): void {
+    if (!this._unmatchedLogged) {
+      this._unmatchedLogged = true;
+      const unmatched: string[] = [];
+      for (const boneName of slot.data.boneFrames.keys()) {
+        if (!slot.boneMap.has(normalizeBoneName(boneName))) unmatched.push(boneName);
+      }
+      if (unmatched.length > 0) {
+        console.warn(`[AnimPlayer] ${unmatched.length} VMD bones unmatched:`, unmatched.slice(0, 20).join(", "));
+        console.log("[AnimPlayer] PMX bones:", [...slot.boneMap.keys()].slice(0, 30).join(", "));
       }
     }
-  }
 
-  private applyMorphTracks(tracks: MorphTrack[], time: number, weight: number): void {
-    for (const track of tracks) {
-      const idx = track.morphIndex;
-      if (idx < 0 || idx >= this.morphCount) continue;
-      const value = sampleTrack(track.keyframes, time);
-      this.morphWeights[idx] += value * weight;
+    for (const [boneName, frames] of slot.data.boneFrames) {
+      const boneIdx = slot.boneMap.get(normalizeBoneName(boneName));
+      if (boneIdx === undefined || boneIdx < 0 || boneIdx >= this.skeleton.boneCount) continue;
+
+      const { rotation, translation } = sampleVMDBone(frames as VMDBoneFrame[], frameNum);
+
+      this.skeleton.setLocalRotation(boneIdx, rotation[0], rotation[1], rotation[2], rotation[3]);
+
+      const i3 = boneIdx * 3;
+      this.skeleton.localPositions[i3] = this.bindPositions[i3] + translation[0];
+      this.skeleton.localPositions[i3 + 1] = this.bindPositions[i3 + 1] + translation[1];
+      this.skeleton.localPositions[i3 + 2] = this.bindPositions[i3 + 2] + translation[2];
     }
-  }
 
-  private normalizeBoneRotation(index: number): void {
-    const i4 = index * 4;
-    const x = this.skeleton.localRotations[i4];
-    const y = this.skeleton.localRotations[i4 + 1];
-    const z = this.skeleton.localRotations[i4 + 2];
-    const w = this.skeleton.localRotations[i4 + 3];
-    const len = Math.sqrt(x * x + y * y + z * z + w * w) || 1;
-    this.skeleton.localRotations[i4] = x / len;
-    this.skeleton.localRotations[i4 + 1] = y / len;
-    this.skeleton.localRotations[i4 + 2] = z / len;
-    this.skeleton.localRotations[i4 + 3] = w / len;
-  }
+    for (const [morphName, frames] of slot.data.morphFrames) {
+      const morphIdx = slot.morphMap.get(normalizeBoneName(morphName));
+      if (morphIdx === undefined || morphIdx < 0 || morphIdx >= this.morphCount) continue;
 
-  private blendPosition(index: number, x: number, y: number, z: number, weight: number): void {
-    const i3 = index * 3;
-    this.skeleton.localPositions[i3] += (x - this.skeleton.localPositions[i3]) * weight;
-    this.skeleton.localPositions[i3 + 1] += (y - this.skeleton.localPositions[i3 + 1]) * weight;
-    this.skeleton.localPositions[i3 + 2] += (z - this.skeleton.localPositions[i3 + 2]) * weight;
-  }
-
-  private blendRotation(index: number, x: number, y: number, z: number, weight: number): void {
-    const i4 = index * 4;
-    const curX = this.skeleton.localRotations[i4];
-    const curY = this.skeleton.localRotations[i4 + 1];
-    const curZ = this.skeleton.localRotations[i4 + 2];
-    const curW = this.skeleton.localRotations[i4 + 3];
-
-    const dot = curX * x + curY * y + curZ * z + curW * 0;
-    const sign = dot >= 0 ? 1 : -1;
-
-    const result = quat.slerp(
-      quat.create(curX, curY, curZ, curW),
-      quat.create(x * sign, y * sign, z * sign, 0),
-      weight
-    );
-
-    this.skeleton.localRotations[i4] = result[0];
-    this.skeleton.localRotations[i4 + 1] = result[1];
-    this.skeleton.localRotations[i4 + 2] = result[2];
-    this.skeleton.localRotations[i4 + 3] = result[3];
+      const value = sampleVMDMorph(frames as VMDMorphFrame[], frameNum);
+      this.morphWeights[morphIdx] += value;
+    }
   }
 }

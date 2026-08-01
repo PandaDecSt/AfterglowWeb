@@ -6,6 +6,10 @@ export interface BoneDesc {
   position: Vec3;
   rotation: Quat;
   scale: Vec3;
+  appendParentIndex?: number;
+  appendRatio?: number;
+  appendRotate?: boolean;
+  appendMove?: boolean;
 }
 
 export class Skeleton {
@@ -17,13 +21,19 @@ export class Skeleton {
   localRotations: Float32Array;
   localScales: Float32Array;
   worldMatrices: Float32Array;
+  worldRotations: Float32Array;
   inverseBindMatrices: Float32Array;
 
+  appendParentIndices: Int16Array;
+  appendRatios: Float32Array;
+  appendFlags: Uint8Array;
+  bindPositions: Float32Array;
+
   private _tmpMat = mat4.create();
-  private _tmpPos = vec3.create();
-  private _tmpRot = quat.create();
-  private _tmpScl = vec3.create();
   private _tmpLocal = mat4.create();
+  private _slerpQ0 = quat.create();
+  private _slerpQ1 = quat.create();
+  private _slerpQ2 = quat.create();
 
   constructor(descs: BoneDesc[], inverseBindMatrices?: Float32Array) {
     this.boneCount = descs.length;
@@ -34,7 +44,13 @@ export class Skeleton {
     this.localRotations = new Float32Array(this.boneCount * 4);
     this.localScales = new Float32Array(this.boneCount * 3);
     this.worldMatrices = new Float32Array(this.boneCount * 16);
+    this.worldRotations = new Float32Array(this.boneCount * 4);
     this.inverseBindMatrices = new Float32Array(this.boneCount * 16);
+
+    this.appendParentIndices = new Int16Array(this.boneCount);
+    this.appendRatios = new Float32Array(this.boneCount);
+    this.appendFlags = new Uint8Array(this.boneCount);
+    this.bindPositions = new Float32Array(this.boneCount * 3);
 
     for (let i = 0; i < this.boneCount; i++) {
       const d = descs[i];
@@ -52,7 +68,16 @@ export class Skeleton {
       this.localScales[i * 3] = d.scale[0];
       this.localScales[i * 3 + 1] = d.scale[1];
       this.localScales[i * 3 + 2] = d.scale[2];
+
+      this.appendParentIndices[i] = d.appendParentIndex ?? -1;
+      this.appendRatios[i] = d.appendRatio ?? 0;
+      let flags = 0;
+      if (d.appendRotate) flags |= 1;
+      if (d.appendMove) flags |= 2;
+      this.appendFlags[i] = flags;
     }
+
+    this.bindPositions.set(this.localPositions);
 
     this.updateWorldMatrices();
 
@@ -85,35 +110,112 @@ export class Skeleton {
   }
 
   updateWorldMatrices(): void {
+    const lr = this.localRotations;
+    const lp = this.localPositions;
+    const bp = this.bindPositions;
+
     for (let i = 0; i < this.boneCount; i++) {
       const off3 = i * 3;
       const off4 = i * 4;
-      this._tmpPos[0] = this.localPositions[off3];
-      this._tmpPos[1] = this.localPositions[off3 + 1];
-      this._tmpPos[2] = this.localPositions[off3 + 2];
-      this._tmpRot[0] = this.localRotations[off4];
-      this._tmpRot[1] = this.localRotations[off4 + 1];
-      this._tmpRot[2] = this.localRotations[off4 + 2];
-      this._tmpRot[3] = this.localRotations[off4 + 3];
-      this._tmpScl[0] = this.localScales[off3];
-      this._tmpScl[1] = this.localScales[off3 + 1];
-      this._tmpScl[2] = this.localScales[off3 + 2];
 
-      mat4.identity(this._tmpLocal);
-      mat4.translate(this._tmpLocal, this._tmpPos, this._tmpLocal);
-      // 这个注释代码是错误的：mat4.multiply(this._tmpLocal, mat4.fromQuat(this._tmpMat, this._tmpRot), this._tmpLocal);
-      mat4.multiply(this._tmpLocal, mat4.fromQuat(this._tmpRot, this._tmpMat), this._tmpLocal);
-      mat4.scale(this._tmpLocal, this._tmpScl, this._tmpLocal);
+      let rx = lr[off4];
+      let ry = lr[off4 + 1];
+      let rz = lr[off4 + 2];
+      let rw = lr[off4 + 3];
 
-      const parentIdx = this.parentIndices[i];
-      if (parentIdx >= 0 && parentIdx < i) {
-        const parentWorld = this.getWorldMatrix(parentIdx);
-        mat4.multiply(parentWorld, this._tmpLocal, this._tmpMat);
-      } else {
-        mat4.copy(this._tmpLocal, this._tmpMat);
+      let addTx = 0, addTy = 0, addTz = 0;
+
+      const aFlags = this.appendFlags[i];
+      if (aFlags !== 0) {
+        const aParent = this.appendParentIndices[i];
+        if (aParent >= 0 && aParent < this.boneCount) {
+          const ratio = this.appendRatios[i];
+          const absRatio = Math.abs(ratio);
+          if (absRatio > 1e-6) {
+            if (aFlags & 1) {
+              let ax = lr[aParent * 4];
+              let ay = lr[aParent * 4 + 1];
+              let az = lr[aParent * 4 + 2];
+              const aw = lr[aParent * 4 + 3];
+              if (ratio < 0) { ax = -ax; ay = -ay; az = -az; }
+
+              this._slerpQ0[0] = 0; this._slerpQ0[1] = 0; this._slerpQ0[2] = 0; this._slerpQ0[3] = 1;
+              this._slerpQ1[0] = ax; this._slerpQ1[1] = ay; this._slerpQ1[2] = az; this._slerpQ1[3] = aw;
+              quat.slerp(this._slerpQ0, this._slerpQ1, absRatio, this._slerpQ2);
+
+              const sx = this._slerpQ2[0], sy = this._slerpQ2[1], sz = this._slerpQ2[2], sw = this._slerpQ2[3];
+              const nx = sw * rx + sx * rw + sy * rz - sz * ry;
+              const ny = sw * ry - sx * rz + sy * rw + sz * rx;
+              const nz = sw * rz + sx * ry - sy * rx + sz * rw;
+              const nw = sw * rw - sx * rx - sy * ry - sz * rz;
+              rx = nx; ry = ny; rz = nz; rw = nw;
+            }
+
+            if (aFlags & 2) {
+              const aOff3 = aParent * 3;
+              addTx = (lp[aOff3] - bp[aOff3]) * ratio;
+              addTy = (lp[aOff3 + 1] - bp[aOff3 + 1]) * ratio;
+              addTz = (lp[aOff3 + 2] - bp[aOff3 + 2]) * ratio;
+            }
+          }
+        }
       }
 
-      this.worldMatrices.set(this._tmpMat, i * 16);
+      const px = lp[off3] + addTx;
+      const py = lp[off3 + 1] + addTy;
+      const pz = lp[off3 + 2] + addTz;
+      const sx = this.localScales[off3];
+      const sy = this.localScales[off3 + 1];
+      const sz = this.localScales[off3 + 2];
+
+      const x2 = rx + rx, y2 = ry + ry, z2 = rz + rz;
+      const xx = rx * x2, xy = rx * y2, xz = rx * z2;
+      const yy = ry * y2, yz = ry * z2, zz = rz * z2;
+      const wx = rw * x2, wy = rw * y2, wz = rw * z2;
+
+      const l = this._tmpLocal;
+      l[0] = (1 - (yy + zz)) * sx; l[1] = (xy + wz) * sx;       l[2] = (xz - wy) * sx;       l[3] = 0;
+      l[4] = (xy - wz) * sy;       l[5] = (1 - (xx + zz)) * sy; l[6] = (yz + wx) * sy;       l[7] = 0;
+      l[8] = (xz + wy) * sz;       l[9] = (yz - wx) * sz;       l[10] = (1 - (xx + yy)) * sz; l[11] = 0;
+      l[12] = px;                  l[13] = py;                  l[14] = pz;                  l[15] = 1;
+
+      const parentIdx = this.parentIndices[i];
+      const wOff = i * 16;
+      if (parentIdx >= 0 && parentIdx < i) {
+        const pOff = parentIdx * 16;
+        const p = this.worldMatrices;
+        const wm = this.worldMatrices;
+        wm[wOff + 0] = p[pOff] * l[0] + p[pOff + 4] * l[1] + p[pOff + 8] * l[2] + p[pOff + 12] * l[3];
+        wm[wOff + 1] = p[pOff + 1] * l[0] + p[pOff + 5] * l[1] + p[pOff + 9] * l[2] + p[pOff + 13] * l[3];
+        wm[wOff + 2] = p[pOff + 2] * l[0] + p[pOff + 6] * l[1] + p[pOff + 10] * l[2] + p[pOff + 14] * l[3];
+        wm[wOff + 3] = p[pOff + 3] * l[0] + p[pOff + 7] * l[1] + p[pOff + 11] * l[2] + p[pOff + 15] * l[3];
+        wm[wOff + 4] = p[pOff] * l[4] + p[pOff + 4] * l[5] + p[pOff + 8] * l[6] + p[pOff + 12] * l[7];
+        wm[wOff + 5] = p[pOff + 1] * l[4] + p[pOff + 5] * l[5] + p[pOff + 9] * l[6] + p[pOff + 13] * l[7];
+        wm[wOff + 6] = p[pOff + 2] * l[4] + p[pOff + 6] * l[5] + p[pOff + 10] * l[6] + p[pOff + 14] * l[7];
+        wm[wOff + 7] = p[pOff + 3] * l[4] + p[pOff + 7] * l[5] + p[pOff + 11] * l[6] + p[pOff + 15] * l[7];
+        wm[wOff + 8] = p[pOff] * l[8] + p[pOff + 4] * l[9] + p[pOff + 8] * l[10] + p[pOff + 12] * l[11];
+        wm[wOff + 9] = p[pOff + 1] * l[8] + p[pOff + 5] * l[9] + p[pOff + 9] * l[10] + p[pOff + 13] * l[11];
+        wm[wOff + 10] = p[pOff + 2] * l[8] + p[pOff + 6] * l[9] + p[pOff + 10] * l[10] + p[pOff + 14] * l[11];
+        wm[wOff + 11] = p[pOff + 3] * l[8] + p[pOff + 7] * l[9] + p[pOff + 11] * l[10] + p[pOff + 15] * l[11];
+        wm[wOff + 12] = p[pOff] * l[12] + p[pOff + 4] * l[13] + p[pOff + 8] * l[14] + p[pOff + 12] * l[15];
+        wm[wOff + 13] = p[pOff + 1] * l[12] + p[pOff + 5] * l[13] + p[pOff + 9] * l[14] + p[pOff + 13] * l[15];
+        wm[wOff + 14] = p[pOff + 2] * l[12] + p[pOff + 6] * l[13] + p[pOff + 10] * l[14] + p[pOff + 14] * l[15];
+        wm[wOff + 15] = p[pOff + 3] * l[12] + p[pOff + 7] * l[13] + p[pOff + 11] * l[14] + p[pOff + 15] * l[15];
+      } else {
+        this.worldMatrices.set(l, wOff);
+      }
+
+      const wr = this.worldRotations;
+      if (parentIdx >= 0 && parentIdx < i) {
+        const pOff4 = parentIdx * 4;
+        const pwx = wr[pOff4], pwy = wr[pOff4 + 1], pwz = wr[pOff4 + 2], pww = wr[pOff4 + 3];
+        wr[off4]     = pww * rx + pwx * rw + pwy * rz - pwz * ry;
+        wr[off4 + 1] = pww * ry - pwx * rz + pwy * rw + pwz * rx;
+        wr[off4 + 2] = pww * rz + pwx * ry - pwy * rx + pwz * rw;
+        wr[off4 + 3] = pww * rw - pwx * rx - pwy * ry - pwz * rz;
+      } else {
+        wr[off4] = rx; wr[off4 + 1] = ry; wr[off4 + 2] = rz; wr[off4 + 3] = rw;
+      }
     }
   }
 

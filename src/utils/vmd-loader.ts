@@ -1,165 +1,192 @@
-import { AnimationClip } from "../scene/animation-clip";
-import type { BoneTrack, MorphTrack, Keyframe } from "../scene/animation-clip";
-
-export interface VMDCameraKeyframe {
-  time: number;
-  position: Float32Array;
-  rotation: Float32Array;
-  distance: number;
-  fov: number;
+export interface VMDBoneFrame {
+  frame: number;
+  rotation: [number, number, number, number];
+  translation: [number, number, number];
+  interpolation: Uint8Array;
 }
 
-export class VMDData {
+export interface VMDMorphFrame {
+  frame: number;
+  weight: number;
+}
+
+export interface VMDData {
   name: string;
-  boneTracks: Map<string, Keyframe[]> = new Map();
-  morphTracks: Map<string, Keyframe[]> = new Map();
-  cameraKeyframes: VMDCameraKeyframe[] = [];
+  boneFrames: Map<string, VMDBoneFrame[]>;
+  morphFrames: Map<string, VMDMorphFrame[]>;
+  maxFrame: number;
+}
 
-  constructor(name = "") {
-    this.name = name;
-  }
+const FRAME_RATE = 30.0;
 
-  toAnimationClip(boneNameToIndex: Map<string, number>, morphNameToIndex: Map<string, number>): AnimationClip {
-    const boneTracks: BoneTrack[] = [];
-    const morphTracks: MorphTrack[] = [];
-    let maxTime = 0;
-
-    for (const [boneName, keyframes] of this.boneTracks) {
-      const boneIndex = boneNameToIndex.get(boneName);
-      if (boneIndex === undefined) continue;
-
-      const sortedKf = keyframes.slice().sort((a, b) => a.time - b.time);
-
-      const posTrack: Keyframe[] = [];
-      const rotTrack: Keyframe[] = [];
-
-      for (const kf of sortedKf) {
-        if (kf.time > maxTime) maxTime = kf.time;
-        posTrack.push({ time: kf.time, value: kf.value });
-        rotTrack.push({ time: kf.time, value: kf.value });
-      }
-
-      if (posTrack.length > 0) {
-        boneTracks.push({ boneName, boneIndex, type: "position", keyframes: posTrack });
-      }
-      if (rotTrack.length > 0) {
-        boneTracks.push({ boneName, boneIndex, type: "rotation", keyframes: rotTrack });
-      }
-    }
-
-    for (const [morphName, keyframes] of this.morphTracks) {
-      const morphIndex = morphNameToIndex.get(morphName);
-      if (morphIndex === undefined) continue;
-
-      const sortedKf = keyframes.slice().sort((a, b) => a.time - b.time);
-      for (const kf of sortedKf) {
-        if (kf.time > maxTime) maxTime = kf.time;
-      }
-
-      if (sortedKf.length > 0) {
-        morphTracks.push({ morphName, morphIndex, keyframes: sortedKf });
-      }
-    }
-
-    return new AnimationClip(this.name, maxTime, boneTracks, morphTracks);
-  }
+export async function loadVMD(url: string): Promise<VMDData> {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Failed to fetch VMD: ${url}`);
+  return parseVMD(await resp.arrayBuffer());
 }
 
 export function parseVMD(buffer: ArrayBuffer): VMDData {
   const view = new DataView(buffer);
-  let offset = 0;
+  let off = 0;
 
-  function readString(len: number, isUTF16: boolean): string {
-    const bytes = new Uint8Array(buffer, offset, len);
-    offset += len;
-    const decoder = isUTF16 ? new TextDecoder("utf-16le") : new TextDecoder("shift-jis");
-    return decoder.decode(bytes).replace(/\0+$/, "");
+  const u8 = () => { const v = view.getUint8(off); off += 1; return v; };
+  const u32 = () => { const v = view.getUint32(off, true); off += 4; return v; };
+  const f32 = () => { const v = view.getFloat32(off, true); off += 4; return v; };
+
+  let decoder: TextDecoder;
+  try { decoder = new TextDecoder("shift-jis"); } catch { decoder = new TextDecoder("utf-8"); }
+
+  const readName = (len: number): string => {
+    const buf = new Uint8Array(buffer, off, len);
+    off += len;
+    let end = len;
+    for (let i = 0; i < len; i++) { if (buf[i] === 0) { end = i; break; } }
+    try { return decoder.decode(buf.slice(0, end)); } catch { return String.fromCharCode(...buf.slice(0, end)); }
+  };
+
+  const readAscii = (len: number): string => {
+    const buf = new Uint8Array(buffer, off, len);
+    off += len;
+    return String.fromCharCode(...buf);
+  };
+
+  const header = readAscii(30);
+  if (!header.startsWith("Vocaloid Motion Data")) throw new Error("Invalid VMD header");
+  const modelName = readName(20);
+
+  const boneCount = u32();
+  const boneFrames = new Map<string, VMDBoneFrame[]>();
+
+  for (let i = 0; i < boneCount; i++) {
+    const boneName = readName(15);
+    const frame = u32();
+    const tx = f32(), ty = f32(), tz = f32();
+    const rx = f32(), ry = f32(), rz = f32(), rw = f32();
+    const interp = new Uint8Array(64);
+    for (let j = 0; j < 64; j++) interp[j] = u8();
+
+    let arr = boneFrames.get(boneName);
+    if (!arr) { arr = []; boneFrames.set(boneName, arr); }
+    arr.push({ frame, rotation: [rx, ry, rz, rw], translation: [tx, ty, tz], interpolation: interp });
   }
 
-  function readFloat32(): number {
-    const v = view.getFloat32(offset, true);
-    offset += 4;
-    return v;
-  }
+  const morphCount = u32();
+  const morphFrames = new Map<string, VMDMorphFrame[]>();
 
-  function readUint32(): number {
-    const v = view.getUint32(offset, true);
-    offset += 4;
-    return v;
-  }
-
-  const magic = readString(30, false);
-  const name = readString(20, true);
-
-  const vmd = new VMDData(name);
-
-  const motionCount = readUint32();
-  for (let i = 0; i < motionCount; i++) {
-    const boneName = readString(15, true);
-    const frameNumber = readUint32();
-    const px = readFloat32();
-    const py = readFloat32();
-    const pz = readFloat32();
-    const rx = readFloat32();
-    const ry = readFloat32();
-    const rz = readFloat32();
-    const rw = readFloat32();
-
-    offset += 64; // interpolation bytes
-
-    const time = frameNumber / 30;
-
-    if (!vmd.boneTracks.has(boneName)) {
-      vmd.boneTracks.set(boneName, []);
-    }
-    vmd.boneTracks.get(boneName)!.push({ time, value: px });
-  }
-
-  const morphCount = readUint32();
   for (let i = 0; i < morphCount; i++) {
-    const morphName = readString(15, true);
-    const frameNumber = readUint32();
-    const weight = readFloat32();
+    const morphName = readName(15);
+    const frame = u32();
+    const weight = f32();
 
-    const time = frameNumber / 30;
-
-    if (!vmd.morphTracks.has(morphName)) {
-      vmd.morphTracks.set(morphName, []);
-    }
-    vmd.morphTracks.get(morphName)!.push({ time, value: weight });
+    let arr = morphFrames.get(morphName);
+    if (!arr) { arr = []; morphFrames.set(morphName, arr); }
+    arr.push({ frame, weight });
   }
 
-  if (offset < buffer.byteLength - 4) {
-    try {
-      const cameraCount = readUint32();
-      for (let i = 0; i < cameraCount && offset < buffer.byteLength - 40; i++) {
-        const frameNumber = readUint32();
-        const distance = readFloat32();
-        const cx = readFloat32();
-        const cy = readFloat32();
-        const cz = readFloat32();
-        const crx = readFloat32();
-        const cry = readFloat32();
-        const crz = readFloat32();
-        const fov = readFloat32();
-        offset += 24; // interpolation
+  for (const frames of boneFrames.values()) frames.sort((a, b) => a.frame - b.frame);
+  for (const frames of morphFrames.values()) frames.sort((a, b) => a.frame - b.frame);
 
-        vmd.cameraKeyframes.push({
-          time: frameNumber / 30,
-          position: new Float32Array([cx, cy, cz]),
-          rotation: new Float32Array([crx, cry, crz]),
-          distance,
-          fov,
-        });
-      }
-    } catch { /* camera data optional */ }
+  let maxFrame = 0;
+  for (const frames of boneFrames.values()) {
+    if (frames.length > 0) maxFrame = Math.max(maxFrame, frames[frames.length - 1].frame);
+  }
+  for (const frames of morphFrames.values()) {
+    if (frames.length > 0) maxFrame = Math.max(maxFrame, frames[frames.length - 1].frame);
   }
 
-  return vmd;
+  return { name: modelName, boneFrames, morphFrames, maxFrame };
 }
 
-export async function loadVMD(url: string): Promise<VMDData> {
-  const response = await fetch(url);
-  const buffer = await response.arrayBuffer();
-  return parseVMD(buffer);
+export function vmdDuration(data: VMDData): number {
+  return data.maxFrame / FRAME_RATE;
+}
+
+function evalBezier(ax: number, ay: number, bx: number, by: number, t: number): number {
+  if (ax === ay && bx === by) return t;
+  let lo = 0.0, hi = 1.0;
+  for (let i = 0; i < 16; i++) {
+    const mid = (lo + hi) * 0.5;
+    const u = 1.0 - mid;
+    const x = 3.0 * u * u * mid * ax + 3.0 * u * mid * mid * bx + mid * mid * mid;
+    if (x < t) lo = mid; else hi = mid;
+  }
+  const s = (lo + hi) * 0.5;
+  const u = 1.0 - s;
+  return 3.0 * u * u * s * ay + 3.0 * u * s * s * by + s * s * s;
+}
+
+export function sampleVMDBone(frames: VMDBoneFrame[], frameNum: number):
+  { rotation: [number, number, number, number]; translation: [number, number, number] } {
+
+  if (frames.length === 0) return { rotation: [0, 0, 0, 1], translation: [0, 0, 0] };
+  if (frames.length === 1) return { rotation: frames[0].rotation, translation: frames[0].translation };
+  if (frameNum <= frames[0].frame) return { rotation: frames[0].rotation, translation: frames[0].translation };
+  const last = frames[frames.length - 1];
+  if (frameNum >= last.frame) return { rotation: last.rotation, translation: last.translation };
+
+  let lo = 0, hi = frames.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].frame <= frameNum) lo = mid; else hi = mid;
+  }
+
+  const f0 = frames[lo], f1 = frames[hi];
+  const dt = f1.frame - f0.frame;
+  if (dt <= 0) return { rotation: f0.rotation, translation: f0.translation };
+
+  const t = (frameNum - f0.frame) / dt;
+  const ip = f0.interpolation;
+
+  const tx = evalBezier(ip[0] / 127.0, ip[4] / 127.0, ip[8] / 127.0, ip[12] / 127.0, t);
+  const ty = evalBezier(ip[1] / 127.0, ip[5] / 127.0, ip[9] / 127.0, ip[13] / 127.0, t);
+  const tz = evalBezier(ip[2] / 127.0, ip[6] / 127.0, ip[10] / 127.0, ip[14] / 127.0, t);
+  const tr = evalBezier(ip[3] / 127.0, ip[7] / 127.0, ip[11] / 127.0, ip[15] / 127.0, t);
+
+  const px = f0.translation[0] + (f1.translation[0] - f0.translation[0]) * tx;
+  const py = f0.translation[1] + (f1.translation[1] - f0.translation[1]) * ty;
+  const pz = f0.translation[2] + (f1.translation[2] - f0.translation[2]) * tz;
+
+  const q0 = f0.rotation, q1 = f1.rotation;
+  let dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+  const sign = dot >= 0 ? 1 : -1;
+  dot = Math.abs(dot);
+
+  if (dot > 0.9995) {
+    const rx = q0[0] + (q1[0] * sign - q0[0]) * tr;
+    const ry = q0[1] + (q1[1] * sign - q0[1]) * tr;
+    const rz = q0[2] + (q1[2] * sign - q0[2]) * tr;
+    const rw = q0[3] + (q1[3] * sign - q0[3]) * tr;
+    const len = Math.sqrt(rx * rx + ry * ry + rz * rz + rw * rw) || 1;
+    return { rotation: [rx / len, ry / len, rz / len, rw / len], translation: [px, py, pz] };
+  }
+
+  const theta = Math.acos(dot);
+  const sinTheta = Math.sin(theta);
+  const s0 = Math.abs(sinTheta) < 1e-6 ? 0.5 : Math.sin((1.0 - tr) * theta) / sinTheta;
+  const s1 = Math.abs(sinTheta) < 1e-6 ? 0.5 : Math.sin(tr * theta) / sinTheta;
+  const rx = s0 * q0[0] + s1 * q1[0] * sign;
+  const ry = s0 * q0[1] + s1 * q1[1] * sign;
+  const rz = s0 * q0[2] + s1 * q1[2] * sign;
+  const rw = s0 * q0[3] + s1 * q1[3] * sign;
+  const len = Math.sqrt(rx * rx + ry * ry + rz * rz + rw * rw) || 1;
+  return { rotation: [rx / len, ry / len, rz / len, rw / len], translation: [px, py, pz] };
+}
+
+export function sampleVMDMorph(frames: VMDMorphFrame[], frameNum: number): number {
+  if (frames.length === 0) return 0;
+  if (frames.length === 1) return frames[0].weight;
+  if (frameNum <= frames[0].frame) return frames[0].weight;
+  if (frameNum >= frames[frames.length - 1].frame) return frames[frames.length - 1].weight;
+
+  let lo = 0, hi = frames.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].frame <= frameNum) lo = mid; else hi = mid;
+  }
+
+  const f0 = frames[lo], f1 = frames[hi];
+  const dt = f1.frame - f0.frame;
+  if (dt <= 0) return f0.weight;
+  const t = (frameNum - f0.frame) / dt;
+  return f0.weight + (f1.weight - f0.weight) * t;
 }
