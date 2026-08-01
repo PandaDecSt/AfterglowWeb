@@ -70,6 +70,10 @@ struct Scene {
   lightDir: vec4<f32>,
   lightColor: vec4<f32>,
   cameraPos: vec4<f32>,
+  flags: u32,
+  _pad1: u32,
+  _pad2: u32,
+  _pad3: u32,
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
 
@@ -100,18 +104,26 @@ fn safe_normal(n: vec3<f32>) -> vec3<f32> {
 fn vs_main(in: VSIn) -> VSOut {
   var out: VSOut;
 
-  let weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
-  let invW = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
-  let w = select(vec4<f32>(1.0, 0.0, 0.0, 0.0), in.weights * invW, weightSum > 0.0001);
+  var skinPos: vec4<f32>;
+  var skinNrm: vec4<f32>;
 
-  var skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  var skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  let pos4 = vec4<f32>(in.position, 1.0);
-  let nrm4 = vec4<f32>(in.normal, 0.0);
-  for (var i = 0u; i < 4u; i++) {
-    let j = in.joints[i];
-    skinPos += skinMatrices[j] * pos4 * w[i];
-    skinNrm += skinMatrices[j] * nrm4 * w[i];
+  if ((scene.flags & 1u) != 0u) {
+    skinPos = vec4<f32>(in.position, 1.0);
+    skinNrm = vec4<f32>(in.normal, 0.0);
+  } else {
+    let weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
+    let invW = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
+    let w = select(vec4<f32>(1.0, 0.0, 0.0, 0.0), in.weights * invW, weightSum > 0.0001);
+
+    skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let pos4 = vec4<f32>(in.position, 1.0);
+    let nrm4 = vec4<f32>(in.normal, 0.0);
+    for (var i = 0u; i < 4u; i++) {
+      let j = in.joints[i];
+      skinPos += skinMatrices[j] * pos4 * w[i];
+      skinNrm += skinMatrices[j] * nrm4 * w[i];
+    }
   }
 
   let worldPos = (scene.model * skinPos).xyz;
@@ -302,6 +314,10 @@ const SHADOW_VS = `
 struct ShadowScene {
   lightVP: mat4x4<f32>,
   model: mat4x4<f32>,
+  flags: u32,
+  _pad1: u32,
+  _pad2: u32,
+  _pad3: u32,
 };
 @group(0) @binding(0) var<uniform> shadowScene: ShadowScene;
 
@@ -315,12 +331,17 @@ fn vs_main(
   @location(3) joints: vec4<u32>,
   @location(4) weights: vec4<f32>,
 ) -> @builtin(position) vec4<f32> {
-  var skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  let pos4 = vec4<f32>(position, 1.0);
-  for (var i = 0u; i < 4u; i++) {
-    let j = joints[i];
-    let w = weights[i];
-    skinPos += skinMatrices[j] * pos4 * w;
+  var skinPos: vec4<f32>;
+  if ((shadowScene.flags & 1u) != 0u) {
+    skinPos = vec4<f32>(position, 1.0);
+  } else {
+    skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let pos4 = vec4<f32>(position, 1.0);
+    for (var i = 0u; i < 4u; i++) {
+      let j = joints[i];
+      let w = weights[i];
+      skinPos += skinMatrices[j] * pos4 * w;
+    }
   }
   let worldPos = (shadowScene.model * skinPos).xyz;
   return shadowScene.lightVP * vec4<f32>(worldPos, 1.0);
@@ -334,6 +355,10 @@ struct Scene {
   lightDir: vec4<f32>,
   lightColor: vec4<f32>,
   cameraPos: vec4<f32>,
+  flags: u32,
+  _pad1: u32,
+  _pad2: u32,
+  _pad3: u32,
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
 
@@ -361,15 +386,23 @@ fn vs_main(
 ) -> VSOut {
   var out: VSOut;
 
-  var skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  var skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-  let pos4 = vec4<f32>(position, 1.0);
-  let nrm4 = vec4<f32>(normal, 0.0);
-  for (var i = 0u; i < 4u; i++) {
-    let j = joints[i];
-    let w = weights[i];
-    skinPos += skinMatrices[j] * pos4 * w;
-    skinNrm += skinMatrices[j] * nrm4 * w;
+  var skinPos: vec4<f32>;
+  var skinNrm: vec4<f32>;
+
+  if ((scene.flags & 1u) != 0u) {
+    skinPos = vec4<f32>(position, 1.0);
+    skinNrm = vec4<f32>(normal, 0.0);
+  } else {
+    skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let pos4 = vec4<f32>(position, 1.0);
+    let nrm4 = vec4<f32>(normal, 0.0);
+    for (var i = 0u; i < 4u; i++) {
+      let j = joints[i];
+      let w = weights[i];
+      skinPos += skinMatrices[j] * pos4 * w;
+      skinNrm += skinMatrices[j] * nrm4 * w;
+    }
   }
 
   let worldPos = (scene.model * skinPos).xyz;
@@ -531,7 +564,7 @@ export class PMXDemo implements Demo {
   private skinBG!: GPUBindGroup;
 
   private shadowSceneBuffer!: GPUBuffer;
-  private shadowSceneData = new Float32Array(32);
+  private shadowSceneData = new Float32Array(36);
   private shadowSceneBG!: GPUBindGroup;
 
   bloomEnabled = true;
@@ -852,7 +885,7 @@ export class PMXDemo implements Demo {
           pmx.vertices.length,
           pmx.bones.length,
           56,
-          new Float32Array(this.vertexBuffer.size / 4),
+          new Float32Array(vertexBuf),
           this.skinning.skinMatrixData,
         );
         console.log(`[PMXDemo] GPU Compute Skinning initialized`);
@@ -1100,6 +1133,7 @@ export class PMXDemo implements Demo {
     this.sceneData[32] = lx / len; this.sceneData[33] = ly / len; this.sceneData[34] = lz / len; this.sceneData[35] = 0;
     this.sceneData[36] = 2.0; this.sceneData[37] = 2.0; this.sceneData[38] = 2.0; this.sceneData[39] = 0;
     this.sceneData[40] = this.camera.position[0]; this.sceneData[41] = this.camera.position[1]; this.sceneData[42] = this.camera.position[2]; this.sceneData[43] = 0;
+    this.sceneData[44] = this.gpuSkinningEnabled ? 1 : 0;
     this.device.queue.writeBuffer(this.sceneBuffer, 0, this.sceneData as unknown as GPUAllowSharedBufferSource);
 
     if (!this._skinDebugOnce && this.skinning) {
@@ -1125,6 +1159,7 @@ export class PMXDemo implements Demo {
 
     this.shadowSceneData.set(this.shadowMap.lightVP as unknown as ArrayLike<number>, 0);
     this.shadowSceneData.set(model as unknown as ArrayLike<number>, 16);
+    this.shadowSceneData[32] = this.gpuSkinningEnabled ? 1 : 0;
     this.device.queue.writeBuffer(this.shadowSceneBuffer, 0, this.shadowSceneData as unknown as GPUAllowSharedBufferSource);
   }
 
@@ -1157,11 +1192,19 @@ export class PMXDemo implements Demo {
           this.device.queue.writeBuffer(this.skinMatrixStorageBuffer, 0, this.skinning.skinMatrixData as unknown as GPUAllowSharedBufferSource);
         }
 
+        let activeVB = this.vertexBuffer;
+        if (this.gpuSkinningEnabled && this.gpuSkinning && this.skinning) {
+          this.gpuSkinning.updateSkinMatrices(this.skinning.skinMatrixData);
+          this.gpuSkinning.dispatch(encoder);
+          const gpuVB = this.gpuSkinning.getSkinnedVertexBuffer();
+          if (gpuVB) activeVB = gpuVB;
+        }
+
         const shadowPass = this.shadowMap.beginShadowPass(encoder);
         shadowPass.setPipeline(this.shadowPipeline);
         shadowPass.setBindGroup(0, this.shadowSceneBG);
         shadowPass.setBindGroup(1, this.skinBG);
-        shadowPass.setVertexBuffer(0, this.vertexBuffer);
+        shadowPass.setVertexBuffer(0, activeVB);
         shadowPass.setIndexBuffer(this.indexBuffer, this.use32bit ? "uint32" : "uint16");
         for (const mr of this.matRenders) {
           if (!mr.castsShadow) continue;
@@ -1184,7 +1227,7 @@ export class PMXDemo implements Demo {
             stencilStoreOp: "store",
           },
         });
-        mainPass.setVertexBuffer(0, this.vertexBuffer);
+        mainPass.setVertexBuffer(0, activeVB);
         mainPass.setIndexBuffer(this.indexBuffer, this.use32bit ? "uint32" : "uint16");
         mainPass.setStencilReference(1);
 

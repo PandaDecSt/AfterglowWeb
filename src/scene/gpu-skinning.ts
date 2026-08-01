@@ -13,7 +13,7 @@ struct Params {
 @compute @workgroup_size(64)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let vi = gid.x;
-  if ((vi >= params.vertexCount)) { return; }
+  if (vi >= params.vertexCount) { return; }
 
   let stride = params.stride;
   let srcOff = vi * stride;
@@ -26,14 +26,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ny = srcVertices[srcOff + 4u];
   let nz = srcVertices[srcOff + 5u];
 
-  let j0 = u32(srcVertices[srcOff + 8u]);
-  let j1 = u32(srcVertices[srcOff + 10u]);
-  let j2 = u32(srcVertices[srcOff + 12u]);
-  let j3 = u32(srcVertices[srcOff + 14u]);
-  let w0 = srcVertices[srcOff + 20u];
-  let w1 = srcVertices[srcOff + 24u];
-  let w2 = srcVertices[srcOff + 28u];
-  let w3 = srcVertices[srcOff + 32u];
+  let packed0 = bitcast<u32>(srcVertices[srcOff + 8u]);
+  let packed1 = bitcast<u32>(srcVertices[srcOff + 9u]);
+  let j0 = packed0 & 0xFFFFu;
+  let j1 = (packed0 >> 16u) & 0xFFFFu;
+  let j2 = packed1 & 0xFFFFu;
+  let j3 = (packed1 >> 16u) & 0xFFFFu;
+
+  let w0 = srcVertices[srcOff + 10u];
+  let w1 = srcVertices[srcOff + 11u];
+  let w2 = srcVertices[srcOff + 12u];
+  let w3 = srcVertices[srcOff + 13u];
 
   let weightSum = w0 + w1 + w2 + w3;
   let invW = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
@@ -78,7 +81,6 @@ export class GPUComputeSkinning {
   private vertexCount = 0;
   private boneCount = 0;
   private stride = 0;
-  private srcData: Float32Array | null = null;
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -116,7 +118,6 @@ export class GPUComputeSkinning {
     this.vertexCount = vertexCount;
     this.boneCount = boneCount;
     this.stride = stride;
-    this.srcData = srcVertexData;
 
     const paramsData = new Uint32Array([vertexCount, boneCount, stride, 0]);
     this.device.queue.writeBuffer(this.paramsBuffer, 0, paramsData);
