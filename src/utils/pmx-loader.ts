@@ -57,6 +57,40 @@ export interface PMXTexture {
   path: string;
 }
 
+export interface PMXRigidbody {
+  name: string;
+  nameEn: string;
+  boneIndex: number;
+  group: number;
+  collisionMask: number;
+  shape: number;
+  size: Float32Array;
+  position: Float32Array;
+  rotation: Float32Array;
+  mass: number;
+  linearDamping: number;
+  angularDamping: number;
+  restitution: number;
+  friction: number;
+  type: number;
+}
+
+export interface PMXJoint {
+  name: string;
+  nameEn: string;
+  type: number;
+  rigidbodyIndexA: number;
+  rigidbodyIndexB: number;
+  position: Float32Array;
+  rotation: Float32Array;
+  positionMin: Float32Array;
+  positionMax: Float32Array;
+  rotationMin: Float32Array;
+  rotationMax: Float32Array;
+  springPosition: Float32Array;
+  springRotation: Float32Array;
+}
+
 export interface PMXModel {
   name: string;
   nameEn: string;
@@ -68,6 +102,8 @@ export interface PMXModel {
   bones: PMXBone[];
   morphs: PMXMorph[];
   textures: PMXTexture[];
+  rigidbodies: PMXRigidbody[];
+  joints: PMXJoint[];
 }
 
 class PMXReader {
@@ -461,42 +497,66 @@ export function parsePMX(buffer: ArrayBuffer): PMXModel {
     }
   }
 
-  // --- Rigid bodies (skip) ---
+  // --- Rigid bodies ---
+  const rigidbodies: PMXRigidbody[] = [];
   if (r.remaining > 4) {
     const rbCount = r.readInt32();
     for (let i = 0; i < rbCount; i++) {
-      r.readText(encoding);
-      r.readText(encoding);
-      r.readNonVertexIndex(boneIndexSize);
-      r.readUint8();
-      r.readUint16();
-      r.readUint8();
-      r.readVec3();
-      r.readVec3();
-      r.readVec3();
-      r.readFloat32();
-      r.readFloat32();
-      r.readFloat32();
-      r.readFloat32();
-      r.readFloat32();
-      r.readUint8();
+      const rbName = r.readText(encoding);
+      const rbNameEn = r.readText(encoding);
+      const rbBoneIndex = r.readNonVertexIndex(boneIndexSize);
+      const rbGroup = r.readUint8();
+      const rbCollisionMask = r.readUint16();
+      const rbShape = r.readUint8();
+      const rbSize = r.readVec3();
+      const rbPosition = r.readVec3();
+      const rbRotation = r.readVec3();
+      const rbMass = r.readFloat32();
+      const rbLinearDamping = r.readFloat32();
+      const rbAngularDamping = r.readFloat32();
+      const rbRestitution = r.readFloat32();
+      const rbFriction = r.readFloat32();
+      const rbType = r.readUint8();
+      rigidbodies.push({
+        name: rbName, nameEn: rbNameEn,
+        boneIndex: rbBoneIndex, group: rbGroup, collisionMask: rbCollisionMask,
+        shape: rbShape, size: rbSize, position: rbPosition, rotation: rbRotation,
+        mass: rbMass, linearDamping: rbLinearDamping, angularDamping: rbAngularDamping,
+        restitution: rbRestitution, friction: rbFriction, type: rbType,
+      });
     }
   }
 
-  // --- Joints (skip) ---
+  // --- Joints ---
+  const joints: PMXJoint[] = [];
   if (r.remaining > 4) {
     const jointCount = r.readInt32();
     for (let i = 0; i < jointCount; i++) {
-      r.readText(encoding);
-      r.readText(encoding);
-      r.readUint8();
-      r.readNonVertexIndex(rigidbodyIndexSize);
-      r.readNonVertexIndex(rigidbodyIndexSize);
-      for (let j = 0; j < 8; j++) r.readVec3();
+      const jName = r.readText(encoding);
+      const jNameEn = r.readText(encoding);
+      const jType = r.readUint8();
+      const jRbA = r.readNonVertexIndex(rigidbodyIndexSize);
+      const jRbB = r.readNonVertexIndex(rigidbodyIndexSize);
+      const jPos = r.readVec3();
+      const jRot = r.readVec3();
+      const jPosMin = r.readVec3();
+      const jPosMax = r.readVec3();
+      const jRotMin = r.readVec3();
+      const jRotMax = r.readVec3();
+      const jSpringPos = r.readVec3();
+      const jSpringRot = r.readVec3();
+      joints.push({
+        name: jName, nameEn: jNameEn, type: jType,
+        rigidbodyIndexA: jRbA, rigidbodyIndexB: jRbB,
+        position: jPos, rotation: jRot,
+        positionMin: jPosMin, positionMax: jPosMax,
+        rotationMin: jRotMin, rotationMax: jRotMax,
+        springPosition: jSpringPos, springRotation: jSpringRot,
+      });
     }
   }
 
-  return { name, nameEn, comment, commentEn, vertices, indices, materials, bones, morphs, textures };
+  return { name, nameEn, comment, commentEn, vertices, indices, materials, bones, morphs, textures, rigidbodies, joints };
 }
 
 export async function loadPMX(url: string): Promise<PMXModel> {

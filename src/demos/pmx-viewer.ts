@@ -15,6 +15,9 @@ import { decodeTGA } from "../utils/tga-loader";
 import { BrdfLut, BRDF_LUT_SIZE } from "../passes/brdf-lut";
 import { loadVMD, vmdDuration } from "../utils/vmd-loader";
 import { buildIKChains, solveIK, type IKChain } from "../scene/ik-solver";
+import { MMDPhysics } from "../scene/physics";
+import { buildPhysicsRigidbodies, buildPhysicsJoints } from "../scene/pmx-physics-bridge";
+import { GPUComputeSkinning } from "../scene/gpu-skinning";
 
 const HDR_FORMAT = "rgba16float";
 
@@ -537,10 +540,15 @@ export class PMXDemo implements Demo {
   gradeEnabled = true;
   debugIK = false;
   animPaused = false;
+  physicsEnabled = true;
+  gpuSkinningEnabled = false;
   lightX = 5;
   lightY = 10;
   lightZ = 8;
   shadowRes = 2048;
+
+  private physics: MMDPhysics | null = null;
+  private gpuSkinning: GPUComputeSkinning | null = null;
 
   private loaded = false;
   private _renderLogOnce = true;
@@ -548,6 +556,7 @@ export class PMXDemo implements Demo {
   private _ikDbgTimer = 0;
   private _ikDbgTimer2 = 0;
   private _legVertCount = 0;
+  private _physDebugOnce = false;
   private _skinDebugOnce2 = false;
   private _gpuSkinDebug = false;
   private _depthTex: GPUTexture | null = null;
@@ -824,6 +833,35 @@ export class PMXDemo implements Demo {
         console.warn("[PMXDemo] VMD load failed:", e);
       }
     }
+
+    if (pmx.rigidbodies.length > 0) {
+      try {
+        const physRbs = buildPhysicsRigidbodies(pmx.rigidbodies);
+        const physJoints = buildPhysicsJoints(pmx.joints);
+        this.physics = new MMDPhysics(physRbs, physJoints);
+        console.log(`[PMXDemo] Physics initialized: ${pmx.rigidbodies.length} rigidbodies, ${pmx.joints.length} joints`);
+      } catch (e) {
+        console.warn("[PMXDemo] Physics init failed:", e);
+      }
+    }
+
+    if (this.gpuSkinningEnabled && this.skeleton && this.skinning) {
+      try {
+        this.gpuSkinning = new GPUComputeSkinning(this.device);
+        this.gpuSkinning.setup(
+          pmx.vertices.length,
+          pmx.bones.length,
+          56,
+          new Float32Array(this.vertexBuffer.size / 4),
+          this.skinning.skinMatrixData,
+        );
+        console.log(`[PMXDemo] GPU Compute Skinning initialized`);
+      } catch (e) {
+        console.warn("[PMXDemo] GPU skinning init failed:", e);
+        this.gpuSkinning = null;
+        this.gpuSkinningEnabled = false;
+      }
+    }
   }
 
   private buildPipelines(): void {
@@ -1010,6 +1048,26 @@ export class PMXDemo implements Demo {
         }
       }
       this.skeleton!.computeSkinMatrices(this.skinning!.skinMatrixData);
+
+      if (this.physicsEnabled && this.physics && this.skeleton) {
+        this.physics.step(deltaTime, this.skeleton.worldMatrices, this.skeleton.inverseBindMatrices);
+        this.skeleton!.computeSkinMatrices(this.skinning!.skinMatrixData);
+        if (!this._physDebugOnce) {
+          this._physDebugOnce = true;
+          const store = this.physics.getStore();
+          let dynCount = 0;
+          for (let i = 0; i < store.count; i++) {
+            if (store.type[i] === 1 && store.invMass[i] > 0) dynCount++;
+          }
+          console.log(`[PHYS] dynamic bodies: ${dynCount}/${store.count}, constraints: ${this.physics.getJoints().length}`);
+          const p = store.positions;
+          const o = store.orientations;
+          for (let i = 0; i < Math.min(5, store.count); i++) {
+            const i3 = i * 3, i4 = i * 4;
+            console.log(`  body[${i}] type=${store.type[i]} bone=${store.boneIndex[i]} pos=[${p[i3].toFixed(2)},${p[i3+1].toFixed(2)},${p[i3+2].toFixed(2)}] ori=[${o[i4].toFixed(3)},${o[i4+1].toFixed(3)},${o[i4+2].toFixed(3)},${o[i4+3].toFixed(3)}]`);
+          }
+        }
+      }
 
       if (!this._skinDebugOnce2) {
         this._skinDebugOnce2 = true;
@@ -1501,6 +1559,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
   registerGUI(gui: any) {
     gui.add(this, "animPaused").name("Pause Animation");
+    gui.add(this, "physicsEnabled").name("Physics");
+    gui.add(this, "gpuSkinningEnabled").name("GPU Skinning");
     gui.add(this, "debugIK").name("Debug Skeleton");
     gui.add(this, "bloomEnabled").name("Bloom");
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
