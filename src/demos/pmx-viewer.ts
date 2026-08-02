@@ -1,5 +1,5 @@
 import { GPUContext } from "../core/device";
-import { Camera } from "../scene/camera";
+import { Camera, type CameraMode } from "../scene/camera";
 import { Demo, ShaderStageDesc } from "./types";
 import type { EngineContext } from "../core/engine";
 import type { RenderPass } from "../core/renderer";
@@ -19,6 +19,8 @@ import { MMDPhysics } from "../scene/physics";
 import { buildPhysicsRigidbodies, buildPhysicsJoints } from "../scene/pmx-physics-bridge";
 import { GPUComputeSkinning } from "../scene/gpu-skinning";
 import { CameraAnimation } from "../scene/camera-animation";
+import { MmdCoord } from "../scene/mmd-coord";
+import { MorphDeformer } from "../scene/morph-deformer";
 
 const HDR_FORMAT = "rgba16float";
 
@@ -528,9 +530,8 @@ export class PMXDemo implements Demo {
   private sceneBuffer!: GPUBuffer;
   private sceneData = new Float32Array(80);
   private vertexBuffer!: GPUBuffer;
-  private baseVertices: Float32Array | null = null;
-  private morphedVertices: Float32Array | null = null;
-  private vertexMorphs: { pmxIndex: number; offsets: { vertexIndex: number; position: Float32Array }[] }[] = [];
+
+  private morphDeformer: MorphDeformer | null = null;
   private indexBuffer!: GPUBuffer;
   private totalIndexCount = 0;
   private use32bit = false;
@@ -594,20 +595,11 @@ export class PMXDemo implements Demo {
   private _headBoneIdx = -1;
   private _headPos = new Float32Array(3);
 
+  private loaded = false;
+  private _legVertCount = 0;
   private _modelCenterY = 10;
   private _modelRadius = 20;
 
-  private loaded = false;
-  private _renderLogOnce = true;
-  private _skinDebugOnce = false;
-  private _ikDbgTimer = 0;
-  private _ikDbgTimer2 = 0;
-  private _legVertCount = 0;
-  private _physDebugOnce = false;
-  private _skinDebugOnce2 = false;
-  private _gpuSkinDebug = false;
-  private _camAnimDbgT = 0;
-  private _camViewProjDbg = 0;
   private _depthTex: GPUTexture | null = null;
   private _depthW = 0;
   private _depthH = 0;
@@ -689,14 +681,9 @@ export class PMXDemo implements Demo {
     new Uint8Array(this.vertexBuffer.getMappedRange()).set(new Uint8Array(vertexBuf));
     this.vertexBuffer.unmap();
 
-    this.baseVertices = new Float32Array(vertexBuf);
-    this.morphedVertices = new Float32Array(this.baseVertices.length);
-    this.morphedVertices.set(this.baseVertices);
-    this.vertexMorphs = [];
-    for (let i = 0; i < pmx.morphs.length; i++) {
-      if (pmx.morphs[i].type === 1) this.vertexMorphs.push({ pmxIndex: i, offsets: pmx.morphs[i].offsets });
-    }
-    console.log(`[PMXDemo] Vertex morphs: ${this.vertexMorphs.length} / ${pmx.morphs.length} total`);
+    const baseVertices = new Float32Array(vertexBuf);
+    this.morphDeformer = new MorphDeformer(this.device, this.vertexBuffer, baseVertices, pmx.morphs);
+    console.log(`[PMXDemo] Vertex morphs: ${this.morphDeformer.morphCount} / ${pmx.morphs.length} total`);
 
     this.use32bit = vertexCount > 65535;
     this.totalIndexCount = pmx.indices.length;
@@ -1116,60 +1103,13 @@ export class PMXDemo implements Demo {
       if (this.ikChains.length > 0) {
         solveIK(this.skeleton!, this.ikChains);
 
-        this._ikDbgTimer += deltaTime;
-        if (this._ikDbgTimer > 2.0) {
-          this._ikDbgTimer = 0;
-          const wm = this.skeleton!.worldMatrices;
-          const sk = this.skeleton!;
-          for (const chain of this.ikChains) {
-            const tOff = chain.targetIndex * 16;
-            const eOff = chain.effectorIndex * 16;
-            const dx = wm[tOff+12]-wm[eOff+12], dy = wm[tOff+13]-wm[eOff+13], dz = wm[tOff+14]-wm[eOff+14];
-            const dist = Math.sqrt(dx*dx+dy*dy+dz*dz);
-            const linkRots = chain.links.map(l => {
-              const o4 = l.index * 4;
-              const rw = sk.localRotations[o4+3];
-              const angle = 2 * Math.acos(Math.min(1, Math.abs(rw))) * 180 / Math.PI;
-              return `${sk.boneNames[l.index]}:${angle.toFixed(1)}°`;
-            }).join(" ");
-            console.log(`[IK] ${sk.boneNames[chain.targetIndex]} dist=${dist.toFixed(3)} [${linkRots}]`);
-          }
-        }
       }
       this.skeleton!.computeSkinMatrices(this.skinning!.skinMatrixData);
 
       if (this.physicsEnabled && this.physics && this.skeleton) {
         this.physics.step(deltaTime, this.skeleton.worldMatrices, this.skeleton.inverseBindMatrices);
         this.skeleton!.computeSkinMatrices(this.skinning!.skinMatrixData);
-        if (!this._physDebugOnce) {
-          this._physDebugOnce = true;
-          const store = this.physics.getStore();
-          let dynCount = 0;
-          for (let i = 0; i < store.count; i++) {
-            if (store.type[i] === 1 && store.invMass[i] > 0) dynCount++;
-          }
-          console.log(`[PHYS] dynamic bodies: ${dynCount}/${store.count}, constraints: ${this.physics.getJoints().length}`);
-          const p = store.positions;
-          const o = store.orientations;
-          for (let i = 0; i < Math.min(5, store.count); i++) {
-            const i3 = i * 3, i4 = i * 4;
-            console.log(`  body[${i}] type=${store.type[i]} bone=${store.boneIndex[i]} pos=[${p[i3].toFixed(2)},${p[i3+1].toFixed(2)},${p[i3+2].toFixed(2)}] ori=[${o[i4].toFixed(3)},${o[i4+1].toFixed(3)},${o[i4+2].toFixed(3)},${o[i4+3].toFixed(3)}]`);
-          }
-        }
-      }
 
-      if (!this._skinDebugOnce2) {
-        this._skinDebugOnce2 = true;
-        const sk = this.skeleton!;
-        const d = this.skinning!.skinMatrixData;
-        const kneeIdx = sk.getBoneIndex("右ひざ");
-        if (kneeIdx >= 0) {
-          const o16 = kneeIdx * 16;
-          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row0=[${d[o16].toFixed(4)},${d[o16+1].toFixed(4)},${d[o16+2].toFixed(4)},${d[o16+3].toFixed(4)}]`);
-          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row1=[${d[o16+4].toFixed(4)},${d[o16+5].toFixed(4)},${d[o16+6].toFixed(4)},${d[o16+7].toFixed(4)}]`);
-          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row2=[${d[o16+8].toFixed(4)},${d[o16+9].toFixed(4)},${d[o16+10].toFixed(4)},${d[o16+11].toFixed(4)}]`);
-          console.log(`[SKIN-CHECK] 右ひざ skinMatrix row3=[${d[o16+12].toFixed(4)},${d[o16+13].toFixed(4)},${d[o16+14].toFixed(4)},${d[o16+15].toFixed(4)}]`);
-        }
       }
     }
 
@@ -1179,19 +1119,16 @@ export class PMXDemo implements Demo {
         const animTime = this.animPlayer ? this.animPlayer.currentTime : 0;
         const pose = anim.sample(animTime);
         if (pose) {
-          this.camera.vmdDriven = true;
+          this.camera.mode = "vmd";
           this.camera.setVmdPose(pose);
         }
       }
+    } else if (this.faceLockEnabled && this.skeleton && this._headBoneIdx >= 0) {
+      this.camera.mode = "faceLock";
+      this.camera.setFaceTarget(MmdCoord.worldPos(this.skeleton.worldMatrices, this._headBoneIdx));
     } else {
-      this.camera.vmdDriven = false;
-    }
-
-    if (this.faceLockEnabled && this.skeleton && this._headBoneIdx >= 0) {
-      const pos = this.skeleton.getBoneWorldPosition(this._headBoneIdx, this._headPos);
-      this.camera.faceTarget = vec3.create(pos[0], pos[1], -pos[2]);
-    } else {
-      this.camera.faceTarget = null;
+      this.camera.mode = "orbit";
+      this.camera.setFaceTarget(null);
     }
 
     const w = this.ctx.canvas.width;
@@ -1201,35 +1138,6 @@ export class PMXDemo implements Demo {
 
     }
 
-    this._camAnimDbgT += deltaTime;
-    if (this._camAnimDbgT > 2.0 && this._camViewProjDbg < 3) {
-      this._camAnimDbgT = 0;
-      this._camViewProjDbg++;
-      const aspect = w / h;
-
-      this.camera.vmdDriven = false;
-      this.camera.update();
-      const orbitVP = this.camera.getViewProjectionMatrix(aspect);
-      const op = this.camera.position;
-      console.log(`[CamDBG ${this._camViewProjDbg}] ORBIT: ${this.camera.debugInfo()}`);
-      console.log(`[CamDBG ${this._camViewProjDbg}] ORBIT VP row2=[${orbitVP[2].toFixed(4)},${orbitVP[6].toFixed(4)},${orbitVP[10].toFixed(4)},${orbitVP[14].toFixed(4)}]`);
-
-      if (this.vmdCameraAnimation ?? this.orbitCameraAnimation) {
-        const anim = this.vmdCameraAnimation ?? this.orbitCameraAnimation!;
-        const animTime = this.animPlayer ? this.animPlayer.currentTime : 0;
-        const pose = anim.sample(animTime);
-        if (pose) {
-          this.camera.setVmdPose(pose);
-          this.camera.vmdDriven = true;
-          const vmdVP = this.camera.getViewProjectionMatrix(aspect);
-          console.log(`[CamDBG ${this._camViewProjDbg}] VMD:  ${this.camera.debugInfo()}`);
-          console.log(`[CamDBG ${this._camViewProjDbg}] VMD VP row2=[${vmdVP[2].toFixed(4)},${vmdVP[6].toFixed(4)},${vmdVP[10].toFixed(4)},${vmdVP[14].toFixed(4)}]`);
-          console.log(`[CamDBG ${this._camViewProjDbg}] VMD pose: target=[${pose.target.map(v=>v.toFixed(2))}] rot=[${pose.rotation.map(v=>v.toFixed(4))}] dist=${pose.distance.toFixed(2)} fov=${pose.fov}`);
-        }
-      }
-
-      this.camera.vmdDriven = this.cameraAnimEnabled && !!(this.vmdCameraAnimation ?? this.orbitCameraAnimation);
-    }
 
     const viewProj = this.camera.getViewProjectionMatrix(w / h);
     const model = mat4.scaling(vec3.create(1, 1, -1));
@@ -1244,17 +1152,6 @@ export class PMXDemo implements Demo {
     this.sceneData[44] = this.gpuSkinningEnabled ? 1 : 0;
     this.device.queue.writeBuffer(this.sceneBuffer, 0, this.sceneData as unknown as GPUAllowSharedBufferSource);
 
-    if (!this._skinDebugOnce && this.skinning) {
-      this._skinDebugOnce = true;
-      const d = this.skinning.skinMatrixData;
-      const sk = this.skeleton!;
-      for (const name of ["右足", "右ひざ", "右足首", "右つま先"]) {
-        const bi = sk.getBoneIndex(name);
-        if (bi < 0) { console.log(`[SKIN] ${name}: NOT FOUND`); continue; }
-        const o = bi * 16;
-        console.log(`[SKIN] ${name} idx=${bi} R00=${d[o].toFixed(4)} R11=${d[o+5].toFixed(4)} T=(${d[o+12].toFixed(3)},${d[o+13].toFixed(3)},${d[o+14].toFixed(3)})`);
-      }
-    }
 
     const slx = this.lightX, sly = this.lightY, slz = this.lightZ;
     const slen = Math.sqrt(slx * slx + sly * sly + slz * slz) || 1;
@@ -1286,17 +1183,7 @@ export class PMXDemo implements Demo {
         }
 
         if (this.skinning) {
-          if (!this._gpuSkinDebug) {
-            this._gpuSkinDebug = true;
-            const d = this.skinning.skinMatrixData;
-            const kneeIdx = this.skeleton!.getBoneIndex("右ひざ");
-            if (kneeIdx >= 0) {
-              const o = kneeIdx * 16;
-              console.log(`[GPU-UPLOAD] 右ひざ skinMatrix row0=[${d[o].toFixed(4)},${d[o+1].toFixed(4)},${d[o+2].toFixed(4)},${d[o+3].toFixed(4)}]`);
-              console.log(`[GPU-UPLOAD] 右ひざ skinMatrix row3=[${d[o+12].toFixed(4)},${d[o+13].toFixed(4)},${d[o+14].toFixed(4)},${d[o+15].toFixed(4)}]`);
-              console.log(`[GPU-UPLOAD] buffer size=${this.skinMatrixStorageBuffer.size} data bytes=${d.byteLength} kneeIdx=${kneeIdx} offset=${o*4}`);
-            }
-          }
+
           this.device.queue.writeBuffer(this.skinMatrixStorageBuffer, 0, this.skinning.skinMatrixData as unknown as GPUAllowSharedBufferSource);
         }
 
@@ -1795,40 +1682,10 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.matRenders = [];
   }
 
-  private _morphDbgOnce = false;
-
   private applyMorphDeform(): void {
     const weights = this.animPlayer?.getMorphWeights();
-    if (!weights || !this.baseVertices || !this.morphedVertices) return;
-
-    const hasMorph = this.vertexMorphs.length > 0 && weights.some(w => w !== 0);
-    if (!hasMorph) return;
-
-    if (!this._morphDbgOnce) {
-      this._morphDbgOnce = true;
-      const active: string[] = [];
-      for (let i = 0; i < weights.length; i++) {
-        if (weights[i] !== 0) active.push(`[${i}]=${weights[i].toFixed(3)}`);
-      }
-      console.log(`[MorphDBG] Active weights (${active.length}): ${active.slice(0, 20).join(', ')}`);
-      console.log(`[MorphDBG] vertexMorphs: ${this.vertexMorphs.length}, pmxIndices: ${this.vertexMorphs.slice(0,5).map(m=>m.pmxIndex).join(',')}`);
-    }
-
-    this.morphedVertices.set(this.baseVertices);
-    const stride = 14;
-    for (let mi = 0; mi < this.vertexMorphs.length; mi++) {
-      const w = weights[this.vertexMorphs[mi].pmxIndex];
-      if (w === 0) continue;
-      const offsets = this.vertexMorphs[mi].offsets;
-      for (let j = 0; j < offsets.length; j++) {
-        const vi = offsets[j].vertexIndex;
-        const pos = offsets[j].position;
-        const o = vi * stride;
-        this.morphedVertices[o] += pos[0] * w;
-        this.morphedVertices[o + 1] += pos[1] * w;
-        this.morphedVertices[o + 2] += pos[2] * w;
-      }
-    }
-    this.device.queue.writeBuffer(this.vertexBuffer, 0, this.morphedVertices as unknown as GPUAllowSharedBufferSource);
+    if (!weights || !this.morphDeformer) return;
+    this.morphDeformer.apply(weights);
   }
 }
+

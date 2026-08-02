@@ -10,4 +10,4 @@ export type { MorphDesc } from "./morph-target";
 export { SkinnedMesh } from "./skinned-mesh";
 export { Entity, Scene } from "./entity";
 export type { Component } from "./entity";
-export { Camera } from "./camera";
+export { Camera, type CameraMode } from "./camera";

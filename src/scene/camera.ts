@@ -1,5 +1,8 @@
 import { mat4, quat, vec3, type Vec3, type Mat4 } from "wgpu-matrix";
 import type { CameraPose } from "./camera-animation";
+import { MmdCoord } from "./mmd-coord";
+
+export type CameraMode = "orbit" | "vmd" | "faceLock";
 
 export class Camera {
   position: Vec3 = vec3.create(0, 2, 6);
@@ -9,15 +12,18 @@ export class Camera {
   near = 0.1;
   far = 100;
 
-  vmdDriven = false;
+  mode: CameraMode = "orbit";
+
   private _vmdTarget: Vec3 = vec3.create(0, 0, 0);
   private _vmdRotation: Vec3 = vec3.create(0, 0, 0);
   private _vmdDistance = 0;
   private _vmdFov = 30;
 
+  private _faceTarget: Vec3 | null = null;
+
   private yaw = -Math.PI / 2;
   private pitch = -0.3;
-  private distance = 7;
+  distance = 7;
   private isDragging = false;
   private lastX = 0;
   private lastY = 0;
@@ -25,8 +31,7 @@ export class Camera {
   constructor(canvas: HTMLCanvasElement) {
     canvas.addEventListener("pointerdown", (e) => {
       this.isDragging = true;
-      this.lastX = e.clientX;
-      this.lastY = e.clientY;
+      this.lastX = e.clientX; this.lastY = e.clientY;
       canvas.setPointerCapture(e.pointerId);
     });
     canvas.addEventListener("pointerup", (e) => {
@@ -37,35 +42,14 @@ export class Camera {
       if (!this.isDragging) return;
       const dx = e.clientX - this.lastX;
       const dy = e.clientY - this.lastY;
-      this.lastX = e.clientX;
-      this.lastY = e.clientY;
+      this.lastX = e.clientX; this.lastY = e.clientY;
       this.yaw += dx * 0.005;
-      this.pitch = Math.max(
-        -Math.PI / 2 + 0.01,
-        Math.min(Math.PI / 2 - 0.01, this.pitch + dy * 0.005)
-      );
+      this.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, this.pitch + dy * 0.005));
     });
-    canvas.addEventListener(
-      "wheel",
-      (e) => {
-        e.preventDefault();
-        this.distance = Math.max(
-          1,
-          Math.min(50, this.distance + e.deltaY * 0.01)
-        );
-      },
-      { passive: false }
-    );
-  }
-
-  update() {
-    this.position = vec3.create(
-      this.target[0] +
-        this.distance * Math.cos(this.pitch) * Math.cos(this.yaw),
-      this.target[1] + this.distance * Math.sin(this.pitch),
-      this.target[2] +
-        this.distance * Math.cos(this.pitch) * Math.sin(this.yaw)
-    );
+    canvas.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      this.distance = Math.max(1, Math.min(50, this.distance + e.deltaY * 0.01));
+    }, { passive: false });
   }
 
   setVmdPose(pose: CameraPose): void {
@@ -75,10 +59,20 @@ export class Camera {
     this._vmdFov = pose.fov > 0 ? pose.fov : 30;
   }
 
-  faceTarget: Vec3 | null = null;
+  setFaceTarget(pos: Vec3 | null): void {
+    this._faceTarget = pos;
+  }
+
+  private orbitUpdate(): void {
+    this.position = vec3.create(
+      this.target[0] + this.distance * Math.cos(this.pitch) * Math.cos(this.yaw),
+      this.target[1] + this.distance * Math.sin(this.pitch),
+      this.target[2] + this.distance * Math.cos(this.pitch) * Math.sin(this.yaw)
+    );
+  }
 
   getViewMatrix(): Mat4 {
-    if (this.vmdDriven) {
+    if (this.mode === "vmd") {
       const r = this._vmdRotation;
       const q = quat.fromEuler(-r[0], -r[1], -r[2], 'zyx', quat.create());
       const rm = mat4.fromQuat(q, mat4.create());
@@ -87,16 +81,18 @@ export class Camera {
       const ex = t[0] + rm[8] * d;
       const ey = t[1] + rm[9] * d;
       const ez = t[2] + rm[10] * d;
-      this.position = vec3.create(ex, ey, -ez);
-      this.target = vec3.create(t[0], t[1], -t[2]);
+      this.position = MmdCoord.toRH(ex, ey, ez);
+      this.target = MmdCoord.toRHTarget(t);
       this.fov = this._vmdFov;
-      const up = vec3.create(rm[4], rm[5], -rm[6]);
+      const up = MmdCoord.toRHUp(vec3.create(rm[4], rm[5], rm[6]));
       return mat4.lookAt(this.position, this.target, up);
     }
-    if (this.faceTarget) {
-      this.target = this.faceTarget;
+
+    if (this.mode === "faceLock" && this._faceTarget) {
+      this.target = this._faceTarget;
     }
-    this.update();
+
+    this.orbitUpdate();
     return mat4.lookAt(this.position, this.target, this.up);
   }
 
@@ -117,10 +113,5 @@ export class Camera {
     if (far !== undefined) this.far = far;
     if (yaw !== undefined) this.yaw = yaw;
     if (pitch !== undefined) this.pitch = pitch;
-  }
-
-  debugInfo(): string {
-    const p = this.position, t = this.target;
-    return `vmdDriven=${this.vmdDriven} fov=${this.fov} near=${this.near} far=${this.far} eye=[${p[0].toFixed(2)},${p[1].toFixed(2)},${p[2].toFixed(2)}] target=[${t[0].toFixed(2)},${t[1].toFixed(2)},${t[2].toFixed(2)}]`;
   }
 }
