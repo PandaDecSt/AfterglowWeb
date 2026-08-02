@@ -10,10 +10,20 @@ export interface VMDMorphFrame {
   weight: number;
 }
 
+export interface VMDCameraFrame {
+  frame: number;
+  distance: number;
+  target: [number, number, number];
+  rotation: [number, number, number];
+  fov: number;
+  interpolation: Uint8Array;
+}
+
 export interface VMDData {
   name: string;
   boneFrames: Map<string, VMDBoneFrame[]>;
   morphFrames: Map<string, VMDMorphFrame[]>;
+  cameraFrames: VMDCameraFrame[];
   maxFrame: number;
 }
 
@@ -94,14 +104,32 @@ export function parseVMD(buffer: ArrayBuffer): VMDData {
     if (frames.length > 0) maxFrame = Math.max(maxFrame, frames[frames.length - 1].frame);
   }
 
-  return { name: modelName, boneFrames, morphFrames, maxFrame };
+  const cameraFrames: VMDCameraFrame[] = [];
+  if (off + 4 <= buffer.byteLength) {
+    const cameraCount = u32();
+    for (let i = 0; i < cameraCount; i++) {
+      const frame = u32();
+      const distance = f32();
+      const tx = f32(), ty = f32(), tz = f32();
+      const rx = f32(), ry = f32(), rz = f32();
+      const interp = new Uint8Array(24);
+      for (let j = 0; j < 24; j++) interp[j] = u8();
+      const fov = u32();
+      u8();
+      cameraFrames.push({ frame, distance, target: [tx, ty, tz], rotation: [rx, ry, rz], fov, interpolation: interp });
+    }
+    cameraFrames.sort((a, b) => a.frame - b.frame);
+    if (cameraFrames.length > 0) maxFrame = Math.max(maxFrame, cameraFrames[cameraFrames.length - 1].frame);
+  }
+
+  return { name: modelName, boneFrames, morphFrames, cameraFrames, maxFrame };
 }
 
 export function vmdDuration(data: VMDData): number {
   return data.maxFrame / FRAME_RATE;
 }
 
-function evalBezier(ax: number, ay: number, bx: number, by: number, t: number): number {
+export function evalBezier(ax: number, ay: number, bx: number, by: number, t: number): number {
   if (ax === ay && bx === by) return t;
   let lo = 0.0, hi = 1.0;
   for (let i = 0; i < 16; i++) {

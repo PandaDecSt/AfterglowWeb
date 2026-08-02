@@ -49,6 +49,10 @@ export class AnimationPlayer {
     return this.morphWeights;
   }
 
+  get currentTime(): number {
+    return this.slots.length > 0 ? this.slots[0].time : 0;
+  }
+
   playVMD(
     data: VMDData,
     boneNames: string[],

@@ -13,11 +13,12 @@ import { HDRRenderTarget } from "../passes/hdr";
 import { mat4, quat, vec3 } from "wgpu-matrix";
 import { decodeTGA } from "../utils/tga-loader";
 import { BrdfLut, BRDF_LUT_SIZE } from "../passes/brdf-lut";
-import { loadVMD, vmdDuration } from "../utils/vmd-loader";
+import { loadVMD, vmdDuration, type VMDCameraFrame } from "../utils/vmd-loader";
 import { buildIKChains, solveIK, type IKChain } from "../scene/ik-solver";
 import { MMDPhysics } from "../scene/physics";
 import { buildPhysicsRigidbodies, buildPhysicsJoints } from "../scene/pmx-physics-bridge";
 import { GPUComputeSkinning } from "../scene/gpu-skinning";
+import { CameraAnimation } from "../scene/camera-animation";
 
 const HDR_FORMAT = "rgba16float";
 
@@ -582,6 +583,13 @@ export class PMXDemo implements Demo {
 
   private physics: MMDPhysics | null = null;
   private gpuSkinning: GPUComputeSkinning | null = null;
+  private vmdCameraAnimation: CameraAnimation | null = null;
+  private orbitCameraAnimation: CameraAnimation | null = null;
+  cameraAnimEnabled = false;
+  cameraAnimSource = "none";
+
+  private _modelCenterY = 10;
+  private _modelRadius = 20;
 
   private loaded = false;
   private _renderLogOnce = true;
@@ -592,6 +600,8 @@ export class PMXDemo implements Demo {
   private _physDebugOnce = false;
   private _skinDebugOnce2 = false;
   private _gpuSkinDebug = false;
+  private _camAnimDbgT = 0;
+  private _camViewProjDbg = 0;
   private _depthTex: GPUTexture | null = null;
   private _depthW = 0;
   private _depthH = 0;
@@ -665,6 +675,8 @@ export class PMXDemo implements Demo {
     const extent = [maxPos[0] - minPos[0], maxPos[1] - minPos[1], maxPos[2] - minPos[2]];
     const radius = Math.sqrt(extent[0] ** 2 + extent[1] ** 2 + extent[2] ** 2) / 2;
     this.camera.orbit(vec3.create(center[0], center[1], center[2]), radius * 2.5, radius * 0.01, radius * 20, Math.PI / 2, 0);
+    this._modelCenterY = center[1];
+    this._modelRadius = radius;
     console.log(`[PMXDemo] Bounds: center=[${center.map(v => v.toFixed(2))}] radius=${radius.toFixed(2)} orbitDist=${(radius * 2.5).toFixed(2)}`);
 
     this.vertexBuffer = this.device.createBuffer({ label: "pmx-vb", size: vertexBuf.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, mappedAtCreation: true });
@@ -861,7 +873,19 @@ export class PMXDemo implements Demo {
         const boneNames = pmx.bones.map(b => b.name);
         const morphNames = pmx.morphs.map(m => m.name);
         this.animPlayer.playVMD(vmd, boneNames, morphNames, { loop: true });
-        console.log(`[PMXDemo] VMD loaded: "${vmd.name}", duration=${vmdDuration(vmd).toFixed(2)}s, bones=${vmd.boneFrames.size}, morphs=${vmd.morphFrames.size}`);
+        console.log(`[PMXDemo] VMD loaded: "${vmd.name}", duration=${vmdDuration(vmd).toFixed(2)}s, bones=${vmd.boneFrames.size}, morphs=${vmd.morphFrames.size}, cameras=${vmd.cameraFrames.length}`);
+        this.orbitCameraAnimation = this.createOrbitCameraTrack(vmdDuration(vmd), this._modelCenterY, this._modelRadius);
+        if (vmd.cameraFrames.length > 0) {
+          this.vmdCameraAnimation = new CameraAnimation(vmd.cameraFrames);
+          this.cameraAnimSource = `VMD (${vmd.cameraFrames.length} frames)`;
+          console.log(`[PMXDemo] VMD camera: ${vmd.cameraFrames.length} frames`);
+        } else {
+          this.vmdCameraAnimation = null;
+          this.cameraAnimSource = "no VMD camera data";
+          console.warn(`[PMXDemo] VMD has no camera frames`);
+        }
+        this.cameraAnimEnabled = false;
+        console.log(`[PMXDemo] Camera animation: source=${this.cameraAnimSource}, orbit track ready (${this.orbitCameraAnimation.frameCount} frames)`);
       } catch (e) {
         console.warn("[PMXDemo] VMD load failed:", e);
       }
@@ -1117,12 +1141,57 @@ export class PMXDemo implements Demo {
       }
     }
 
+    if (this.cameraAnimEnabled && !this.animPaused) {
+      const anim = this.vmdCameraAnimation ?? this.orbitCameraAnimation;
+      if (anim) {
+        const animTime = this.animPlayer ? this.animPlayer.currentTime : 0;
+        const pose = anim.sample(animTime);
+        if (pose) {
+          this.camera.vmdDriven = true;
+          this.camera.setVmdPose(pose);
+        }
+      }
+    } else {
+      this.camera.vmdDriven = false;
+    }
+
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
     if (w !== this.hdrTarget.w || h !== this.hdrTarget.h) {
       this.hdrTarget.resize(w, h);
 
     }
+
+    this._camAnimDbgT += deltaTime;
+    if (this._camAnimDbgT > 2.0 && this._camViewProjDbg < 3) {
+      this._camAnimDbgT = 0;
+      this._camViewProjDbg++;
+      const aspect = w / h;
+
+      this.camera.vmdDriven = false;
+      this.camera.update();
+      const orbitVP = this.camera.getViewProjectionMatrix(aspect);
+      const op = this.camera.position;
+      console.log(`[CamDBG ${this._camViewProjDbg}] ORBIT: ${this.camera.debugInfo()}`);
+      console.log(`[CamDBG ${this._camViewProjDbg}] ORBIT VP row2=[${orbitVP[2].toFixed(4)},${orbitVP[6].toFixed(4)},${orbitVP[10].toFixed(4)},${orbitVP[14].toFixed(4)}]`);
+
+      if (this.vmdCameraAnimation ?? this.orbitCameraAnimation) {
+        const anim = this.vmdCameraAnimation ?? this.orbitCameraAnimation!;
+        const animTime = this.animPlayer ? this.animPlayer.currentTime : 0;
+        const pose = anim.sample(animTime);
+        if (pose) {
+          this.camera.setVmdPose(pose);
+          this.camera.vmdDriven = true;
+          const vmdVP = this.camera.getViewProjectionMatrix(aspect);
+          console.log(`[CamDBG ${this._camViewProjDbg}] VMD:  ${this.camera.debugInfo()}`);
+          console.log(`[CamDBG ${this._camViewProjDbg}] VMD VP row2=[${vmdVP[2].toFixed(4)},${vmdVP[6].toFixed(4)},${vmdVP[10].toFixed(4)},${vmdVP[14].toFixed(4)}]`);
+          console.log(`[CamDBG ${this._camViewProjDbg}] VMD pose: target=[${pose.target.map(v=>v.toFixed(2))}] rot=[${pose.rotation.map(v=>v.toFixed(4))}] dist=${pose.distance.toFixed(2)} fov=${pose.fov}`);
+        }
+      }
+
+      this.camera.vmdDriven = this.cameraAnimEnabled && !!(this.vmdCameraAnimation ?? this.orbitCameraAnimation);
+    }
+
     const viewProj = this.camera.getViewProjectionMatrix(w / h);
     const model = mat4.scaling(vec3.create(1, 1, -1));
 
@@ -1604,6 +1673,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     gui.add(this, "animPaused").name("Pause Animation");
     gui.add(this, "physicsEnabled").name("Physics");
     gui.add(this, "gpuSkinningEnabled").name("GPU Skinning");
+    gui.add(this, "cameraAnimEnabled").name("Camera Animation");
+    gui.add(this, "cameraAnimSource").name("Camera Source").disable(true);
     gui.add(this, "debugIK").name("Debug Skeleton");
     gui.add(this, "bloomEnabled").name("Bloom");
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
@@ -1634,6 +1705,30 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     lightFolder.add(this, "lightX", -30, 30, 0.5).name("X");
     lightFolder.add(this, "lightY", -30, 30, 0.5).name("Y");
     lightFolder.add(this, "lightZ", -30, 30, 0.5).name("Z");
+  }
+
+  private createOrbitCameraTrack(durationSec: number, centerY: number, radius: number): CameraAnimation {
+    const frames: VMDCameraFrame[] = [];
+    const totalFrames = Math.ceil(durationSec * 30);
+    const orbitFrames = Math.min(totalFrames, 300);
+    const dist = -(radius * 2.5);
+    const cy = centerY;
+    const fov = 30;
+    for (let i = 0; i <= orbitFrames; i++) {
+      const angle = (i / orbitFrames) * Math.PI * 2;
+      const frame = Math.round((i / orbitFrames) * totalFrames);
+      const ip = new Uint8Array(24);
+      for (let j = 0; j < 24; j++) ip[j] = 20;
+      frames.push({
+        frame,
+        distance: dist,
+        target: [0, cy, 0],
+        rotation: [0, angle, 0],
+        fov,
+        interpolation: ip,
+      });
+    }
+    return new CameraAnimation(frames);
   }
 
   destroy(): void {
