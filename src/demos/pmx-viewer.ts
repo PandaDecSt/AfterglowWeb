@@ -1,5 +1,5 @@
 import { GPUContext } from "../core/device";
-import { Camera, type CameraMode } from "../scene/camera";
+import { Camera } from "../scene/camera";
 import { Demo, ShaderStageDesc } from "./types";
 import type { EngineContext } from "../core/engine";
 import type { RenderPass } from "../core/renderer";
@@ -1119,16 +1119,15 @@ export class PMXDemo implements Demo {
         const animTime = this.animPlayer ? this.animPlayer.currentTime : 0;
         const pose = anim.sample(animTime);
         if (pose) {
-          this.camera.mode = "vmd";
+          this.camera.setMode("vmd");
           this.camera.setVmdPose(pose);
         }
       }
-    } else if (this.faceLockEnabled && this.skeleton && this._headBoneIdx >= 0) {
-      this.camera.mode = "faceLock";
-      this.camera.setFaceTarget(MmdCoord.worldPos(this.skeleton.worldMatrices, this._headBoneIdx));
     } else {
-      this.camera.mode = "orbit";
-      this.camera.setFaceTarget(null);
+      this.camera.setMode("orbit");
+      if (this.faceLockEnabled && this.skeleton && this._headBoneIdx >= 0) {
+        this.camera.target = MmdCoord.worldPos(this.skeleton.worldMatrices, this._headBoneIdx);
+      }
     }
 
     const w = this.ctx.canvas.width;

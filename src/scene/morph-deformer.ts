@@ -26,9 +26,7 @@ export class MorphDeformer {
   get morphCount(): number { return this.morphs.length; }
 
   apply(weights: Float32Array): void {
-    const hasMorph = this.morphs.length > 0 && weights.some(w => w !== 0);
-    if (!hasMorph) return;
-
+    if (this.morphs.length === 0) return;
 
     this.morphedVertices.set(this.baseVertices);
     for (let mi = 0; mi < this.morphs.length; mi++) {
