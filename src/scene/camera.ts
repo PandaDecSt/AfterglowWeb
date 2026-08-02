@@ -75,6 +75,8 @@ export class Camera {
     this._vmdFov = pose.fov > 0 ? pose.fov : 30;
   }
 
+  faceTarget: Vec3 | null = null;
+
   getViewMatrix(): Mat4 {
     if (this.vmdDriven) {
       const r = this._vmdRotation;
@@ -90,6 +92,9 @@ export class Camera {
       this.fov = this._vmdFov;
       const up = vec3.create(rm[4], rm[5], -rm[6]);
       return mat4.lookAt(this.position, this.target, up);
+    }
+    if (this.faceTarget) {
+      this.target = this.faceTarget;
     }
     this.update();
     return mat4.lookAt(this.position, this.target, this.up);

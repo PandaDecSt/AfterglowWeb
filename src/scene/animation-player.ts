@@ -119,6 +119,7 @@ export class AnimationPlayer {
   }
 
   private _unmatchedLogged = false;
+  private _morphUnmatched = false;
 
   private applyVMD(slot: VMDAnimationSlot, frameNum: number): void {
     if (!this._unmatchedLogged) {
@@ -149,7 +150,17 @@ export class AnimationPlayer {
 
     for (const [morphName, frames] of slot.data.morphFrames) {
       const morphIdx = slot.morphMap.get(normalizeBoneName(morphName));
-      if (morphIdx === undefined || morphIdx < 0 || morphIdx >= this.morphCount) continue;
+      if (morphIdx === undefined || morphIdx < 0 || morphIdx >= this.morphCount) {
+        if (!this._morphUnmatched) {
+          this._morphUnmatched = true;
+          const unmatched: string[] = [];
+          for (const name of slot.data.morphFrames.keys()) {
+            if (!slot.morphMap.has(normalizeBoneName(name))) unmatched.push(name);
+          }
+          if (unmatched.length > 0) console.warn(`[AnimPlayer] ${unmatched.length} VMD morphs unmatched:`, unmatched.slice(0, 20).join(", "));
+        }
+        continue;
+      }
 
       const value = sampleVMDMorph(frames as VMDMorphFrame[], frameNum);
       this.morphWeights[morphIdx] += value;

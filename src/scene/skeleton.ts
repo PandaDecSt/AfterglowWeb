@@ -92,6 +92,15 @@ export class Skeleton {
     return this.boneNames.indexOf(name);
   }
 
+  getBoneWorldPosition(index: number, out?: Float32Array): Float32Array {
+    const o = index * 16;
+    const result = out ?? new Float32Array(3);
+    result[0] = this.worldMatrices[o + 12];
+    result[1] = this.worldMatrices[o + 13];
+    result[2] = this.worldMatrices[o + 14];
+    return result;
+  }
+
   setLocalPosition(index: number, x: number, y: number, z: number): void {
     this.localPositions[index * 3] = x;
     this.localPositions[index * 3 + 1] = y;

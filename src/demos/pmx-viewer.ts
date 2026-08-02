@@ -528,6 +528,9 @@ export class PMXDemo implements Demo {
   private sceneBuffer!: GPUBuffer;
   private sceneData = new Float32Array(80);
   private vertexBuffer!: GPUBuffer;
+  private baseVertices: Float32Array | null = null;
+  private morphedVertices: Float32Array | null = null;
+  private vertexMorphs: { pmxIndex: number; offsets: { vertexIndex: number; position: Float32Array }[] }[] = [];
   private indexBuffer!: GPUBuffer;
   private totalIndexCount = 0;
   private use32bit = false;
@@ -587,6 +590,9 @@ export class PMXDemo implements Demo {
   private orbitCameraAnimation: CameraAnimation | null = null;
   cameraAnimEnabled = false;
   cameraAnimSource = "none";
+  faceLockEnabled = false;
+  private _headBoneIdx = -1;
+  private _headPos = new Float32Array(3);
 
   private _modelCenterY = 10;
   private _modelRadius = 20;
@@ -682,6 +688,15 @@ export class PMXDemo implements Demo {
     this.vertexBuffer = this.device.createBuffer({ label: "pmx-vb", size: vertexBuf.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, mappedAtCreation: true });
     new Uint8Array(this.vertexBuffer.getMappedRange()).set(new Uint8Array(vertexBuf));
     this.vertexBuffer.unmap();
+
+    this.baseVertices = new Float32Array(vertexBuf);
+    this.morphedVertices = new Float32Array(this.baseVertices.length);
+    this.morphedVertices.set(this.baseVertices);
+    this.vertexMorphs = [];
+    for (let i = 0; i < pmx.morphs.length; i++) {
+      if (pmx.morphs[i].type === 1) this.vertexMorphs.push({ pmxIndex: i, offsets: pmx.morphs[i].offsets });
+    }
+    console.log(`[PMXDemo] Vertex morphs: ${this.vertexMorphs.length} / ${pmx.morphs.length} total`);
 
     this.use32bit = vertexCount > 65535;
     this.totalIndexCount = pmx.indices.length;
@@ -853,6 +868,12 @@ export class PMXDemo implements Demo {
         };
       });
       this.skeleton = new Skeleton(boneDescs);
+      for (const name of ["頭", "頭部", "head", "Head"]) {
+        this._headBoneIdx = this.skeleton.getBoneIndex(name);
+        if (this._headBoneIdx >= 0) break;
+      }
+      if (this._headBoneIdx < 0) this._headBoneIdx = this.skeleton.getBoneIndex("両目") ?? -1;
+      console.log(`[PMXDemo] Head bone idx: ${this._headBoneIdx}${this._headBoneIdx >= 0 ? ' (' + this.skeleton.boneNames[this._headBoneIdx] + ')' : ' (not found)'}`);
       const joints = new Uint16Array(vertexCount * 4);
       const weights = new Float32Array(vertexCount * 4);
       for (let i = 0; i < vertexCount; i++) { const v = pmx.vertices[i]; for (let j = 0; j < 4; j++) { joints[i * 4 + j] = v.boneIndices.length > j ? v.boneIndices[j] : 0; weights[i * 4 + j] = v.boneWeights.length > j ? v.boneWeights[j] : 0; } }
@@ -869,11 +890,21 @@ export class PMXDemo implements Demo {
       }
 
       try {
-        const vmd = await loadVMD("/motion.vmd");
         const boneNames = pmx.bones.map(b => b.name);
         const morphNames = pmx.morphs.map(m => m.name);
+
+        const vmd = await loadVMD("/motions.vmd");
         this.animPlayer.playVMD(vmd, boneNames, morphNames, { loop: true });
         console.log(`[PMXDemo] VMD loaded: "${vmd.name}", duration=${vmdDuration(vmd).toFixed(2)}s, bones=${vmd.boneFrames.size}, morphs=${vmd.morphFrames.size}, cameras=${vmd.cameraFrames.length}`);
+
+        try {
+          const vmd2 = await loadVMD("/motion.vmd");
+          if (vmd2.boneFrames.size > 0 || vmd2.morphFrames.size > 0) {
+            this.animPlayer.playVMD(vmd2, boneNames, morphNames, { loop: true });
+            console.log(`[PMXDemo] Extra VMD: "${vmd2.name}", bones=${vmd2.boneFrames.size}, morphs=${vmd2.morphFrames.size}, cameras=${vmd2.cameraFrames.length}`);
+          }
+        } catch { }
+
         this.orbitCameraAnimation = this.createOrbitCameraTrack(vmdDuration(vmd), this._modelCenterY, this._modelRadius);
         if (vmd.cameraFrames.length > 0) {
           this.vmdCameraAnimation = new CameraAnimation(vmd.cameraFrames);
@@ -1080,6 +1111,7 @@ export class PMXDemo implements Demo {
 
     if (this.animPlayer && !this.animPaused) {
       this.animPlayer.update(deltaTime);
+      this.applyMorphDeform();
       this.skeleton!.updateWorldMatrices();
       if (this.ikChains.length > 0) {
         solveIK(this.skeleton!, this.ikChains);
@@ -1153,6 +1185,13 @@ export class PMXDemo implements Demo {
       }
     } else {
       this.camera.vmdDriven = false;
+    }
+
+    if (this.faceLockEnabled && this.skeleton && this._headBoneIdx >= 0) {
+      const pos = this.skeleton.getBoneWorldPosition(this._headBoneIdx, this._headPos);
+      this.camera.faceTarget = vec3.create(pos[0], pos[1], -pos[2]);
+    } else {
+      this.camera.faceTarget = null;
     }
 
     const w = this.ctx.canvas.width;
@@ -1675,6 +1714,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     gui.add(this, "gpuSkinningEnabled").name("GPU Skinning");
     gui.add(this, "cameraAnimEnabled").name("Camera Animation");
     gui.add(this, "cameraAnimSource").name("Camera Source").disable(true);
+    gui.add(this, "faceLockEnabled").name("Face Lock");
     gui.add(this, "debugIK").name("Debug Skeleton");
     gui.add(this, "bloomEnabled").name("Bloom");
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
@@ -1753,5 +1793,42 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     for (const t of this.gpuTextures) t.destroy();
     this.gpuTextures = [];
     this.matRenders = [];
+  }
+
+  private _morphDbgOnce = false;
+
+  private applyMorphDeform(): void {
+    const weights = this.animPlayer?.getMorphWeights();
+    if (!weights || !this.baseVertices || !this.morphedVertices) return;
+
+    const hasMorph = this.vertexMorphs.length > 0 && weights.some(w => w !== 0);
+    if (!hasMorph) return;
+
+    if (!this._morphDbgOnce) {
+      this._morphDbgOnce = true;
+      const active: string[] = [];
+      for (let i = 0; i < weights.length; i++) {
+        if (weights[i] !== 0) active.push(`[${i}]=${weights[i].toFixed(3)}`);
+      }
+      console.log(`[MorphDBG] Active weights (${active.length}): ${active.slice(0, 20).join(', ')}`);
+      console.log(`[MorphDBG] vertexMorphs: ${this.vertexMorphs.length}, pmxIndices: ${this.vertexMorphs.slice(0,5).map(m=>m.pmxIndex).join(',')}`);
+    }
+
+    this.morphedVertices.set(this.baseVertices);
+    const stride = 14;
+    for (let mi = 0; mi < this.vertexMorphs.length; mi++) {
+      const w = weights[this.vertexMorphs[mi].pmxIndex];
+      if (w === 0) continue;
+      const offsets = this.vertexMorphs[mi].offsets;
+      for (let j = 0; j < offsets.length; j++) {
+        const vi = offsets[j].vertexIndex;
+        const pos = offsets[j].position;
+        const o = vi * stride;
+        this.morphedVertices[o] += pos[0] * w;
+        this.morphedVertices[o + 1] += pos[1] * w;
+        this.morphedVertices[o + 2] += pos[2] * w;
+      }
+    }
+    this.device.queue.writeBuffer(this.vertexBuffer, 0, this.morphedVertices as unknown as GPUAllowSharedBufferSource);
   }
 }
