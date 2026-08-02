@@ -162,7 +162,7 @@ export class GPUComputeSkinning {
     this.dstBuffer = this.device.createBuffer({
       label: "gpu-skin-dst",
       size: srcSize,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
     this.renderVB = this.device.createBuffer({
       label: "gpu-skin-render-vb",
