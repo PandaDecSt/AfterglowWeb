@@ -6,8 +6,8 @@ struct Params {
   _pad: u32,
 };
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> baseVertices: array<f32>;
-@group(0) @binding(2) var<storage, read_write> morphedVertices: array<f32>;
+@group(0) @binding(1) var<storage, read> baseData: array<u32>;
+@group(0) @binding(2) var<storage, read_write> morphedData: array<u32>;
 @group(0) @binding(3) var<storage, read> morphWeights: array<f32>;
 @group(0) @binding(4) var<storage, read> morphDeltas: array<f32>;
 
@@ -21,7 +21,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let morphOff = vi * stride;
 
   for (var k = 0u; k < stride; k++) {
-    morphedVertices[morphOff + k] = baseVertices[baseOff + k];
+    morphedData[morphOff + k] = baseData[baseOff + k];
   }
 
   for (var m = 0u; m < params.morphCount; m++) {
@@ -29,9 +29,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (abs(w) < 1e-6) { continue; }
 
     let deltaOff = (m * params.vertexCount + vi) * 3u;
-    morphedVertices[morphOff + 0u] += morphDeltas[deltaOff + 0u] * w;
-    morphedVertices[morphOff + 1u] += morphDeltas[deltaOff + 1u] * w;
-    morphedVertices[morphOff + 2u] += morphDeltas[deltaOff + 2u] * w;
+    morphedData[morphOff + 0u] = bitcast<u32>(bitcast<f32>(morphedData[morphOff + 0u]) + morphDeltas[deltaOff + 0u] * w);
+    morphedData[morphOff + 1u] = bitcast<u32>(bitcast<f32>(morphedData[morphOff + 1u]) + morphDeltas[deltaOff + 1u] * w);
+    morphedData[morphOff + 2u] = bitcast<u32>(bitcast<f32>(morphedData[morphOff + 2u]) + morphDeltas[deltaOff + 2u] * w);
   }
 }
 `;

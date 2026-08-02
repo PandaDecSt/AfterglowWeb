@@ -18,6 +18,7 @@ import { buildIKChains, solveIK, type IKChain } from "../scene/ik-solver";
 import { MMDPhysics } from "../scene/physics";
 import { buildPhysicsRigidbodies, buildPhysicsJoints } from "../scene/pmx-physics-bridge";
 import { GPUComputeSkinning } from "../scene/gpu-skinning";
+import { GPUComputeMorph } from "../scene/gpu-morph";
 import { CameraAnimation } from "../scene/camera-animation";
 import { MmdCoord } from "../scene/mmd-coord";
 import { MorphDeformer } from "../scene/morph-deformer";
@@ -148,6 +149,7 @@ struct Scene {
   lightDir: vec4<f32>,
   lightColor: vec4<f32>,
   cameraPos: vec4<f32>,
+
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
 
@@ -529,6 +531,7 @@ export class PMXDemo implements Demo {
   private outlinePipeline!: GPURenderPipeline;
   private sceneBuffer!: GPUBuffer;
   private sceneData = new Float32Array(80);
+  private sceneDataU32 = new Uint32Array(this.sceneData.buffer);
   private vertexBuffer!: GPUBuffer;
 
   private morphDeformer: MorphDeformer | null = null;
@@ -570,6 +573,7 @@ export class PMXDemo implements Demo {
 
   private shadowSceneBuffer!: GPUBuffer;
   private shadowSceneData = new Float32Array(36);
+  private shadowSceneDataU32 = new Uint32Array(this.shadowSceneData.buffer);
   private shadowSceneBG!: GPUBindGroup;
 
   bloomEnabled = true;
@@ -587,6 +591,10 @@ export class PMXDemo implements Demo {
 
   private physics: MMDPhysics | null = null;
   private gpuSkinning: GPUComputeSkinning | null = null;
+  private gpuMorph: GPUComputeMorph | null = null;
+  private gpuMorphIndices: number[] = [];
+  private gpuMorphWeights: Float32Array | null = null;
+  gpuMorphEnabled = false;
   private vmdCameraAnimation: CameraAnimation | null = null;
   private orbitCameraAnimation: CameraAnimation | null = null;
   cameraAnimEnabled = false;
@@ -596,7 +604,6 @@ export class PMXDemo implements Demo {
   private _headPos = new Float32Array(3);
 
   private loaded = false;
-  private _legVertCount = 0;
   private _modelCenterY = 10;
   private _modelRadius = 20;
 
@@ -649,24 +656,6 @@ export class PMXDemo implements Demo {
       dv.setFloat32(off + 48, bw.length > 2 ? bw[2] : 0, true);
       dv.setFloat32(off + 52, bw.length > 3 ? bw[3] : 0, true);
       for (let k = 0; k < 3; k++) { if (v.position[k] < minPos[k]) minPos[k] = v.position[k]; if (v.position[k] > maxPos[k]) maxPos[k] = v.position[k]; }
-      if (i < 5) {
-        console.log(`[VERT ${i}] boneType=${v.boneType} boneIndices=[${Array.from(v.boneIndices)}] boneWeights=[${Array.from(v.boneWeights).map(w=>w.toFixed(3)).join(",")}]`);
-      }
-      if (i === 1708) {
-        for (const bIdx of v.boneIndices) {
-          if (bIdx < pmx.bones.length) console.log(`  bone ${bIdx} = ${pmx.bones[bIdx].name} parent=${pmx.bones[bIdx].parentIndex}`);
-        }
-      }
-      if ((bj[0] >= 18 && bj[0] <= 21) || (bj[1] >= 18 && bj[1] <= 21) || (bj[2] >= 18 && bj[2] <= 21) || (bj[3] >= 18 && bj[3] <= 21)) {
-        if (this._legVertCount < 10) {
-          const dj0 = dv.getUint16(off + 32, true);
-          const dj1 = dv.getUint16(off + 34, true);
-          const dw0 = dv.getFloat32(off + 40, true);
-          const dw1 = dv.getFloat32(off + 44, true);
-          console.log(`[LEGVERT ${i}] pmx_joints=[${Array.from(bj)}] pmx_weights=[${Array.from(bw).map(w=>w.toFixed(3)).join(",")}] vb_joints=[${dj0},${dj1}] vb_weights=[${dw0.toFixed(3)},${dw1.toFixed(3)}]`);
-          this._legVertCount++;
-        }
-      }
     }
 
     const center = [(minPos[0] + maxPos[0]) / 2, (minPos[1] + maxPos[1]) / 2, (minPos[2] + maxPos[2]) / 2];
@@ -920,21 +909,67 @@ export class PMXDemo implements Demo {
       }
     }
 
-    if (this.gpuSkinningEnabled && this.skeleton && this.skinning) {
+    if (this.skeleton && this.skinning) {
       try {
+        const boneIndicesData = new Uint32Array(vertexCount * 4);
+        const boneWeightsData = new Float32Array(vertexCount * 4);
+        for (let i = 0; i < vertexCount; i++) {
+          const v = pmx.vertices[i];
+          const bj = v.boneIndices;
+          const bw = v.boneWeights;
+          const off4 = i * 4;
+          boneIndicesData[off4 + 0] = bj.length > 0 ? bj[0] : 0;
+          boneIndicesData[off4 + 1] = bj.length > 1 ? bj[1] : 0;
+          boneIndicesData[off4 + 2] = bj.length > 2 ? bj[2] : 0;
+          boneIndicesData[off4 + 3] = bj.length > 3 ? bj[3] : 0;
+          boneWeightsData[off4 + 0] = bw.length > 0 ? bw[0] : 0;
+          boneWeightsData[off4 + 1] = bw.length > 1 ? bw[1] : 0;
+          boneWeightsData[off4 + 2] = bw.length > 2 ? bw[2] : 0;
+          boneWeightsData[off4 + 3] = bw.length > 3 ? bw[3] : 0;
+        }
         this.gpuSkinning = new GPUComputeSkinning(this.device);
         this.gpuSkinning.setup(
-          pmx.vertices.length,
+          vertexCount,
           pmx.bones.length,
-          56,
+          14,
           new Float32Array(vertexBuf),
           this.skinning.skinMatrixData,
+          boneIndicesData,
+          boneWeightsData,
         );
-        console.log(`[PMXDemo] GPU Compute Skinning initialized`);
+        console.log(`[PMXDemo] GPU Compute Skinning ready`);
       } catch (e) {
         console.warn("[PMXDemo] GPU skinning init failed:", e);
         this.gpuSkinning = null;
-        this.gpuSkinningEnabled = false;
+      }
+    }
+
+    if (this.morphDeformer) {
+      try {
+        const vertexMorphs: { pmxIndex: number; offsets: { vertexIndex: number; position: Float32Array }[] }[] = [];
+        for (let i = 0; i < pmx.morphs.length; i++) {
+          if (pmx.morphs[i].type === 1) vertexMorphs.push({ pmxIndex: i, offsets: pmx.morphs[i].offsets });
+        }
+        const vertexCount = pmx.vertices.length;
+        const morphCount = vertexMorphs.length;
+        const deltas = new Float32Array(morphCount * vertexCount * 3);
+        for (let mi = 0; mi < morphCount; mi++) {
+          const base = mi * vertexCount * 3;
+          for (const off of vertexMorphs[mi].offsets) {
+            const d3 = base + off.vertexIndex * 3;
+            deltas[d3] = off.position[0];
+            deltas[d3 + 1] = off.position[1];
+            deltas[d3 + 2] = off.position[2];
+          }
+        }
+        this.gpuMorphIndices = vertexMorphs.map(m => m.pmxIndex);
+        this.gpuMorphWeights = new Float32Array(morphCount);
+        this.gpuMorph = new GPUComputeMorph(this.device);
+        this.gpuMorph.setup(vertexCount, morphCount, 14, new Float32Array(vertexBuf), deltas);
+        console.log(`[PMXDemo] GPU Compute Morph ready: ${morphCount} morphs, deltas=${(deltas.byteLength / 1024).toFixed(0)}KB`);
+      } catch (e) {
+        console.warn("[PMXDemo] GPU morph init failed:", e);
+        this.gpuMorph = null;
       }
     }
   }
@@ -1148,7 +1183,8 @@ export class PMXDemo implements Demo {
     this.sceneData[32] = lx / len; this.sceneData[33] = ly / len; this.sceneData[34] = lz / len; this.sceneData[35] = 0;
     this.sceneData[36] = 2.0; this.sceneData[37] = 2.0; this.sceneData[38] = 2.0; this.sceneData[39] = 0;
     this.sceneData[40] = this.camera.position[0]; this.sceneData[41] = this.camera.position[1]; this.sceneData[42] = this.camera.position[2]; this.sceneData[43] = 0;
-    this.sceneData[44] = this.gpuSkinningEnabled ? 1 : 0;
+    this.sceneDataU32[44] = this.gpuSkinningEnabled ? 1 : 0;
+
     this.device.queue.writeBuffer(this.sceneBuffer, 0, this.sceneData as unknown as GPUAllowSharedBufferSource);
 
 
@@ -1163,7 +1199,7 @@ export class PMXDemo implements Demo {
 
     this.shadowSceneData.set(this.shadowMap.lightVP as unknown as ArrayLike<number>, 0);
     this.shadowSceneData.set(model as unknown as ArrayLike<number>, 16);
-    this.shadowSceneData[32] = this.gpuSkinningEnabled ? 1 : 0;
+    this.shadowSceneDataU32[32] = this.gpuSkinningEnabled ? 1 : 0;
     this.device.queue.writeBuffer(this.shadowSceneBuffer, 0, this.shadowSceneData as unknown as GPUAllowSharedBufferSource);
   }
 
@@ -1187,6 +1223,28 @@ export class PMXDemo implements Demo {
         }
 
         let activeVB = this.vertexBuffer;
+
+        if (this.gpuMorphEnabled && this.gpuMorph) {
+          const allWeights = this.animPlayer?.getMorphWeights();
+          if (allWeights && this.gpuMorphWeights) {
+            const indices = this.gpuMorphIndices;
+            const out = this.gpuMorphWeights;
+            for (let i = 0; i < indices.length; i++) {
+              out[i] = allWeights[indices[i]];
+            }
+            this.gpuMorph.updateWeights(out);
+          }
+          this.gpuMorph.dispatch(encoder);
+          const morphVB = this.gpuMorph.getMorphedVertexBuffer();
+          if (morphVB) {
+            if (this.gpuSkinningEnabled && this.gpuSkinning) {
+              this.gpuSkinning.setSourceBuffer(morphVB);
+            } else {
+              activeVB = morphVB;
+            }
+          }
+        }
+
         if (this.gpuSkinningEnabled && this.gpuSkinning && this.skinning) {
           this.gpuSkinning.updateSkinMatrices(this.skinning.skinMatrixData);
           this.gpuSkinning.dispatch(encoder);
@@ -1598,6 +1656,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     gui.add(this, "animPaused").name("Pause Animation");
     gui.add(this, "physicsEnabled").name("Physics");
     gui.add(this, "gpuSkinningEnabled").name("GPU Skinning");
+    gui.add(this, "gpuMorphEnabled").name("GPU Morph");
     gui.add(this, "cameraAnimEnabled").name("Camera Animation");
     gui.add(this, "cameraAnimSource").name("Camera Source").disable(true);
     gui.add(this, "faceLockEnabled").name("Face Lock");
@@ -1675,6 +1734,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.grade2UBO?.destroy();
     this.filmicLUT?.destroy();
     this._depthTex?.destroy();
+    this.gpuSkinning?.destroy();
+    this.gpuMorph?.destroy();
+    this.morphDeformer?.destroy();
 
     for (const t of this.gpuTextures) t.destroy();
     this.gpuTextures = [];
@@ -1682,6 +1744,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   }
 
   private applyMorphDeform(): void {
+    if (this.gpuMorphEnabled) return;
     const weights = this.animPlayer?.getMorphWeights();
     if (!weights || !this.morphDeformer) return;
     this.morphDeformer.apply(weights);

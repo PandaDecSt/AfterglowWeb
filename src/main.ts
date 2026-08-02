@@ -38,8 +38,8 @@ function showError(msg: string) {
 }
 
 const demoFactories: { label: string; create: () => Demo }[] = [
-  { label: "GLB Viewer (Qin_DL)", create: () => new GLBViewerDemo() },
   { label: "PBR + Shadow", create: () => new PBRShadowDemo() },
+  { label: "GLB Viewer (Qin_DL)", create: () => new GLBViewerDemo() },
   { label: "Toon (Multi-Material)", create: () => new ToonDemo() },
   { label: "Arc Toon (ILM+SSS)", create: () => new ArcToonDemo() },
   { label: "Grass", create: () => new GrassDemo() },
