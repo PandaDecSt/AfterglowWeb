@@ -11,6 +11,14 @@ export class HDRRenderTarget {
   depthTarget!: DepthTarget;
   format: GPUTextureFormat;
   private depthFormat: GPUTextureFormat;
+  sampleCount: number;
+
+  private msaaColorTexture: GPUTexture | null = null;
+  private msaaColorView: GPUTextureView | null = null;
+  private msaaDepthTexture: GPUTexture | null = null;
+  private msaaDepthView: GPUTextureView | null = null;
+  private resolveTexture: GPUTexture | null = null;
+  private resolveView: GPUTextureView | null = null;
 
   toneMapping: ToneMappingMode = "aces";
   exposure = 1.0;
@@ -21,10 +29,11 @@ export class HDRRenderTarget {
   private toneUniformBuffer!: GPUBuffer;
   private toneUniformData = new Float32Array(8);
 
-  constructor(device: GPUDevice, format: GPUTextureFormat = "rgba16float", depthFormat: GPUTextureFormat = "depth24plus") {
+  constructor(device: GPUDevice, format: GPUTextureFormat = "rgba16float", depthFormat: GPUTextureFormat = "depth24plus", sampleCount = 1) {
     this.device = device;
     this.format = format;
     this.depthFormat = depthFormat;
+    this.sampleCount = sampleCount;
     this.toneUniformBuffer = device.createBuffer({
       label: "tone-mapping-ubo",
       size: 32,
@@ -39,12 +48,49 @@ export class HDRRenderTarget {
 
     this.colorTarget?.destroy();
     this.depthTarget?.destroy();
+    this.msaaColorTexture?.destroy();
+    this.msaaDepthTexture?.destroy();
+    this.resolveTexture?.destroy();
 
-    this.colorTarget = new RenderTarget(
-      this.device, width, height, this.format, "hdr-color",
-      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-    );
-    this.depthTarget = new DepthTarget(this.device, width, height, "hdr-depth", this.depthFormat);
+    if (this.sampleCount > 1) {
+      this.msaaColorTexture = this.device.createTexture({
+        label: "msaa-hdr-color",
+        size: [width, height],
+        format: this.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount: this.sampleCount,
+      });
+      this.msaaColorView = this.msaaColorTexture.createView();
+
+      this.msaaDepthTexture = this.device.createTexture({
+        label: "msaa-hdr-depth",
+        size: [width, height],
+        format: this.depthFormat,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount: this.sampleCount,
+      });
+      this.msaaDepthView = this.msaaDepthTexture.createView();
+
+      this.resolveTexture = this.device.createTexture({
+        label: "hdr-resolve",
+        size: [width, height],
+        format: this.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this.resolveView = this.resolveTexture.createView();
+
+      this.colorTarget = new RenderTarget(
+        this.device, width, height, this.format, "hdr-color",
+        GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+      );
+      this.depthTarget = new DepthTarget(this.device, width, height, "hdr-depth", this.depthFormat);
+    } else {
+      this.colorTarget = new RenderTarget(
+        this.device, width, height, this.format, "hdr-color",
+        GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+      );
+      this.depthTarget = new DepthTarget(this.device, width, height, "hdr-depth", this.depthFormat);
+    }
 
     this.tonePipeline = null;
     this.toneBindGroup = null;
@@ -53,7 +99,42 @@ export class HDRRenderTarget {
   get w(): number { return this.width; }
   get h(): number { return this.height; }
 
+  get msaa(): boolean { return this.sampleCount > 1; }
+
+  get msaaColorView_(): GPUTextureView | null { return this.msaaColorView; }
+  get msaaDepthView_(): GPUTextureView | null { return this.msaaDepthView; }
+  get resolveView_(): GPUTextureView | null { return this.resolveView; }
+
+  get resolvedColorView(): GPUTextureView {
+    return this.msaa ? this.resolveView! : this.colorTarget.view;
+  }
+
+  get resolvedColorTexture(): GPUTexture {
+    return this.msaa ? this.resolveTexture! : this.colorTarget.texture;
+  }
+
+  get depthViewForPass(): GPUTextureView {
+    return this.msaa ? this.msaaDepthView! : this.depthTarget.view;
+  }
+
   beginRenderPass(encoder: GPUCommandEncoder, clear = true): GPURenderPassEncoder {
+    if (this.msaa) {
+      return encoder.beginRenderPass({
+        colorAttachments: [{
+          view: this.msaaColorView!,
+          resolveTarget: this.resolveView!,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: clear ? "clear" : "load",
+          storeOp: "discard",
+        }],
+        depthStencilAttachment: {
+          view: this.msaaDepthView!,
+          depthClearValue: 1.0,
+          depthLoadOp: clear ? "clear" : "load",
+          depthStoreOp: "discard",
+        },
+      });
+    }
     return encoder.beginRenderPass({
       colorAttachments: [{
         view: this.colorTarget.view,
@@ -189,6 +270,9 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   destroy(): void {
     this.colorTarget?.destroy();
     this.depthTarget?.destroy();
+    this.msaaColorTexture?.destroy();
+    this.msaaDepthTexture?.destroy();
+    this.resolveTexture?.destroy();
     this.toneUniformBuffer?.destroy();
   }
 }

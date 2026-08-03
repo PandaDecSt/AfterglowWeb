@@ -32,6 +32,7 @@ import { create1x1Texture, createToonRampTexture, loadTextureImage } from "../ut
 import { IKDebugRenderer } from "../debug/ik-debug-renderer";
 
 const HDR_FORMAT = "rgba16float";
+const MSAA_COUNT = 4;
 
 interface MatRenderData {
   indexOffset: number;
@@ -77,6 +78,10 @@ export class PMXDemo implements Demo {
 
   private bloomMaskTex: GPUTexture | null = null;
   private bloomMaskView: GPUTextureView | null = null;
+  private bloomMaskMSAA: GPUTexture | null = null;
+  private bloomMaskMSAAView: GPUTextureView | null = null;
+  private bloomMaskResolve: GPUTexture | null = null;
+  private bloomMaskResolveView: GPUTextureView | null = null;
   private bloomOutput: GPUTexture | null = null;
   private bloomOutputView: GPUTextureView | null = null;
   private tonemapper!: PMXTonemapper;
@@ -100,6 +105,7 @@ export class PMXDemo implements Demo {
   private shadowSceneBG!: GPUBindGroup;
 
   bloomEnabled = true;
+  msaaEnabled = true;
   stencilEnabled = true;
   get tonemapEnabled() { return this.tonemapper?.tonemapEnabled ?? true; }
   set tonemapEnabled(v: boolean) { if (this.tonemapper) this.tonemapper.tonemapEnabled = v; }
@@ -340,7 +346,7 @@ export class PMXDemo implements Demo {
 
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    this.hdrTarget = new HDRRenderTarget(this.device, HDR_FORMAT, "depth24plus-stencil8");
+    this.hdrTarget = new HDRRenderTarget(this.device, HDR_FORMAT, "depth24plus-stencil8", this.msaaEnabled ? MSAA_COUNT : 1);
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
     this.bloom = new BloomPass(this.device, this.ctx.supportsRG11B10 ? "rg11b10ufloat" as GPUTextureFormat : "rgba16float" as GPUTextureFormat);
@@ -561,6 +567,7 @@ export class PMXDemo implements Demo {
     const DS_FORMAT: GPUTextureFormat = "depth24plus-stencil8";
     const mainLayout = this.device.createPipelineLayout({ bindGroupLayouts: [mainGroup0, this.shadowBGLayout, this.skinBGL] });
     const mainTargets = [{ format: HDR_FORMAT as GPUTextureFormat, blend: blendState }, { format: "rg8unorm" as GPUTextureFormat }];
+    const msaaCount = this.msaaEnabled ? MSAA_COUNT : 1;
 
     this.mainPipeline = this.device.createRenderPipeline({
       label: "pmx-main",
@@ -569,6 +576,7 @@ export class PMXDemo implements Demo {
       fragment: { module: fsModule, entryPoint: "fs_main", targets: mainTargets },
       primitive: { topology: "triangle-list", cullMode: "none", frontFace: "cw" },
       depthStencil: { format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
+      multisample: { count: msaaCount },
     });
 
     this.eyePipeline = this.device.createRenderPipeline({
@@ -583,6 +591,7 @@ export class PMXDemo implements Demo {
         stencilBack: { compare: "always", failOp: "keep", depthFailOp: "keep", passOp: "replace" },
         stencilReadMask: 0xff, stencilWriteMask: 0xff,
       },
+      multisample: { count: msaaCount },
     });
 
     this.hairPipeline = this.device.createRenderPipeline({
@@ -597,6 +606,7 @@ export class PMXDemo implements Demo {
         stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
         stencilReadMask: 0xff, stencilWriteMask: 0,
       },
+      multisample: { count: msaaCount },
     });
 
     this.hairOverEyesPipeline = this.device.createRenderPipeline({
@@ -611,6 +621,7 @@ export class PMXDemo implements Demo {
         stencilBack: { compare: "equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
         stencilReadMask: 0xff, stencilWriteMask: 0,
       },
+      multisample: { count: msaaCount },
     });
     console.log(`[PMXDemo] mainPipeline valid=${this.mainPipeline !== null}`);
 
@@ -649,6 +660,7 @@ export class PMXDemo implements Demo {
         stencilBack: { compare: "not-equal", failOp: "keep", depthFailOp: "keep", passOp: "keep" },
         stencilReadMask: 0xff, stencilWriteMask: 0,
       },
+      multisample: { count: msaaCount },
     });
   }
 
@@ -735,8 +747,23 @@ export class PMXDemo implements Demo {
         if (this.hdrTarget.w !== w || this.hdrTarget.h !== h) { this.hdrTarget.resize(w, h); }
         if (!this.bloomMaskTex || this.bloomMaskTex.width !== w || this.bloomMaskTex.height !== h) {
           this.bloomMaskTex?.destroy();
+    this.bloomMaskMSAA?.destroy();
+    this.bloomMaskResolve?.destroy();
+          this.bloomMaskMSAA?.destroy();
+          this.bloomMaskResolve?.destroy();
           this.bloomMaskTex = this.device.createTexture({ label: "bloom-mask", size: [w, h], format: "rg8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
           this.bloomMaskView = this.bloomMaskTex.createView();
+          if (this.hdrTarget.msaa) {
+            this.bloomMaskMSAA = this.device.createTexture({ label: "bloom-mask-msaa", size: [w, h], format: "rg8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT, sampleCount: MSAA_COUNT });
+            this.bloomMaskMSAAView = this.bloomMaskMSAA.createView();
+            this.bloomMaskResolve = this.device.createTexture({ label: "bloom-mask-resolve", size: [w, h], format: "rg8unorm", usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING });
+            this.bloomMaskResolveView = this.bloomMaskResolve.createView();
+          } else {
+            this.bloomMaskMSAA = null;
+            this.bloomMaskMSAAView = null;
+            this.bloomMaskResolve = null;
+            this.bloomMaskResolveView = null;
+          }
         }
 
         if (this.skinning) {
@@ -786,13 +813,18 @@ export class PMXDemo implements Demo {
         }
         shadowPass.end();
 
+        const useMSAA = this.hdrTarget.msaa;
         const mainPass = encoder.beginRenderPass({
           colorAttachments: [
-            { view: this.hdrTarget.colorTarget.view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
-            { view: this.bloomMaskView!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+            useMSAA
+              ? { view: this.hdrTarget.msaaColorView_!, resolveTarget: this.hdrTarget.resolveView_!, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "discard" }
+              : { view: this.hdrTarget.colorTarget.view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: "clear", storeOp: "store" },
+            useMSAA
+              ? { view: this.bloomMaskMSAAView!, resolveTarget: this.bloomMaskResolveView!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "discard" }
+              : { view: this.bloomMaskView!, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
           ],
           depthStencilAttachment: {
-            view: this.hdrTarget.depthTarget.view,
+            view: this.hdrTarget.depthViewForPass,
             depthClearValue: 1.0,
             depthLoadOp: "clear",
             depthStoreOp: "store",
@@ -858,11 +890,12 @@ export class PMXDemo implements Demo {
         }
         mainPass.end();
 
-        const hdrTex = this.hdrTarget.colorTarget.texture;
-        const hdrView = this.hdrTarget.colorTarget.view;
+        const hdrTex = this.hdrTarget.resolvedColorTexture;
+        const hdrView = this.hdrTarget.resolvedColorView;
+        const resolvedBloomMaskView = useMSAA ? this.bloomMaskResolveView! : this.bloomMaskView!;
 
         if (this.bloomEnabled) {
-          const bloomResult = this.bloom.execute(encoder, hdrTex, this.bloomMaskView!);
+          const bloomResult = this.bloom.execute(encoder, hdrTex, resolvedBloomMaskView);
           this.tonemapper.apply(encoder, view, this.ctx.format, hdrView, bloomResult.view, this.bloom.bloomIntensity);
         } else {
           this.tonemapper.apply(encoder, view, this.ctx.format, hdrView, null, 0);
@@ -907,6 +940,7 @@ export class PMXDemo implements Demo {
     gui.add(this, "faceLockEnabled").name("Face Lock");
     gui.add(this, "debugIK").name("Debug Skeleton");
     gui.add(this, "bloomEnabled").name("Bloom");
+    gui.add(this, "msaaEnabled").name("MSAA 4x");
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
     gui.add(this, "gradeEnabled").name("Color Grading");
     gui.add(this, "stencilEnabled").name("Eye Stencil");
