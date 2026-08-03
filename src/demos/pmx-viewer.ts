@@ -545,8 +545,7 @@ export class PMXDemo implements Demo {
   private bloom!: BloomPass;
   private brdfLut!: BrdfLut;
 
-  private resolvedHDR: GPUTexture | null = null;
-  private resolvedHDRView: GPUTextureView | null = null;
+
   private bloomMaskTex: GPUTexture | null = null;
   private bloomMaskView: GPUTextureView | null = null;
   private bloomOutput: GPUTexture | null = null;
@@ -1320,18 +1319,14 @@ export class PMXDemo implements Demo {
         }
         mainPass.end();
 
-        if (!this.resolvedHDR || this.resolvedHDR.width !== w || this.resolvedHDR.height !== h) {
-          this.resolvedHDR?.destroy();
-          this.resolvedHDR = this.device.createTexture({ label: "resolved-hdr", size: [w, h], format: HDR_FORMAT, usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING });
-          this.resolvedHDRView = this.resolvedHDR.createView();
-        }
-        encoder.copyTextureToTexture({ texture: this.hdrTarget.colorTarget.texture }, { texture: this.resolvedHDR }, [w, h]);
+        const hdrTex = this.hdrTarget.colorTarget.texture;
+        const hdrView = this.hdrTarget.colorTarget.view;
 
         if (this.bloomEnabled) {
-          const bloomView = this.bloom.execute(encoder, this.resolvedHDR, this.bloomMaskView!);
-          this.applyTonemap(encoder, view, this.ctx.format, this.resolvedHDRView!, bloomView, this.bloom.bloomIntensity);
+          const bloomResult = this.bloom.execute(encoder, hdrTex, this.bloomMaskView!);
+          this.applyTonemap(encoder, view, this.ctx.format, hdrView, bloomResult.view, this.bloom.bloomIntensity);
         } else {
-          this.applyTonemap(encoder, view, this.ctx.format, this.resolvedHDRView!, null, 0);
+          this.applyTonemap(encoder, view, this.ctx.format, hdrView, null, 0);
         }
 
         if (this.debugIK && this.ikChains.length > 0) {
@@ -1726,7 +1721,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.shadowMap?.destroy();
     this.hdrTarget?.destroy();
     this.bloom?.destroy();
-    this.resolvedHDR?.destroy();
+
     this.bloomMaskTex?.destroy();
     this.bloomOutput?.destroy();
     this.toneUBO?.destroy();

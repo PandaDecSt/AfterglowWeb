@@ -22,7 +22,9 @@ fn fetch(c: vec2<i32>, clampV: f32) -> vec3f {
   let d = vec2<i32>(textureDimensions(hdrTex));
   let cc = clamp(c, vec2<i32>(0), d - vec2<i32>(1));
   let s = textureLoad(hdrTex, cc, 0).rgb;
-  let mask = textureLoad(maskTex, cc, 0).r;
+  let md = vec2<i32>(textureDimensions(maskTex));
+  let mc = clamp(c, vec2<i32>(0), md - vec2<i32>(1));
+  let mask = textureLoad(maskTex, mc, 0).r;
   let masked = s * mask;
   return select(masked, min(masked, vec3f(clampV)), clampV > 0.0);
 }
@@ -317,7 +319,7 @@ export class BloomPass {
     return this.cachedSceneView;
   }
 
-  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, maskView?: GPUTextureView): GPUTextureView {
+  execute(encoder: GPUCommandEncoder, sceneTexture: GPUTexture, maskView?: GPUTextureView): { view: GPUTextureView; texture: GPUTexture } {
     const w = sceneTexture.width;
     const h = sceneTexture.height;
     this.ensureTextures(w, h);
@@ -332,7 +334,9 @@ export class BloomPass {
     this.device.queue.writeBuffer(this.upsampleUBO, 0, upData as unknown as GPUAllowSharedBufferSource);
 
     const upSteps = this.mipCount - 1;
-    const bloomResultView = upSteps > 0 ? this.bloomUpViews[0] : this.bloomDownViews[0];
+    const bloomResultIdx = 0;
+    const bloomResultView = upSteps > 0 ? this.bloomUpViews[bloomResultIdx] : this.bloomDownViews[bloomResultIdx];
+    const bloomResultTex = upSteps > 0 ? this.bloomUp[bloomResultIdx] : this.bloomDown[bloomResultIdx];
 
     if (this.bgDirty || sceneView !== this.bgSceneView || effectiveMaskView !== this.bgMaskView) {
       this.blitBG = this.device.createBindGroup({
@@ -396,7 +400,42 @@ export class BloomPass {
       }
     }
 
-    return bloomResultView;
+    return { view: bloomResultView, texture: bloomResultTex };
+  }
+
+  combine(
+    encoder: GPUCommandEncoder,
+    sceneTexture: GPUTexture,
+    bloomView: GPUTextureView,
+    outputView: GPUTextureView,
+    intensity: number,
+  ): void {
+    const combineData = new Float32Array([intensity, 0, 0, 0]);
+    this.device.queue.writeBuffer(this.combineUBO, 0, combineData as unknown as GPUAllowSharedBufferSource);
+
+    const sceneView = this.getSceneView(sceneTexture);
+    const bg = this.device.createBindGroup({
+      layout: this.combinePipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: sceneView },
+        { binding: 1, resource: bloomView },
+        { binding: 2, resource: this.linearSampler },
+        { binding: 3, resource: { buffer: this.combineUBO } },
+      ],
+    });
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: outputView,
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        loadOp: "clear",
+        storeOp: "store",
+      }],
+    });
+    pass.setPipeline(this.combinePipeline);
+    pass.setBindGroup(0, bg);
+    pass.draw(3);
+    pass.end();
   }
 
   destroy() {

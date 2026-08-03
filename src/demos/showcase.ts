@@ -100,6 +100,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
 export class ShowcaseDemo implements Demo {
   label = "Showcase";
 
+
   private device!: GPUDevice;
   private ctx!: GPUContext;
   private engine!: EngineContext;
@@ -115,10 +116,11 @@ export class ShowcaseDemo implements Demo {
   private indexCount = 0;
 
 
+
   private vsCode = sceneVS;
   private fsCode = sceneFS;
 
-  bloomIntensity = 0.05;
+  bloomIntensity = 0.3;
   emissive = 2.0;
 
   init(ctx: GPUContext, camera: Camera, engine?: EngineContext) {
@@ -129,6 +131,9 @@ export class ShowcaseDemo implements Demo {
 
     this.passManager = new PassManager(ctx.device, ctx.format);
     this.bloomPass = new BloomPass(ctx.device, "rgba16float");
+    this.bloomPass.threshold = 0.3;
+    this.bloomPass.knee = 0.7;
+    this.bloomPass.radius = 2.5;
     this.postProcessPass = new PostProcessPass(ctx.device, ctx.format);
 
     const { vertices, indices } = createCubeGeometry();
@@ -164,6 +169,7 @@ export class ShowcaseDemo implements Demo {
       layout: this.scenePipeline.getBindGroupLayout(0),
       entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
     });
+
   }
 
   private buildPipeline(): boolean {
@@ -309,7 +315,8 @@ export class ShowcaseDemo implements Demo {
           pass.end();
         }
 
-        this.bloomPass.execute(encoder, sceneRT.texture, bloomRT.view);
+        const bloomResult = this.bloomPass.execute(encoder, sceneRT.texture);
+        this.bloomPass.combine(encoder, sceneRT.texture, bloomResult.view, bloomRT.view, this.bloomIntensity);
 
         // Pass camera/light info to post-process
         const pp = this.postProcessPass;
@@ -344,6 +351,8 @@ export class ShowcaseDemo implements Demo {
 
   registerGUI(gui: any) {
     gui.add(this, "bloomIntensity", 0, 1, 0.01).name("Bloom Intensity");
+    gui.add(this.bloomPass, "threshold", 0, 2, 0.01).name("Bloom Threshold");
+    gui.add(this.bloomPass, "knee", 0, 1, 0.01).name("Bloom Knee");
     gui.add(this, "emissive", 0, 5, 0.1).name("Emissive");
     const pp = this.postProcessPass.params;
     const fxFolder = gui.addFolder("Post Process");
@@ -354,8 +363,6 @@ export class ShowcaseDemo implements Demo {
     fxFolder.add(pp, "heightFogDensity", 0, 2, 0.01).name("Height Fog");
     fxFolder.add(pp, "heightFogBlend", 0, 1, 0.01).name("Fog Blend");
     fxFolder.add(pp, "dustIntensity", 0, 1, 0.01).name("Atmospheric Dust");
-    fxFolder.add(pp, "lightShaftIntensity", 0, 1, 0.01).name("Light Shaft");
-    fxFolder.add(pp, "lightShaftLayers", 1, 16, 1).name("Shaft Layers");
     const lutFolder = gui.addFolder("Color Grading");
     lutFolder.add(pp, "lutStrength", 0, 1, 0.01).name("LUT Strength");
     lutFolder.add(pp, "contrast", 0.5, 2, 0.01).name("Contrast");

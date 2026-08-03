@@ -526,9 +526,120 @@ function detectCapsuleBox(store: RigidBodyStore, a: number, b: number, pool: Con
   combineMaterials(store, a, b, c);
 }
 
+function detectBoxBox(store: RigidBodyStore, a: number, b: number, pool: ContactPool): void {
+  const ai3 = a * 3, bi3 = b * 3;
+  const pos = store.positions, sz = store.size;
+  const cAx = pos[ai3], cAy = pos[ai3 + 1], cAz = pos[ai3 + 2];
+  const cBx = pos[bi3], cBy = pos[bi3 + 1], cBz = pos[bi3 + 2];
+  const hAx = sz[ai3], hAy = sz[ai3 + 1], hAz = sz[ai3 + 2];
+  const hBx = sz[bi3], hBy = sz[bi3 + 1], hBz = sz[bi3 + 2];
+  const rA = _boxRotA;
+  loadRotMatrix(store, a, rA);
+  const rB = _boxRotB;
+  loadRotMatrix(store, b, rB);
+  const dx = cBx - cAx, dy = cBy - cAy, dz = cBz - cAz;
+  let minPen = Infinity;
+  let bestAxis = 0;
+  let bestSign = 1;
+  const axes = _satAxes;
+  axes[0] = rA[0]; axes[1] = rA[1]; axes[2] = rA[2];
+  axes[3] = rA[3]; axes[4] = rA[4]; axes[5] = rA[5];
+  axes[6] = rA[6]; axes[7] = rA[7]; axes[8] = rA[8];
+  axes[9] = rB[0]; axes[10] = rB[1]; axes[11] = rB[2];
+  axes[12] = rB[3]; axes[13] = rB[4]; axes[14] = rB[5];
+  axes[15] = rB[6]; axes[16] = rB[7]; axes[17] = rB[8];
+  for (let i = 0; i < 9; i++) {
+    const ax = axes[i * 3], ay = axes[i * 3 + 1], az = axes[i * 3 + 2];
+    const len2 = ax * ax + ay * ay + az * az;
+    if (len2 < 1e-12) continue;
+    const invLen = 1 / Math.sqrt(len2);
+    const nx = ax * invLen, ny = ay * invLen, nz = az * invLen;
+    const projA = boxHalfProj(rA, hAx, hAy, hAz, nx, ny, nz);
+    const projB = boxHalfProj(rB, hBx, hBy, hBz, nx, ny, nz);
+    const dist = dx * nx + dy * ny + dz * nz;
+    const pen = projA + projB - Math.abs(dist);
+    if (pen < 0) return;
+    if (pen < minPen) {
+      minPen = pen;
+      bestAxis = i;
+      bestSign = dist >= 0 ? 1 : -1;
+    }
+  }
+  for (let i = 0; i < 9; i++) {
+    const iA = Math.floor(i / 3), iB = i % 3;
+    const aOff = iA * 3, bOff = iB * 3;
+    const ax = rA[aOff + 1] * rB[bOff + 2] - rA[aOff + 2] * rB[bOff + 1];
+    const ay = rA[aOff + 2] * rB[bOff] - rA[aOff] * rB[bOff + 2];
+    const az = rA[aOff] * rB[bOff + 1] - rA[aOff + 1] * rB[bOff];
+    const len2 = ax * ax + ay * ay + az * az;
+    if (len2 < 1e-12) continue;
+    const invLen = 1 / Math.sqrt(len2);
+    const nx = ax * invLen, ny = ay * invLen, nz = az * invLen;
+    const projA = boxHalfProj(rA, hAx, hAy, hAz, nx, ny, nz);
+    const projB = boxHalfProj(rB, hBx, hBy, hBz, nx, ny, nz);
+    const dist = dx * nx + dy * ny + dz * nz;
+    const pen = projA + projB - Math.abs(dist);
+    if (pen < 0) return;
+    if (pen < minPen) {
+      minPen = pen;
+      bestAxis = 9 + i;
+      bestSign = dist >= 0 ? 1 : -1;
+    }
+  }
+  let cnx: number, cny: number, cnz: number;
+  if (bestAxis < 9) {
+    const off = bestAxis * 3;
+    cnx = axes[off] * bestSign;
+    cny = axes[off + 1] * bestSign;
+    cnz = axes[off + 2] * bestSign;
+  } else {
+    const i2 = bestAxis - 9;
+    const iA = Math.floor(i2 / 3), iB = i2 % 3;
+    const aOff = iA * 3, bOff = iB * 3;
+    cnx = (rA[aOff + 1] * rB[bOff + 2] - rA[aOff + 2] * rB[bOff + 1]) * bestSign;
+    cny = (rA[aOff + 2] * rB[bOff] - rA[aOff] * rB[bOff + 2]) * bestSign;
+    cnz = (rA[aOff] * rB[bOff + 1] - rA[aOff + 1] * rB[bOff]) * bestSign;
+    const len = Math.sqrt(cnx * cnx + cny * cny + cnz * cnz);
+    if (len > 1e-8) { cnx /= len; cny /= len; cnz /= len; }
+  }
+  const c = pool.acquire();
+  c.bodyA = a; c.bodyB = b;
+  c.nx = cnx; c.ny = cny; c.nz = cnz;
+  c.depth = minPen;
+  c.rAx = 0; c.rAy = 0; c.rAz = 0;
+  c.rBx = 0; c.rBy = 0; c.rBz = 0;
+  combineMaterials(store, a, b, c);
+}
+
+const _boxRotA = new Float32Array(9);
+const _boxRotB = new Float32Array(9);
+const _satAxes = new Float32Array(27);
+
+function loadRotMatrix(store: RigidBodyStore, i: number, out: Float32Array): void {
+  const i4 = i * 4;
+  const qx = store.orientations[i4 + 0];
+  const qy = store.orientations[i4 + 1];
+  const qz = store.orientations[i4 + 2];
+  const qw = store.orientations[i4 + 3];
+  const x2 = qx + qx, y2 = qy + qy, z2 = qz + qz;
+  const xx = qx * x2, yy = qy * y2, zz = qz * z2;
+  const xy = qx * y2, xz = qx * z2, yz = qy * z2;
+  const wx = qw * x2, wy = qw * y2, wz = qw * z2;
+  out[0] = 1 - (yy + zz); out[1] = xy - wz; out[2] = xz + wy;
+  out[3] = xy + wz; out[4] = 1 - (xx + zz); out[5] = yz - wx;
+  out[6] = xz - wy; out[7] = yz + wx; out[8] = 1 - (xx + yy);
+}
+
+function boxHalfProj(rot: Float32Array, hx: number, hy: number, hz: number, nx: number, ny: number, nz: number): number {
+  return Math.abs((rot[0] * nx + rot[1] * ny + rot[2] * nz) * hx)
+       + Math.abs((rot[3] * nx + rot[4] * ny + rot[5] * nz) * hy)
+       + Math.abs((rot[6] * nx + rot[7] * ny + rot[8] * nz) * hz);
+}
+
 export function generateContacts(store: RigidBodyStore, a: number, b: number, pool: ContactPool): void {
   const sA = store.shape[a];
   const sB = store.shape[b];
+  const beforeCount = pool.count;
   if (sA === RigidbodyShape.Sphere && sB === RigidbodyShape.Sphere) {
     detectSphereSphere(store, a, b, pool); return;
   }
@@ -536,7 +647,7 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
     detectSphereCapsule(store, a, b, pool); return;
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Sphere) {
-    detectSphereCapsule(store, b, a, pool); flipLastNormal(pool); return;
+    detectSphereCapsule(store, b, a, pool); flipNewContacts(pool, beforeCount); return;
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Capsule) {
     detectCapsuleCapsule(store, a, b, pool); return;
@@ -545,24 +656,28 @@ export function generateContacts(store: RigidBodyStore, a: number, b: number, po
     detectSphereBox(store, a, b, pool); return;
   }
   if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Sphere) {
-    detectSphereBox(store, b, a, pool); flipLastNormal(pool); return;
+    detectSphereBox(store, b, a, pool); flipNewContacts(pool, beforeCount); return;
   }
   if (sA === RigidbodyShape.Capsule && sB === RigidbodyShape.Box) {
     detectCapsuleBox(store, a, b, pool); return;
   }
   if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Capsule) {
-    detectCapsuleBox(store, b, a, pool); flipLastNormal(pool); return;
+    detectCapsuleBox(store, b, a, pool); flipNewContacts(pool, beforeCount); return;
+  }
+  if (sA === RigidbodyShape.Box && sB === RigidbodyShape.Box) {
+    detectBoxBox(store, a, b, pool); return;
   }
 }
 
-function flipLastNormal(pool: ContactPool): void {
-  if (pool.count === 0) return;
-  const c = pool.get(pool.count - 1);
-  const ta = c.bodyA; c.bodyA = c.bodyB; c.bodyB = ta;
-  const trAx = c.rAx, trAy = c.rAy, trAz = c.rAz;
-  c.rAx = c.rBx; c.rAy = c.rBy; c.rAz = c.rBz;
-  c.rBx = trAx; c.rBy = trAy; c.rBz = trAz;
-  c.nx = -c.nx; c.ny = -c.ny; c.nz = -c.nz;
+function flipNewContacts(pool: ContactPool, beforeCount: number): void {
+  for (let i = beforeCount; i < pool.count; i++) {
+    const c = pool.get(i);
+    const ta = c.bodyA; c.bodyA = c.bodyB; c.bodyB = ta;
+    const trAx = c.rAx, trAy = c.rAy, trAz = c.rAz;
+    c.rAx = c.rBx; c.rAy = c.rBy; c.rAz = c.rBz;
+    c.rBx = trAx; c.rBy = trAy; c.rBz = trAz;
+    c.nx = -c.nx; c.ny = -c.ny; c.nz = -c.nz;
+  }
 }
 
 export function findContacts(store: RigidBodyStore, pool: ContactPool): void {

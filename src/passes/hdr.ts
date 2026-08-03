@@ -42,7 +42,7 @@ export class HDRRenderTarget {
 
     this.colorTarget = new RenderTarget(
       this.device, width, height, this.format, "hdr-color",
-      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC
+      GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
     );
     this.depthTarget = new DepthTarget(this.device, width, height, "hdr-depth", this.depthFormat);
 

@@ -250,6 +250,7 @@ export class PostProcessPass {
     colorTint: [0, 0, 0],
   };
 
+
   // External inputs for camera/light
   cameraPos = [0, 2, 6] as [number, number, number];
   invVP = new Float32Array(16);
@@ -361,6 +362,7 @@ export class PostProcessPass {
     d[46] = p.colorTint[2];
     d[47] = 0;
     this.device.queue.writeBuffer(this.paramBuffer, 0, d as unknown as GPUAllowSharedBufferSource);
+
 
     this.ensureBindGroup(sceneTexture, depthTexture);
 
