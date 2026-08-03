@@ -1,4 +1,4 @@
-import { GPUContext } from "../core/device";
+﻿import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo, ShaderStageDesc } from "./types";
 import type { EngineContext } from "../core/engine";
@@ -31,7 +31,6 @@ import { PMXTonemapper } from "../passes/pmx-tonemapper";
 import { create1x1Texture, createToonRampTexture, loadTextureImage } from "../utils/texture-utils";
 import { IKDebugRenderer } from "../debug/ik-debug-renderer";
 
-const HDR_FORMAT = "rgba16float";
 const MSAA_COUNT = 4;
 
 interface MatRenderData {
@@ -53,6 +52,7 @@ export class PMXDemo implements Demo {
   private device!: GPUDevice;
   private ctx!: GPUContext;
   private camera!: Camera;
+  private hdrFormat!: GPUTextureFormat;
 
   private mainPipeline!: GPURenderPipeline;
   private eyePipeline!: GPURenderPipeline;
@@ -118,7 +118,7 @@ export class PMXDemo implements Demo {
   lightX = 5;
   lightY = 10;
   lightZ = 8;
-  shadowRes = 2048;
+  shadowRes = 4096;
 
   private physics: MMDPhysics | null = null;
   private gpuSkinning: GPUComputeSkinning | null = null;
@@ -213,11 +213,12 @@ export class PMXDemo implements Demo {
     else { new Uint16Array(this.indexBuffer.getMappedRange()).set(pmx.indices); }
     this.indexBuffer.unmap();
 
-    this.shadowMap = new ShadowMap(this.device, 2048);
-    this.shadowMap.orthoSize = 64;
+    this.shadowMap = new ShadowMap(this.device, 4096);
+    this.shadowMap.orthoSize = 80;
     this.shadowMap.near = 1;
     this.shadowMap.far = 140;
 
+    this.hdrFormat = this.ctx.supportsRG11B10 ? "rg11b10ufloat" as GPUTextureFormat : "rgba16float" as GPUTextureFormat;
     this.buildPipelines();
 
     this.sceneBuffer = this.device.createBuffer({ label: "pmx-scene-ubo", size: this.sceneData.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -346,10 +347,10 @@ export class PMXDemo implements Demo {
 
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    this.hdrTarget = new HDRRenderTarget(this.device, HDR_FORMAT, "depth24plus-stencil8", this.msaaEnabled ? MSAA_COUNT : 1);
+    this.hdrTarget = new HDRRenderTarget(this.device, this.hdrFormat, "depth24plus-stencil8", this.msaaEnabled ? MSAA_COUNT : 1);
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
-    this.bloom = new BloomPass(this.device, this.ctx.supportsRG11B10 ? "rg11b10ufloat" as GPUTextureFormat : "rgba16float" as GPUTextureFormat);
+    this.bloom = new BloomPass(this.device, this.hdrFormat);
     this.tonemapper = new PMXTonemapper(this.device);
     this.ikDebugRenderer = new IKDebugRenderer(this.device, this.ctx.format);
 
@@ -566,7 +567,7 @@ export class PMXDemo implements Demo {
 
     const DS_FORMAT: GPUTextureFormat = "depth24plus-stencil8";
     const mainLayout = this.device.createPipelineLayout({ bindGroupLayouts: [mainGroup0, this.shadowBGLayout, this.skinBGL] });
-    const mainTargets = [{ format: HDR_FORMAT as GPUTextureFormat, blend: blendState }, { format: "rg8unorm" as GPUTextureFormat }];
+    const mainTargets = [{ format: this.hdrFormat as GPUTextureFormat, blend: blendState }, { format: "rg8unorm" as GPUTextureFormat }];
     const msaaCount = this.msaaEnabled ? MSAA_COUNT : 1;
 
     this.mainPipeline = this.device.createRenderPipeline({
@@ -652,7 +653,7 @@ export class PMXDemo implements Demo {
       label: "pmx-outline",
       layout: this.device.createPipelineLayout({ bindGroupLayouts: [outlineGroup0, this.shadowBGLayout, this.skinBGL] }),
       vertex: { module: outVSModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module: outFSModule, entryPoint: "fs_main", targets: [{ format: HDR_FORMAT, blend: blendState }, { format: "rg8unorm" }] },
+      fragment: { module: outFSModule, entryPoint: "fs_main", targets: [{ format: this.hdrFormat, blend: blendState }, { format: "rg8unorm" }] },
       primitive: { topology: "triangle-list", cullMode: "front", frontFace: "cw" },
       depthStencil: {
         format: DS_FORMAT, depthWriteEnabled: true, depthCompare: "less-equal", depthBias: 4, depthBiasSlopeScale: 1,
@@ -944,7 +945,7 @@ export class PMXDemo implements Demo {
     gui.add(this, "tonemapEnabled").name("Tone Mapping");
     gui.add(this, "gradeEnabled").name("Color Grading");
     gui.add(this, "stencilEnabled").name("Eye Stencil");
-    gui.add(this, "shadowRes", [1024, 2048, 4096]).name("Shadow Res").onChange((v: number) => this.setShadowResolution(v));
+    gui.add(this, "shadowRes", [2048, 4096, 8192]).name("Shadow Res").onChange((v: number) => this.setShadowResolution(v));
     const camFolder = gui.addFolder("Camera");
     camFolder.add(this.camera, "distance", 1, 80, 0.5).name("Distance");
     camFolder.add(this.camera, "fov", 20, 120, 1).name("FOV");
@@ -960,11 +961,20 @@ export class PMXDemo implements Demo {
     toneFolder.add(this.tonemapper, "exposure", 0.1, 3, 0.01).name("Exposure");
     toneFolder.add(this.tonemapper, "gamma", 1.0, 3.0, 0.01).name("Gamma");
     const gradeFolder = gui.addFolder("Color Grading");
-    gradeFolder.add(this.tonemapper, "slope", 0.5, 2.0, 0.01).name("Slope");
-    gradeFolder.add(this.tonemapper, "offset", -0.5, 0.5, 0.01).name("Offset");
-    gradeFolder.add(this.tonemapper, "power", 0.5, 2.0, 0.01).name("Power");
-    gradeFolder.add(this.tonemapper, "saturation", 0, 2, 0.01).name("Saturation");
+    const sh = this.tonemapper.shadows;
+    gradeFolder.add(sh, "0", 0, 1, 0.01).name("Shadows R");
+    gradeFolder.add(sh, "1", 0, 1, 0.01).name("Shadows G");
+    gradeFolder.add(sh, "2", 0, 1, 0.01).name("Shadows B");
+    const mt = this.tonemapper.midtones;
+    gradeFolder.add(mt, "0", 0, 1, 0.01).name("Midtones R");
+    gradeFolder.add(mt, "1", 0, 1, 0.01).name("Midtones G");
+    gradeFolder.add(mt, "2", 0, 1, 0.01).name("Midtones B");
+    const hi = this.tonemapper.highlights;
+    gradeFolder.add(hi, "0", 0, 1, 0.01).name("Highlights R");
+    gradeFolder.add(hi, "1", 0, 1, 0.01).name("Highlights G");
+    gradeFolder.add(hi, "2", 0, 1, 0.01).name("Highlights B");
     gradeFolder.add(this.tonemapper, "contrast", 0.5, 2.0, 0.01).name("Contrast");
+    gradeFolder.add(this.tonemapper, "saturation", 0, 2, 0.01).name("Saturation");
     const lightFolder = gui.addFolder("Light");
     lightFolder.add(this, "lightX", -30, 30, 0.5).name("X");
     lightFolder.add(this, "lightY", -30, 30, 0.5).name("Y");

@@ -1,3 +1,5 @@
+const NEUTRAL = 0.5;
+
 export class PMXTonemapper {
   private device: GPUDevice;
   private pipeline: GPURenderPipeline | null = null;
@@ -5,6 +7,7 @@ export class PMXTonemapper {
   private toneUBO!: GPUBuffer;
   private gradeUBO!: GPUBuffer;
   private grade2UBO!: GPUBuffer;
+  private grade3UBO!: GPUBuffer;
   private bloomParamsUBO!: GPUBuffer;
   private sampler!: GPUSampler;
   private filmicLUT: GPUTexture | null = null;
@@ -16,13 +19,14 @@ export class PMXTonemapper {
 
   exposure = 1.0;
   gamma = 2.2;
-  slope = 1.0;
-  offset = 0.0;
-  power = 1.0;
-  saturation = 1.0;
   contrast = 1.0;
+  saturation = 1.0;
   tonemapEnabled = true;
   gradeEnabled = true;
+
+  shadows: [number, number, number] = [NEUTRAL, NEUTRAL, NEUTRAL];
+  midtones: [number, number, number] = [NEUTRAL, NEUTRAL, NEUTRAL];
+  highlights: [number, number, number] = [NEUTRAL, NEUTRAL, NEUTRAL];
 
   constructor(device: GPUDevice) {
     this.device = device;
@@ -48,6 +52,7 @@ struct Params { exposure: f32, gamma: f32, contrast: f32, flags: u32 };
 @group(0) @binding(5) var<uniform> grade2: vec4<f32>;
 @group(0) @binding(6) var bloomTex: texture_2d<f32>;
 @group(0) @binding(7) var<uniform> bloomParams: vec4<f32>;
+@group(0) @binding(8) var<uniform> grade3: vec4<f32>;
 
 fn filmicLUT(x: f32) -> f32 {
   let t = clamp(log2(max(x, 1e-10)) + 10.0, 0.0, 13.0);
@@ -56,13 +61,13 @@ fn filmicLUT(x: f32) -> f32 {
 }
 
 fn gradeColor(c: vec3f) -> vec3f {
-  let slope = grade.xyz;
-  let offset = vec3f(grade.w);
+  let slope = grade3.xyz;
+  let offset = grade.xyz;
   let power = grade2.xyz;
-  let sat = grade2.w;
   var x = pow(max(c * slope + offset, vec3f(0.0)), power);
+  x = (x - vec3f(0.5)) * p.contrast + vec3f(0.5);
   let luma = dot(x, vec3f(0.2126, 0.7152, 0.0722));
-  return max(mix(vec3f(luma), x, sat), vec3f(0.0));
+  return max(mix(vec3f(luma), x, grade2.w), vec3f(0.0));
 }
 
 @vertex
@@ -87,7 +92,6 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   }
   if (doGrade) {
     color = gradeColor(color);
-    color = (color - vec3f(0.5)) * p.contrast + vec3f(0.5);
   }
   color = pow(max(color, vec3f(0.0)), vec3f(1.0 / p.gamma));
   return vec4<f32>(color, 1.0);
@@ -108,6 +112,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     if (!this.gradeUBO) {
       this.gradeUBO = this.device.createBuffer({ label: "grade-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       this.grade2UBO = this.device.createBuffer({ label: "grade2-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      this.grade3UBO = this.device.createBuffer({ label: "grade3-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     }
     if (!this.bloomParamsUBO) {
       this.bloomParamsUBO = this.device.createBuffer({ label: "bloom-params-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -118,14 +123,20 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
       this.blackTexView = this.blackTex.createView();
     }
 
+    const off = (c: number) => (c - NEUTRAL) * 0.5;
+    const pow_ = (c: number) => Math.max(0.05, 1 - (c - NEUTRAL) * 1.5);
+    const slope = (c: number) => Math.max(0, 1 + (c - NEUTRAL) * 1.5);
+
     const flags = (this.tonemapEnabled ? 1 : 0) | (this.gradeEnabled ? 2 : 0);
     const data = new ArrayBuffer(16);
     const f32 = new Float32Array(data);
     const u32 = new Uint32Array(data);
     f32[0] = this.exposure; f32[1] = this.gamma; f32[2] = this.contrast; u32[3] = flags;
     this.device.queue.writeBuffer(this.toneUBO, 0, data);
-    this.device.queue.writeBuffer(this.gradeUBO, 0, new Float32Array([this.slope, this.slope, this.slope, this.offset]) as unknown as GPUAllowSharedBufferSource);
-    this.device.queue.writeBuffer(this.grade2UBO, 0, new Float32Array([this.power, this.power, this.power, this.saturation]) as unknown as GPUAllowSharedBufferSource);
+
+    this.device.queue.writeBuffer(this.gradeUBO, 0, new Float32Array([off(this.shadows[0]), off(this.shadows[1]), off(this.shadows[2]), 0]) as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.grade2UBO, 0, new Float32Array([pow_(this.midtones[0]), pow_(this.midtones[1]), pow_(this.midtones[2]), this.saturation]) as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.grade3UBO, 0, new Float32Array([slope(this.highlights[0]), slope(this.highlights[1]), slope(this.highlights[2]), 0]) as unknown as GPUAllowSharedBufferSource);
     this.device.queue.writeBuffer(this.bloomParamsUBO, 0, new Float32Array([bloomIntensity, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
 
     if (!this.sampler) {
@@ -145,6 +156,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
           { binding: 5, resource: { buffer: this.grade2UBO } },
           { binding: 6, resource: effectiveBloomView },
           { binding: 7, resource: { buffer: this.bloomParamsUBO } },
+          { binding: 8, resource: { buffer: this.grade3UBO } },
         ],
       });
       this.prevSceneView = sceneView;
@@ -192,6 +204,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.toneUBO?.destroy();
     this.gradeUBO?.destroy();
     this.grade2UBO?.destroy();
+    this.grade3UBO?.destroy();
     this.bloomParamsUBO?.destroy();
     this.filmicLUT?.destroy();
     this.blackTex?.destroy();
