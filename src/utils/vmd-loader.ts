@@ -29,6 +29,21 @@ export interface VMDData {
 
 const FRAME_RATE = 30.0;
 
+export function normalizeBoneName(name: string): string {
+  let out = "";
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c >= 0xff01 && c <= 0xff5e) {
+      out += String.fromCharCode(c - 0xfee0);
+    } else if (c === 0x3000) {
+      out += " ";
+    } else {
+      out += name[i];
+    }
+  }
+  return out;
+}
+
 export async function loadVMD(url: string): Promise<VMDData> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Failed to fetch VMD: ${url}`);
@@ -68,7 +83,7 @@ export function parseVMD(buffer: ArrayBuffer): VMDData {
   const boneFrames = new Map<string, VMDBoneFrame[]>();
 
   for (let i = 0; i < boneCount; i++) {
-    const boneName = readName(15);
+    const boneName = normalizeBoneName(readName(15));
     const frame = u32();
     const tx = f32(), ty = f32(), tz = f32();
     const rx = f32(), ry = f32(), rz = f32(), rw = f32();
@@ -84,7 +99,7 @@ export function parseVMD(buffer: ArrayBuffer): VMDData {
   const morphFrames = new Map<string, VMDMorphFrame[]>();
 
   for (let i = 0; i < morphCount; i++) {
-    const morphName = readName(15);
+    const morphName = normalizeBoneName(readName(15));
     const frame = u32();
     const weight = f32();
 
@@ -143,14 +158,14 @@ export function evalBezier(ax: number, ay: number, bx: number, by: number, t: nu
   return 3.0 * u * u * s * ay + 3.0 * u * s * s * by + s * s * s;
 }
 
-export function sampleVMDBone(frames: VMDBoneFrame[], frameNum: number):
-  { rotation: [number, number, number, number]; translation: [number, number, number] } {
+export function sampleVMDBone(frames: VMDBoneFrame[], frameNum: number, out: { rotation: [number, number, number, number]; translation: [number, number, number] }):
+  void {
 
-  if (frames.length === 0) return { rotation: [0, 0, 0, 1], translation: [0, 0, 0] };
-  if (frames.length === 1) return { rotation: frames[0].rotation, translation: frames[0].translation };
-  if (frameNum <= frames[0].frame) return { rotation: frames[0].rotation, translation: frames[0].translation };
+  if (frames.length === 0) { out.rotation[0]=0; out.rotation[1]=0; out.rotation[2]=0; out.rotation[3]=1; out.translation[0]=0; out.translation[1]=0; out.translation[2]=0; return; }
+  if (frames.length === 1) { out.rotation[0]=frames[0].rotation[0]; out.rotation[1]=frames[0].rotation[1]; out.rotation[2]=frames[0].rotation[2]; out.rotation[3]=frames[0].rotation[3]; out.translation[0]=frames[0].translation[0]; out.translation[1]=frames[0].translation[1]; out.translation[2]=frames[0].translation[2]; return; }
+  if (frameNum <= frames[0].frame) { out.rotation[0]=frames[0].rotation[0]; out.rotation[1]=frames[0].rotation[1]; out.rotation[2]=frames[0].rotation[2]; out.rotation[3]=frames[0].rotation[3]; out.translation[0]=frames[0].translation[0]; out.translation[1]=frames[0].translation[1]; out.translation[2]=frames[0].translation[2]; return; }
   const last = frames[frames.length - 1];
-  if (frameNum >= last.frame) return { rotation: last.rotation, translation: last.translation };
+  if (frameNum >= last.frame) { out.rotation[0]=last.rotation[0]; out.rotation[1]=last.rotation[1]; out.rotation[2]=last.rotation[2]; out.rotation[3]=last.rotation[3]; out.translation[0]=last.translation[0]; out.translation[1]=last.translation[1]; out.translation[2]=last.translation[2]; return; }
 
   let lo = 0, hi = frames.length - 1;
   while (hi - lo > 1) {
@@ -160,7 +175,7 @@ export function sampleVMDBone(frames: VMDBoneFrame[], frameNum: number):
 
   const f0 = frames[lo], f1 = frames[hi];
   const dt = f1.frame - f0.frame;
-  if (dt <= 0) return { rotation: f0.rotation, translation: f0.translation };
+  if (dt <= 0) { out.rotation[0]=f0.rotation[0]; out.rotation[1]=f0.rotation[1]; out.rotation[2]=f0.rotation[2]; out.rotation[3]=f0.rotation[3]; out.translation[0]=f0.translation[0]; out.translation[1]=f0.translation[1]; out.translation[2]=f0.translation[2]; return; }
 
   const t = (frameNum - f0.frame) / dt;
   const ip = f0.interpolation;
@@ -185,7 +200,9 @@ export function sampleVMDBone(frames: VMDBoneFrame[], frameNum: number):
     const rz = q0[2] + (q1[2] * sign - q0[2]) * tr;
     const rw = q0[3] + (q1[3] * sign - q0[3]) * tr;
     const len = Math.sqrt(rx * rx + ry * ry + rz * rz + rw * rw) || 1;
-    return { rotation: [rx / len, ry / len, rz / len, rw / len], translation: [px, py, pz] };
+    out.rotation[0] = rx / len; out.rotation[1] = ry / len; out.rotation[2] = rz / len; out.rotation[3] = rw / len;
+    out.translation[0] = px; out.translation[1] = py; out.translation[2] = pz;
+    return;
   }
 
   const theta = Math.acos(dot);
@@ -197,7 +214,8 @@ export function sampleVMDBone(frames: VMDBoneFrame[], frameNum: number):
   const rz = s0 * q0[2] + s1 * q1[2] * sign;
   const rw = s0 * q0[3] + s1 * q1[3] * sign;
   const len = Math.sqrt(rx * rx + ry * ry + rz * rz + rw * rw) || 1;
-  return { rotation: [rx / len, ry / len, rz / len, rw / len], translation: [px, py, pz] };
+  out.rotation[0] = rx / len; out.rotation[1] = ry / len; out.rotation[2] = rz / len; out.rotation[3] = rw / len;
+  out.translation[0] = px; out.translation[1] = py; out.translation[2] = pz;
 }
 
 export function sampleVMDMorph(frames: VMDMorphFrame[], frameNum: number): number {

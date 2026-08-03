@@ -458,6 +458,7 @@ interface MatRenderData {
   indexCount: number;
   mainBG: GPUBindGroup;
   shadowBG: GPUBindGroup;
+  shadowGen: number;
   outlineBG: GPUBindGroup | null;
   isTransparent: boolean;
   hasEdge: boolean;
@@ -803,7 +804,7 @@ export class PMXDemo implements Demo {
       }
 
       const castsShadow = (m.flag & 0x04) !== 0;
-      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass, castsShadow });
+      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, shadowGen: this.shadowMap.generation, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass, castsShadow });
       indexOffset += matIndexCount;
     }
 
@@ -1281,6 +1282,22 @@ export class PMXDemo implements Demo {
         mainPass.setVertexBuffer(0, activeVB);
         mainPass.setIndexBuffer(this.indexBuffer, this.use32bit ? "uint32" : "uint16");
         mainPass.setStencilReference(1);
+
+        const curGen = this.shadowMap.generation;
+        if (this.matRenders.length > 0 && this.matRenders[0].shadowGen !== curGen) {
+          for (const mr of this.matRenders) {
+            if (mr.shadowGen === curGen) continue;
+            mr.shadowBG = this.device.createBindGroup({
+              layout: this.shadowBGLayout,
+              entries: [
+                { binding: 0, resource: this.shadowMap.view },
+                { binding: 1, resource: this.shadowMap.sampler },
+                { binding: 2, resource: { buffer: this.shadowMap.getVPBuffer() } },
+              ],
+            });
+            mr.shadowGen = curGen;
+          }
+        }
 
         for (const mr of this.opaqueOrder) {
           if (mr.hasEdge && mr.outlineBG && mr.renderClass !== "eye") {

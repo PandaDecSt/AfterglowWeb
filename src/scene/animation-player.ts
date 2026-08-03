@@ -1,23 +1,9 @@
 import type { Skeleton } from "./skeleton";
 import type { VMDData, VMDBoneFrame, VMDMorphFrame } from "../utils/vmd-loader";
-import { sampleVMDBone, sampleVMDMorph, vmdDuration } from "../utils/vmd-loader";
+import { sampleVMDBone, sampleVMDMorph, vmdDuration, normalizeBoneName } from "../utils/vmd-loader";
 
 const FRAME_RATE = 30.0;
 
-function normalizeBoneName(name: string): string {
-  let out = "";
-  for (let i = 0; i < name.length; i++) {
-    const c = name.charCodeAt(i);
-    if (c >= 0xff01 && c <= 0xff5e) {
-      out += String.fromCharCode(c - 0xfee0);
-    } else if (c === 0x3000) {
-      out += " ";
-    } else {
-      out += name[i];
-    }
-  }
-  return out;
-}
 
 export interface VMDAnimationSlot {
   data: VMDData;
@@ -120,13 +106,14 @@ export class AnimationPlayer {
 
   private _unmatchedLogged = false;
   private _morphUnmatched = false;
+  private _sampleOut = { rotation: [0, 0, 0, 1] as [number, number, number, number], translation: [0, 0, 0] as [number, number, number] };
 
   private applyVMD(slot: VMDAnimationSlot, frameNum: number): void {
     if (!this._unmatchedLogged) {
       this._unmatchedLogged = true;
       const unmatched: string[] = [];
       for (const boneName of slot.data.boneFrames.keys()) {
-        if (!slot.boneMap.has(normalizeBoneName(boneName))) unmatched.push(boneName);
+        if (!slot.boneMap.has(boneName)) unmatched.push(boneName);
       }
       if (unmatched.length > 0) {
         console.warn(`[AnimPlayer] ${unmatched.length} VMD bones unmatched:`, unmatched.slice(0, 20).join(", "));
@@ -135,10 +122,11 @@ export class AnimationPlayer {
     }
 
     for (const [boneName, frames] of slot.data.boneFrames) {
-      const boneIdx = slot.boneMap.get(normalizeBoneName(boneName));
+      const boneIdx = slot.boneMap.get(boneName);
       if (boneIdx === undefined || boneIdx < 0 || boneIdx >= this.skeleton.boneCount) continue;
 
-      const { rotation, translation } = sampleVMDBone(frames as VMDBoneFrame[], frameNum);
+      sampleVMDBone(frames as VMDBoneFrame[], frameNum, this._sampleOut);
+      const { rotation, translation } = this._sampleOut;
 
       this.skeleton.setLocalRotation(boneIdx, rotation[0], rotation[1], rotation[2], rotation[3]);
 
@@ -149,13 +137,13 @@ export class AnimationPlayer {
     }
 
     for (const [morphName, frames] of slot.data.morphFrames) {
-      const morphIdx = slot.morphMap.get(normalizeBoneName(morphName));
+      const morphIdx = slot.morphMap.get(morphName);
       if (morphIdx === undefined || morphIdx < 0 || morphIdx >= this.morphCount) {
         if (!this._morphUnmatched) {
           this._morphUnmatched = true;
           const unmatched: string[] = [];
           for (const name of slot.data.morphFrames.keys()) {
-            if (!slot.morphMap.has(normalizeBoneName(name))) unmatched.push(name);
+            if (!slot.morphMap.has(name)) unmatched.push(name);
           }
           if (unmatched.length > 0) console.warn(`[AnimPlayer] ${unmatched.length} VMD morphs unmatched:`, unmatched.slice(0, 20).join(", "));
         }

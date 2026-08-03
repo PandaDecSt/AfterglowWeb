@@ -9,6 +9,7 @@ export class ShadowMap {
 
   size: number;
   format: GPUTextureFormat = "depth32float";
+  generation = 0;
   lightVP: Mat4 = mat4.identity(mat4.create());
   lightPosition: Vec3 = vec3.create(2, 5, 3);
   lightTarget: Vec3 = vec3.create(0, 0, 0);
@@ -125,6 +126,7 @@ export class ShadowMap {
     if (size === this.size) return;
     this.shadowTexture.destroy();
     this.size = size;
+    this.generation++;
     this.shadowTexture = this.device.createTexture({
       label: "shadow-map",
       size: [this.size, this.size],

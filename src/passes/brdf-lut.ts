@@ -8,6 +8,8 @@ export class BrdfLut {
   view!: GPUTextureView;
 
   bake(device: GPUDevice): void {
+    this.texture?.destroy();
+
     if (BRDF_LUT_SIZE !== LTC_MAG_LUT_SIZE) {
       throw new Error("BRDF LUT bake requires DFG size == LTC size (both 64).");
     }
