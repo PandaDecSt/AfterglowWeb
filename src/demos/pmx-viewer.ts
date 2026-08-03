@@ -7,12 +7,11 @@ import { Skeleton, type BoneDesc } from "../scene/skeleton";
 import { Skinning } from "../scene/skinning";
 import { AnimationPlayer } from "../scene/animation-player";
 import { loadPMX, type PMXModel, type PMXMaterial } from "../utils/pmx-loader";
-import { ShadowMap, SHADOW_WGSL } from "../passes/shadow";
+import { ShadowMap } from "../passes/shadow";
 import { BloomPass } from "../passes/bloom";
 import { HDRRenderTarget } from "../passes/hdr";
 import { mat4, quat, vec3 } from "wgpu-matrix";
-import { decodeTGA } from "../utils/tga-loader";
-import { BrdfLut, BRDF_LUT_SIZE } from "../passes/brdf-lut";
+import { BrdfLut } from "../passes/brdf-lut";
 import { loadVMD, vmdDuration, type VMDCameraFrame } from "../utils/vmd-loader";
 import { buildIKChains, solveIK, type IKChain } from "../scene/ik-solver";
 import { MMDPhysics } from "../scene/physics";
@@ -22,436 +21,17 @@ import { GPUComputeMorph } from "../scene/gpu-morph";
 import { CameraAnimation } from "../scene/camera-animation";
 import { MmdCoord } from "../scene/mmd-coord";
 import { MorphDeformer } from "../scene/morph-deformer";
+import { SCENE_VS } from "../shader/pmx/scene-vs";
+import { buildMainFS } from "../shader/pmx/main-fs";
+import { SHADOW_VS } from "../shader/pmx/shadow-vs";
+import { OUTLINE_VS } from "../shader/pmx/outline-vs";
+import { OUTLINE_FS } from "../shader/pmx/outline-fs";
+import { RenderClass, PresetConfig, PRESETS, detectPreset } from "../scene/pmx-preset";
+import { PMXTonemapper } from "../passes/pmx-tonemapper";
+import { create1x1Texture, createToonRampTexture, loadTextureImage } from "../utils/texture-utils";
+import { IKDebugRenderer } from "../debug/ik-debug-renderer";
 
 const HDR_FORMAT = "rgba16float";
-
-
-type RenderClass = "auto" | "eye" | "hair";
-
-interface PresetConfig {
-  metallic: number;
-  roughness: number;
-  emissionStrength: number;
-  nprMix: number;
-  rimColor: [number, number, number];
-  rimStrength: number;
-  rimPower: number;
-  alphaMode?: number;
-  renderClass: RenderClass;
-}
-
-const PRESETS: Record<string, PresetConfig> = {
-  default:      { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.0, rimPower: 3.0, renderClass: "auto" },
-  body:         { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.5, rimColor: [1, 0.85, 0.7], rimStrength: 0.3, rimPower: 3.0, renderClass: "auto" },
-  face:         { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.5, rimColor: [1, 0.9, 0.8], rimStrength: 0.2, rimPower: 4.0, renderClass: "auto" },
-  hair:         { metallic: 0.0, roughness: 0.3, emissionStrength: 0.0, nprMix: 0.2, rimColor: [1, 1, 1], rimStrength: 0.4, rimPower: 2.5, renderClass: "hair" },
-  eye:          { metallic: 0.0, roughness: 0.1, emissionStrength: 1.5, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.0, rimPower: 3.0, renderClass: "eye" },
-  eyelash:      { metallic: 0.0, roughness: 0.5, emissionStrength: 0.0, nprMix: 0.3, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.0, renderClass: "eye" },
-  metal:        { metallic: 1.0, roughness: 0.3, emissionStrength: 0.0, nprMix: 0.3, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 5.0, renderClass: "auto" },
-  stockings:    { metallic: 0.0, roughness: 0.8, emissionStrength: 0.0, nprMix: 0.0, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.0, alphaMode: 1, renderClass: "auto" },
-  cloth_smooth: { metallic: 0.0, roughness: 0.6, emissionStrength: 0.0, nprMix: 0.1, rimColor: [1, 1, 1], rimStrength: 0.15, rimPower: 3.0, renderClass: "auto" },
-  cloth_rough:  { metallic: 0.0, roughness: 0.82, emissionStrength: 0.0, nprMix: 0.1, rimColor: [1, 1, 1], rimStrength: 0.1, rimPower: 3.5, renderClass: "auto" },
-};
-
-function detectPreset(name: string, isTransparent: boolean): PresetConfig {
-  const n = name.toLowerCase();
-  if (n.includes("顔") || n.includes("面") || n.includes("face")) return PRESETS.face;
-  if (n.includes("睫") || n.includes("まつげ") || n.includes("まつ毛") || n.includes("eyelash")) return PRESETS.eyelash;
-  if (n.includes("髪") || n.includes("毛") || n.includes("hair")) return PRESETS.hair;
-  if (n.includes("目") || n.includes("眼") || n.includes("eye") || n.includes("瞳")) return PRESETS.eye;
-  if (n.includes("金属") || n.includes("metal") || n.includes("メタル")) return PRESETS.metal;
-  if (n.includes("ストッキング") || n.includes("靴下") || n.includes("stocking") || n.includes("ニーソ")) return PRESETS.stockings;
-  if (n.includes("服") || n.includes("衣") || n.includes("cloth") || n.includes("シャツ") || n.includes("スカート")) return PRESETS.cloth_smooth;
-  if (n.includes("肌") || n.includes("体") || n.includes("body") || n.includes("skin")) return PRESETS.body;
-  if (isTransparent) return PRESETS.stockings;
-  return PRESETS.default;
-}
-
-const SCENE_VS = `
-struct Scene {
-  viewProj: mat4x4<f32>,
-  model: mat4x4<f32>,
-  lightDir: vec4<f32>,
-  lightColor: vec4<f32>,
-  cameraPos: vec4<f32>,
-  flags: u32,
-  _pad1: u32,
-  _pad2: u32,
-  _pad3: u32,
-};
-@group(0) @binding(0) var<uniform> scene: Scene;
-
-@group(2) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
-
-struct VSIn {
-  @location(0) position: vec3<f32>,
-  @location(1) normal: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-  @location(3) joints: vec4<u32>,
-  @location(4) weights: vec4<f32>,
-};
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) worldNormal: vec3<f32>,
-  @location(1) worldPos: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-};
-
-fn safe_normal(n: vec3<f32>) -> vec3<f32> {
-  let l2 = dot(n, n);
-  if (l2 < 1e-12) { return vec3<f32>(0.0, 1.0, 0.0); }
-  return n * inverseSqrt(l2);
-}
-
-@vertex
-fn vs_main(in: VSIn) -> VSOut {
-  var out: VSOut;
-
-  var skinPos: vec4<f32>;
-  var skinNrm: vec4<f32>;
-
-  if ((scene.flags & 1u) != 0u) {
-    skinPos = vec4<f32>(in.position, 1.0);
-    skinNrm = vec4<f32>(in.normal, 0.0);
-  } else {
-    let weightSum = in.weights.x + in.weights.y + in.weights.z + in.weights.w;
-    let invW = select(1.0, 1.0 / weightSum, weightSum > 0.0001);
-    let w = select(vec4<f32>(1.0, 0.0, 0.0, 0.0), in.weights * invW, weightSum > 0.0001);
-
-    skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    let pos4 = vec4<f32>(in.position, 1.0);
-    let nrm4 = vec4<f32>(in.normal, 0.0);
-    for (var i = 0u; i < 4u; i++) {
-      let j = in.joints[i];
-      skinPos += skinMatrices[j] * pos4 * w[i];
-      skinNrm += skinMatrices[j] * nrm4 * w[i];
-    }
-  }
-
-  let worldPos = (scene.model * skinPos).xyz;
-  out.position = scene.viewProj * vec4<f32>(worldPos, 1.0);
-  out.worldNormal = safe_normal((scene.model * skinNrm).xyz);
-  out.worldPos = worldPos;
-  out.uv = in.uv;
-  return out;
-}
-`;
-
-const MAIN_FS = `
-override IS_OVER_EYES: bool = false;
-override IS_EYE: bool = false;
-
-struct Scene {
-  viewProj: mat4x4<f32>,
-  model: mat4x4<f32>,
-  lightDir: vec4<f32>,
-  lightColor: vec4<f32>,
-  cameraPos: vec4<f32>,
-
-};
-@group(0) @binding(0) var<uniform> scene: Scene;
-
-struct Mat {
-  diffuseColor_alpha: vec4<f32>,
-  ambient_shininess: vec4<f32>,
-  specular_sphereMode: vec4<f32>,
-  pbrParams: vec4<f32>,
-  rimColor_strength: vec4<f32>,
-  rimPower_pad: vec4<f32>,
-};
-@group(0) @binding(1) var<uniform> mat: Mat;
-
-@group(0) @binding(2) var diffuseTex: texture_2d<f32>;
-@group(0) @binding(3) var sphereTex: texture_2d<f32>;
-@group(0) @binding(4) var toonTex: texture_2d<f32>;
-@group(0) @binding(5) var texSampler: sampler;
-@group(0) @binding(6) var brdfLut: texture_2d<f32>;
-
-@group(1) @binding(0) var shadowTex: texture_depth_2d;
-@group(1) @binding(1) var shadowSampler: sampler_comparison;
-@group(1) @binding(2) var<uniform> lightVP: mat4x4<f32>;
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) worldNormal: vec3<f32>,
-  @location(1) worldPos: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-};
-
-${SHADOW_WGSL}
-
-fn ggxNDF(NH: f32, a2: f32) -> f32 {
-  let d = NH * NH * (a2 - 1.0) + 1.0;
-  return a2 / (3.14159265 * d * d);
-}
-
-fn smithG2(NL: f32, NV: f32, k: f32) -> f32 {
-  return 1.0 / (4.0 * (NL * (1.0 - k) + k) * (NV * (1.0 - k) + k));
-}
-
-fn fresnelSchlick(VH: f32, F0: vec3<f32>) -> vec3<f32> {
-  return F0 + (1.0 - F0) * pow(1.0 - VH, 5.0);
-}
-
-fn brdf_lut_sample(NV: f32, roughness: f32) -> vec4<f32> {
-  let LUT_SIZE: f32 = ${BRDF_LUT_SIZE}.0;
-  var uv = vec2f(clamp(roughness, 0.0, 1.0), sqrt(clamp(1.0 - NV, 0.0, 1.0)));
-  uv = uv * ((LUT_SIZE - 1.0) / LUT_SIZE) + 0.5 / LUT_SIZE;
-  return textureSampleLevel(brdfLut, texSampler, uv, 0.0);
-}
-
-fn F_brdf_multi_scatter(f0: vec3<f32>, f90: vec3<f32>, lut: vec2<f32>) -> vec3<f32> {
-  let FssEss = lut.y * f90 + lut.x * f0;
-  let Ess = lut.x + lut.y;
-  let Ems = 1.0 - Ess;
-  let Favg = f0 + (1.0 - f0) / 21.0;
-  let Fms = FssEss * Favg / (1.0 - (1.0 - Ess) * Favg);
-  return FssEss + Fms * Ems;
-}
-
-fn ltc_brdf_scale(lut: vec4<f32>) -> f32 {
-  return (lut.z + lut.w) / max(lut.x + lut.y, 1e-6);
-}
-
-fn hash3(p3: vec3<f32>) -> f32 {
-  var p = fract(p3 * 0.1031);
-  p += dot(p, p.yzx + 33.33);
-  return fract((p.x + p.y) * p.z);
-}
-
-fn hashedAlphaThreshold(co: vec3<f32>, alphaHashScale: f32) -> f32 {
-  let dx = dpdx(co);
-  let dy = dpdy(co);
-  let maxDeriv = max(length(dx), length(dy));
-  let pixScale = 1.0 / max(alphaHashScale * maxDeriv, 1e-6);
-  let pixScaleFloor = floor(pixScale);
-  let baseHash = hash3(floor(co * pixScaleFloor));
-  let nextHash = hash3(floor(co * pixScaleFloor) + vec3<f32>(1.0));
-  let fracPart = fract(pixScale);
-  return mix(baseHash, nextHash, fracPart);
-}
-
-struct FSOut {
-  @location(0) color: vec4<f32>,
-  @location(1) mask: vec4<f32>,
-};
-
-@fragment
-fn fs_main(in: VSOut) -> FSOut {
-  if (IS_EYE && scene.cameraPos.z < in.worldPos.z) { discard; }
-  let tex_s = textureSample(diffuseTex, texSampler, in.uv);
-  let alpha = mat.diffuseColor_alpha.w * tex_s.a;
-  if (mat.rimPower_pad.y > 0.5) {
-    let threshold = hashedAlphaThreshold(in.worldPos, 1.0);
-    if (alpha < threshold) { discard; }
-  } else {
-    if (alpha < 0.001) { discard; }
-  }
-
-  var n = normalize(in.worldNormal);
-  let v = normalize(scene.cameraPos.xyz - in.worldPos);
-  n = select(-n, n, dot(n, v) >= 0.0);
-
-  let l = normalize(scene.lightDir.xyz);
-  let h = normalize(v + l);
-  let NL = max(dot(n, l), 0.0);
-  let NV = max(dot(n, v), 0.0);
-  let NH = max(dot(n, h), 0.0);
-  let VH = max(dot(v, h), 0.0);
-
-  let baseColor = tex_s.rgb * mat.diffuseColor_alpha.xyz;
-  let shadow = sampleShadowPCF(shadowTex, shadowSampler, lightVP, in.worldPos, n, l);
-
-  let toonT = clamp(NL * 0.5 + 0.5, 0.0, 1.0);
-  let toonShade = textureSample(toonTex, texSampler, vec2<f32>(toonT, 0.5)).r;
-
-  let nprDiffuse = baseColor * toonShade * shadow;
-  let nprSpecular = pow(NH, max(mat.ambient_shininess.w, 1.0)) * mat.specular_sphereMode.xyz * shadow;
-
-  let metallic = mat.pbrParams.x;
-  let roughness = max(mat.pbrParams.y, 0.04);
-  let a2 = roughness * roughness * roughness * roughness;
-  let F0 = mix(vec3<f32>(0.04), baseColor, metallic);
-  let f90 = vec3<f32>(1.0);
-
-  let lut = brdf_lut_sample(NV, roughness);
-  let F_ms = F_brdf_multi_scatter(F0, f90, lut.xy);
-
-  let pbrDiffuse = baseColor * (1.0 - metallic) / 3.14159265 * NL * shadow;
-  let D = ggxNDF(NH, a2);
-  let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
-  let G = smithG2(NL, NV, k);
-  let pbrSpecular = D * G * F_ms * shadow;
-
-  let nprMix = mat.pbrParams.w;
-  let diffuse = mix(pbrDiffuse, nprDiffuse, nprMix);
-  let specular = mix(pbrSpecular, nprSpecular, nprMix);
-
-  let rimFactor = pow(1.0 - NV, mat.rimPower_pad.x) * mat.rimColor_strength.w;
-  let rim = mat.rimColor_strength.xyz * rimFactor; // * shadow; 边缘光本质是视角效应，不需要被阴影遮挡。
-
-  let emission = baseColor * mat.pbrParams.z;
-
-  var sphereAdd = vec3<f32>(0.0);
-  if (mat.specular_sphereMode.w > 0.5 && mat.specular_sphereMode.w < 1.5) {
-    let viewN = (scene.viewProj * vec4<f32>(n, 0.0)).xy;
-    let sphereUV = viewN * 0.5 + vec2<f32>(0.5, 0.5);
-    sphereAdd = textureSample(sphereTex, texSampler, sphereUV).rgb * baseColor;
-  } else if (mat.specular_sphereMode.w > 1.5) {
-    sphereAdd = textureSample(sphereTex, texSampler, in.uv).rgb * baseColor;
-  }
-
-  let ambient = baseColor * mat.ambient_shininess.xyz;
-  let color = ambient + (diffuse + specular) * scene.lightColor.rgb + rim + emission + sphereAdd;
-  var outAlpha = alpha;
-  if (IS_OVER_EYES) { outAlpha = alpha * 0.25; }
-  var out: FSOut;
-  out.color = vec4<f32>(color, outAlpha);
-  out.mask = vec4<f32>(1.0, outAlpha, 0.0, 0.0);
-  return out;
-}
-`;
-
-
-const SHADOW_VS = `
-struct ShadowScene {
-  lightVP: mat4x4<f32>,
-  model: mat4x4<f32>,
-  flags: u32,
-  _pad1: u32,
-  _pad2: u32,
-  _pad3: u32,
-};
-@group(0) @binding(0) var<uniform> shadowScene: ShadowScene;
-
-@group(1) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
-
-@vertex
-fn vs_main(
-  @location(0) position: vec3<f32>,
-  @location(1) normal: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-  @location(3) joints: vec4<u32>,
-  @location(4) weights: vec4<f32>,
-) -> @builtin(position) vec4<f32> {
-  var skinPos: vec4<f32>;
-  if ((shadowScene.flags & 1u) != 0u) {
-    skinPos = vec4<f32>(position, 1.0);
-  } else {
-    skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    let pos4 = vec4<f32>(position, 1.0);
-    for (var i = 0u; i < 4u; i++) {
-      let j = joints[i];
-      let w = weights[i];
-      skinPos += skinMatrices[j] * pos4 * w;
-    }
-  }
-  let worldPos = (shadowScene.model * skinPos).xyz;
-  return shadowScene.lightVP * vec4<f32>(worldPos, 1.0);
-}
-`;
-
-const OUTLINE_VS = `
-struct Scene {
-  viewProj: mat4x4<f32>,
-  model: mat4x4<f32>,
-  lightDir: vec4<f32>,
-  lightColor: vec4<f32>,
-  cameraPos: vec4<f32>,
-  flags: u32,
-  _pad1: u32,
-  _pad2: u32,
-  _pad3: u32,
-};
-@group(0) @binding(0) var<uniform> scene: Scene;
-
-struct OutlineMat {
-  edgeColor: vec4<f32>,
-  edgeSize: f32,
-  _p0: f32, _p1: f32, _p2: f32,
-};
-@group(0) @binding(1) var<uniform> omat: OutlineMat;
-
-@group(2) @binding(0) var<storage, read> skinMatrices: array<mat4x4<f32>>;
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(
-  @location(0) position: vec3<f32>,
-  @location(1) normal: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-  @location(3) joints: vec4<u32>,
-  @location(4) weights: vec4<f32>,
-) -> VSOut {
-  var out: VSOut;
-
-  var skinPos: vec4<f32>;
-  var skinNrm: vec4<f32>;
-
-  if ((scene.flags & 1u) != 0u) {
-    skinPos = vec4<f32>(position, 1.0);
-    skinNrm = vec4<f32>(normal, 0.0);
-  } else {
-    skinPos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    skinNrm = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    let pos4 = vec4<f32>(position, 1.0);
-    let nrm4 = vec4<f32>(normal, 0.0);
-    for (var i = 0u; i < 4u; i++) {
-      let j = joints[i];
-      let w = weights[i];
-      skinPos += skinMatrices[j] * pos4 * w;
-      skinNrm += skinMatrices[j] * nrm4 * w;
-    }
-  }
-
-  let worldPos = (scene.model * skinPos).xyz;
-  let worldNrm = normalize((scene.model * skinNrm).xyz);
-  let clipPos = scene.viewProj * vec4<f32>(worldPos, 1.0);
-  let viewNrm = (scene.viewProj * vec4<f32>(worldNrm, 0.0)).xyz;
-  let screenNrm = normalize(viewNrm.xy);
-  let offset = screenNrm * (omat.edgeSize * 0.003) * clipPos.w;
-  out.position = vec4<f32>(clipPos.xy + offset, clipPos.z, clipPos.w);
-  out.uv = uv;
-  return out;
-}
-`;
-
-const OUTLINE_FS = `
-struct OutlineMat {
-  edgeColor: vec4<f32>,
-  edgeSize: f32,
-  _p0: f32, _p1: f32, _p2: f32,
-};
-@group(0) @binding(1) var<uniform> omat: OutlineMat;
-@group(0) @binding(2) var diffuseTex: texture_2d<f32>;
-@group(0) @binding(5) var texSampler: sampler;
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) uv: vec2<f32>,
-};
-
-struct OutlineFSOut {
-  @location(0) color: vec4<f32>,
-  @location(1) mask: vec4<f32>,
-};
-
-@fragment
-fn fs_main(in: VSOut) -> OutlineFSOut {
-  let texA = textureSample(diffuseTex, texSampler, in.uv).a;
-  if (texA < 0.05) { discard; }
-  var out: OutlineFSOut;
-  out.color = vec4<f32>(omat.edgeColor.rgb, omat.edgeColor.a * texA);
-  out.mask = vec4<f32>(1.0, omat.edgeColor.a * texA, 0.0, 0.0);
-  return out;
-}
-`;
 
 interface MatRenderData {
   indexOffset: number;
@@ -464,57 +44,6 @@ interface MatRenderData {
   hasEdge: boolean;
   renderClass: RenderClass;
   castsShadow: boolean;
-}
-
-function create1x1Texture(device: GPUDevice, r: number, g: number, b: number, a: number, label: string): GPUTexture {
-  const tex = device.createTexture({ label, size: [1, 1], format: "rgba8unorm-srgb", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-  device.queue.writeTexture({ texture: tex }, new Uint8Array([r, g, b, a]), { bytesPerRow: 4 }, [1, 1]);
-  return tex;
-}
-
-function createToonRampTexture(device: GPUDevice): GPUTexture {
-  const h = 64;
-  const data = new Uint8Array(h * 4);
-  for (let y = 0; y < h; y++) {
-    const v = y / (h - 1);
-    const t = Math.min(1, Math.max(0, (v - 0.5) / 0.1));
-    const s = t * t * (3 - 2 * t);
-    data[y * 4 + 0] = Math.round(255 - s * (255 - 196));
-    data[y * 4 + 1] = Math.round(255 - s * (255 - 186));
-    data[y * 4 + 2] = Math.round(255 - s * (255 - 205));
-    data[y * 4 + 3] = 255;
-  }
-  const tex = device.createTexture({ label: "toon-ramp", size: [1, h], format: "rgba8unorm-srgb", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-  device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: 4 }, [1, h]);
-  return tex;
-}
-
-async function loadTextureImage(device: GPUDevice, url: string, label: string): Promise<GPUTexture | null> {
-  try {
-    if (url.toLowerCase().endsWith(".tga")) {
-      const resp = await fetch(url);
-      if (!resp.ok) return null;
-      const buffer = await resp.arrayBuffer();
-      const tga = decodeTGA(buffer);
-      const tex = device.createTexture({
-        label,
-        size: [tga.width, tga.height],
-        format: "rgba8unorm-srgb",
-        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT,
-      });
-      const tgaBytes = new Uint8Array(tga.data.buffer.slice(tga.data.byteOffset, tga.data.byteOffset + tga.data.byteLength));
-      device.queue.writeTexture({ texture: tex }, tgaBytes as unknown as GPUAllowSharedBufferSource, { bytesPerRow: tga.width * 4 }, [tga.width, tga.height]);
-      return tex;
-    }
-    const resp = await fetch(url);
-    if (!resp.ok) return null;
-    const blob = await resp.blob();
-    const bitmap = await createImageBitmap(blob);
-    const tex = device.createTexture({ label, size: [bitmap.width, bitmap.height], format: "rgba8unorm-srgb", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.RENDER_ATTACHMENT });
-    device.queue.copyExternalImageToTexture({ source: bitmap }, { texture: tex }, [bitmap.width, bitmap.height]);
-    bitmap.close();
-    return tex;
-  } catch { return null; }
 }
 
 export class PMXDemo implements Demo {
@@ -546,17 +75,11 @@ export class PMXDemo implements Demo {
   private bloom!: BloomPass;
   private brdfLut!: BrdfLut;
 
-
   private bloomMaskTex: GPUTexture | null = null;
   private bloomMaskView: GPUTextureView | null = null;
   private bloomOutput: GPUTexture | null = null;
   private bloomOutputView: GPUTextureView | null = null;
-  private tonePipeline: GPURenderPipeline | null = null;
-  private toneBindGroup: GPUBindGroup | null = null;
-  private toneUBO!: GPUBuffer;
-  private gradeUBO!: GPUBuffer;
-  private grade2UBO!: GPUBuffer;
-  private toneSampler!: GPUSampler;
+  private tonemapper!: PMXTonemapper;
 
   private matRenders: MatRenderData[] = [];
   private opaqueOrder: MatRenderData[] = [];
@@ -577,9 +100,11 @@ export class PMXDemo implements Demo {
   private shadowSceneBG!: GPUBindGroup;
 
   bloomEnabled = true;
-  tonemapEnabled = true;
   stencilEnabled = true;
-  gradeEnabled = true;
+  get tonemapEnabled() { return this.tonemapper?.tonemapEnabled ?? true; }
+  set tonemapEnabled(v: boolean) { if (this.tonemapper) this.tonemapper.tonemapEnabled = v; }
+  get gradeEnabled() { return this.tonemapper?.gradeEnabled ?? true; }
+  set gradeEnabled(v: boolean) { if (this.tonemapper) this.tonemapper.gradeEnabled = v; }
   debugIK = false;
   animPaused = false;
   physicsEnabled = true;
@@ -819,8 +344,8 @@ export class PMXDemo implements Demo {
     this.hdrTarget.toneMapping = "filmic";
     this.hdrTarget.resize(w, h);
     this.bloom = new BloomPass(this.device, this.ctx.supportsRG11B10 ? "rg11b10ufloat" as GPUTextureFormat : "rgba16float" as GPUTextureFormat);
-
-
+    this.tonemapper = new PMXTonemapper(this.device);
+    this.ikDebugRenderer = new IKDebugRenderer(this.device, this.ctx.format);
 
     if (pmx.bones.length > 0) {
       const boneDescs: BoneDesc[] = pmx.bones.map((b, i) => {
@@ -976,7 +501,7 @@ export class PMXDemo implements Demo {
 
   private buildPipelines(): void {
     const vsModule = this.device.createShaderModule({ code: SCENE_VS });
-    const fsModule = this.device.createShaderModule({ code: MAIN_FS });
+    const fsModule = this.device.createShaderModule({ code: buildMainFS() });
     const shadowVSModule = this.device.createShaderModule({ code: SHADOW_VS });
     const outVSModule = this.device.createShaderModule({ code: OUTLINE_VS });
 
@@ -1127,7 +652,6 @@ export class PMXDemo implements Demo {
     });
   }
 
-
   update(time: number, deltaTime: number): void {
     if (!this.loaded) return;
 
@@ -1172,7 +696,6 @@ export class PMXDemo implements Demo {
 
     }
 
-
     const viewProj = this.camera.getViewProjectionMatrix(w / h);
     const model = mat4.scaling(vec3.create(1, 1, -1));
 
@@ -1186,7 +709,6 @@ export class PMXDemo implements Demo {
     this.sceneDataU32[44] = this.gpuSkinningEnabled ? 1 : 0;
 
     this.device.queue.writeBuffer(this.sceneBuffer, 0, this.sceneData as unknown as GPUAllowSharedBufferSource);
-
 
     const slx = this.lightX, sly = this.lightY, slz = this.lightZ;
     const slen = Math.sqrt(slx * slx + sly * sly + slz * slz) || 1;
@@ -1341,313 +863,24 @@ export class PMXDemo implements Demo {
 
         if (this.bloomEnabled) {
           const bloomResult = this.bloom.execute(encoder, hdrTex, this.bloomMaskView!);
-          this.applyTonemap(encoder, view, this.ctx.format, hdrView, bloomResult.view, this.bloom.bloomIntensity);
+          this.tonemapper.apply(encoder, view, this.ctx.format, hdrView, bloomResult.view, this.bloom.bloomIntensity);
         } else {
-          this.applyTonemap(encoder, view, this.ctx.format, hdrView, null, 0);
+          this.tonemapper.apply(encoder, view, this.ctx.format, hdrView, null, 0);
         }
 
-        if (this.debugIK && this.ikChains.length > 0) {
-          this.drawIKDebug(encoder, view);
+        if (this.debugIK && this.ikChains.length > 0 && this.skeleton) {
+          this.ikDebugRenderer.draw(
+            encoder, view, this.hdrTarget.depthTarget.view,
+            this.camera.getViewProjectionMatrix(w / h),
+            this.skeleton.worldMatrices, this.skeleton.parentIndices,
+            this.skeleton.boneCount, this.ikChains, w, h,
+          );
         }
       },
     }];
   }
 
-  private _ikDebugPipeline: GPURenderPipeline | null = null;
-  private _boneLinePipeline: GPURenderPipeline | null = null;
-  private _ikDebugBuf: GPUBuffer | null = null;
-  private _boneLineBuf: GPUBuffer | null = null;
-  private _ikDebugUBO: GPUBuffer | null = null;
-
-  private drawIKDebug(encoder: GPUCommandEncoder, view: GPUTextureView): void {
-    if (!this._ikDebugPipeline) {
-      const code = `
-struct U { viewProj: mat4x4<f32>, screenSize: vec2<f32>, pad: vec2<f32> };
-@group(0) @binding(0) var<uniform> u: U;
-struct V { @location(0) pos: vec3<f32>, @location(1) color: vec3<f32>, @location(2) size: f32 };
-struct O { @builtin(position) position: vec4<f32>, @location(0) color: vec3<f32> };
-@vertex fn vs(v: V) -> O {
-  let clip = u.viewProj * vec4<f32>(v.pos, 1.0);
-  var o: O;
-  o.position = clip;
-  o.color = v.color;
-  return o;
-}
-@fragment fn fs(o: O) -> @location(0) vec4<f32> {
-  return vec4<f32>(o.color, 1.0);
-}`;
-      const mod = this.device.createShaderModule({ code });
-      const vbLayout: GPUVertexBufferLayout = { arrayStride: 28, attributes: [
-        { shaderLocation: 0, offset: 0, format: "float32x3" },
-        { shaderLocation: 1, offset: 12, format: "float32x3" },
-        { shaderLocation: 2, offset: 24, format: "float32" },
-      ]};
-      const dsState: GPUDepthStencilState = { format: "depth24plus-stencil8", depthWriteEnabled: false, depthCompare: "less" };
-      const sharedBGL = this.device.createBindGroupLayout({ entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
-      ]});
-      const sharedLayout = this.device.createPipelineLayout({ bindGroupLayouts: [sharedBGL] });
-      this._ikDebugPipeline = this.device.createRenderPipeline({
-        label: "ik-debug-points",
-        layout: sharedLayout,
-        vertex: { module: mod, entryPoint: "vs", buffers: [vbLayout] },
-        fragment: { module: mod, entryPoint: "fs", targets: [{ format: this.ctx.format }] },
-        primitive: { topology: "point-list" },
-        depthStencil: dsState,
-      });
-      this._boneLinePipeline = this.device.createRenderPipeline({
-        label: "ik-debug-lines",
-        layout: sharedLayout,
-        vertex: { module: mod, entryPoint: "vs", buffers: [vbLayout] },
-        fragment: { module: mod, entryPoint: "fs", targets: [{ format: this.ctx.format }] },
-        primitive: { topology: "line-list" },
-        depthStencil: dsState,
-      });
-    }
-
-    const wm = this.skeleton!.worldMatrices;
-    const sk = this.skeleton!;
-
-    // Bone lines: parent→child as cyan lines (Z negated to match model matrix Z-flip)
-    const lines: number[] = [];
-    for (let i = 0; i < sk.boneCount; i++) {
-      const pi = sk.parentIndices[i];
-      if (pi < 0) continue;
-      const cOff = i * 16, pOff = pi * 16;
-      lines.push(wm[pOff+12], wm[pOff+13], -wm[pOff+14], 0, 0.8, 0.8, 1);
-      lines.push(wm[cOff+12], wm[cOff+13], -wm[cOff+14], 0, 0.8, 0.8, 1);
-    }
-
-    // IK points: target=red, effector=green, chain=yellow
-    const pts: number[] = [];
-    for (const chain of this.ikChains) {
-      const tOff = chain.targetIndex * 16;
-      pts.push(wm[tOff+12], wm[tOff+13], -wm[tOff+14], 1, 0, 0, 8);
-      const eOff = chain.effectorIndex * 16;
-      pts.push(wm[eOff+12], wm[eOff+13], -wm[eOff+14], 0, 1, 0, 8);
-      for (const link of chain.links) {
-        const lOff = link.index * 16;
-        pts.push(wm[lOff+12], wm[lOff+13], -wm[lOff+14], 1, 1, 0, 5);
-      }
-    }
-
-    const lineVertCount = lines.length / 7;
-    const lineByteSize = lineVertCount * 28;
-    if (!this._boneLineBuf || this._boneLineBuf.size < lineByteSize) {
-      this._boneLineBuf?.destroy();
-      this._boneLineBuf = this.device.createBuffer({ label: "bone-line-vb", size: Math.max(lineByteSize, 1024), usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    }
-    this.device.queue.writeBuffer(this._boneLineBuf, 0, new Float32Array(lines) as unknown as GPUAllowSharedBufferSource);
-
-    const ptVertCount = pts.length / 7;
-    const ptByteSize = ptVertCount * 28;
-    if (!this._ikDebugBuf || this._ikDebugBuf.size < ptByteSize) {
-      this._ikDebugBuf?.destroy();
-      this._ikDebugBuf = this.device.createBuffer({ label: "ik-debug-vb", size: Math.max(ptByteSize, 256), usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST });
-    }
-    this.device.queue.writeBuffer(this._ikDebugBuf, 0, new Float32Array(pts) as unknown as GPUAllowSharedBufferSource);
-
-    const w = this.ctx.canvas.width;
-    const h = this.ctx.canvas.height;
-    const viewProj = this.camera.getViewProjectionMatrix(w / h);
-    const uboData = new Float32Array(20);
-    uboData.set(viewProj as unknown as ArrayLike<number>, 0);
-    uboData[16] = w; uboData[17] = h;
-
-    if (!this._ikDebugUBO) {
-      this._ikDebugUBO = this.device.createBuffer({ label: "ik-debug-ubo", size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    }
-    this.device.queue.writeBuffer(this._ikDebugUBO, 0, uboData as unknown as GPUAllowSharedBufferSource);
-
-    const bg = this.device.createBindGroup({
-      layout: this._ikDebugPipeline.getBindGroupLayout(0),
-      entries: [{ binding: 0, resource: { buffer: this._ikDebugUBO } }],
-    });
-
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view, loadOp: "load", storeOp: "store" }],
-      depthStencilAttachment: { view: this.hdrTarget.depthTarget.view, depthLoadOp: "load", depthStoreOp: "store", depthClearValue: 1.0, stencilLoadOp: "load", stencilStoreOp: "store", stencilClearValue: 0 },
-    });
-    // Draw bone lines
-    pass.setPipeline(this._boneLinePipeline!);
-    pass.setBindGroup(0, bg);
-    pass.setVertexBuffer(0, this._boneLineBuf);
-    pass.draw(lineVertCount);
-    // Draw IK points
-    pass.setPipeline(this._ikDebugPipeline);
-    pass.setVertexBuffer(0, this._ikDebugBuf);
-    pass.draw(ptVertCount);
-    pass.end();
-  }
-
-  exposure = 1.0;
-  gamma = 2.2;
-  slope = 1.0;
-  offset = 0.0;
-  power = 1.0;
-  saturation = 1.0;
-  contrast = 1.0;
-  private filmicLUT: GPUTexture | null = null;
-  private filmicLUTView: GPUTextureView | null = null;
-  private toneBGSceneView: GPUTextureView | null = null;
-  private toneBGBloomView: GPUTextureView | null = null;
-  private blackTex: GPUTexture | null = null;
-  private blackTexView: GPUTextureView | null = null;
-  private bloomParamsUBO!: GPUBuffer;
-
-  private buildFilmicLUT(): GPUTexture {
-    if (this.filmicLUT) return this.filmicLUT;
-    const LUT_W = 256;
-    const data = new Float32Array(LUT_W * 4);
-    const A = 0.22, B = 0.30, C = 0.10, D = 0.20, E = 0.01, F = 0.30;
-    const filmicWhite = ((11.2 * (A * 11.2 + C * B) + D * E) / (11.2 * (A * 11.2 + B) + D * F)) - E / F;
-    const whiteScale = 1.0 / filmicWhite;
-    for (let i = 0; i < LUT_W; i++) {
-      const logX = (i / (LUT_W - 1)) * 13.0 - 10.0;
-      const x = Math.pow(2, logX);
-      const filmic = ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
-      const v = Math.max(0, filmic * whiteScale);
-      data[i * 4 + 0] = v;
-      data[i * 4 + 1] = v;
-      data[i * 4 + 2] = v;
-      data[i * 4 + 3] = 1.0;
-    }
-    this.filmicLUT = this.device.createTexture({
-      label: "filmic-lut",
-      size: [LUT_W, 1],
-      format: "rgba32float",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    this.device.queue.writeTexture({ texture: this.filmicLUT }, data as unknown as GPUAllowSharedBufferSource, { bytesPerRow: LUT_W * 16 }, [LUT_W, 1]);
-    this.filmicLUTView = this.filmicLUT.createView();
-    return this.filmicLUT;
-  }
-
-  private applyTonemap(encoder: GPUCommandEncoder, screenView: GPUTextureView, screenFormat: GPUTextureFormat, sceneView: GPUTextureView, bloomView: GPUTextureView | null, bloomIntensity: number): void {
-    if (!this.tonePipeline) {
-      const lut = this.buildFilmicLUT();
-      const code = `
-struct Params { exposure: f32, gamma: f32, contrast: f32, flags: u32 };
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var srcTex: texture_2d<f32>;
-@group(0) @binding(2) var srcSampler: sampler;
-@group(0) @binding(3) var filmicLut: texture_2d<f32>;
-@group(0) @binding(4) var<uniform> grade: vec4<f32>;
-@group(0) @binding(5) var<uniform> grade2: vec4<f32>;
-@group(0) @binding(6) var bloomTex: texture_2d<f32>;
-@group(0) @binding(7) var<uniform> bloomParams: vec4<f32>;
-
-fn filmicLUT(x: f32) -> f32 {
-  let t = clamp(log2(max(x, 1e-10)) + 10.0, 0.0, 13.0);
-  let idx = u32(t * 255.0 / 13.0 + 0.5);
-  return textureLoad(filmicLut, vec2u(min(idx, 255u), 0u), 0).r;
-}
-
-fn gradeColor(c: vec3f) -> vec3f {
-  let slope = grade.xyz;
-  let offset = vec3f(grade.w);
-  let power = grade2.xyz;
-  let sat = grade2.w;
-  var x = pow(max(c * slope + offset, vec3f(0.0)), power);
-  let luma = dot(x, vec3f(0.2126, 0.7152, 0.0722));
-  return max(mix(vec3f(luma), x, sat), vec3f(0.0));
-}
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4<f32> {
-  var pos = array<vec2<f32>, 3>(vec2<f32>(-1, -1), vec2<f32>(3, -1), vec2<f32>(-1, 3));
-  return vec4<f32>(pos[vi], 0.0, 1.0);
-}
-
-@fragment
-fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-  let dims = vec2<f32>(textureDimensions(srcTex));
-  let uv = pos.xy / dims;
-  let scene = textureSample(srcTex, srcSampler, uv).rgb;
-  let bloom = textureSample(bloomTex, srcSampler, uv).rgb;
-  var color = (scene + bloom * bloomParams.x) * p.exposure;
-  let doTonemap = (p.flags & 1u) != 0u;
-  let doGrade = (p.flags & 2u) != 0u;
-  if (doTonemap) {
-    color = vec3f(filmicLUT(color.r), filmicLUT(color.g), filmicLUT(color.b));
-  } else {
-    color = clamp(color, vec3f(0.0), vec3f(1.0));
-  }
-  if (doGrade) {
-    color = gradeColor(color);
-    color = (color - vec3f(0.5)) * p.contrast + vec3f(0.5);
-  }
-  color = pow(max(color, vec3f(0.0)), vec3f(1.0 / p.gamma));
-  return vec4<f32>(color, 1.0);
-}`;
-      const module = this.device.createShaderModule({ code });
-      this.tonePipeline = this.device.createRenderPipeline({
-        label: "pmx-tonemap",
-        layout: "auto",
-        vertex: { module, entryPoint: "vs_main" },
-        fragment: { module, entryPoint: "fs_main", targets: [{ format: screenFormat }] },
-        primitive: { topology: "triangle-list" },
-      });
-    }
-
-    if (!this.toneUBO) {
-      this.toneUBO = this.device.createBuffer({ label: "tone-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    }
-    if (!this.gradeUBO) {
-      this.gradeUBO = this.device.createBuffer({ label: "grade-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-      this.grade2UBO = this.device.createBuffer({ label: "grade2-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    }
-    if (!this.bloomParamsUBO) {
-      this.bloomParamsUBO = this.device.createBuffer({ label: "bloom-params-ubo", size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    }
-    if (!this.blackTex) {
-      this.blackTex = this.device.createTexture({ label: "tonemap-black", size: [1, 1], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
-      this.device.queue.writeTexture({ texture: this.blackTex }, new Uint8Array([0, 0, 0, 0]), { bytesPerRow: 4 }, [1, 1]);
-      this.blackTexView = this.blackTex.createView();
-    }
-    const flags = (this.tonemapEnabled ? 1 : 0) | (this.gradeEnabled ? 2 : 0);
-    const data = new ArrayBuffer(16);
-    const f32 = new Float32Array(data);
-    const u32 = new Uint32Array(data);
-    f32[0] = this.exposure; f32[1] = this.gamma; f32[2] = this.contrast; u32[3] = flags;
-    this.device.queue.writeBuffer(this.toneUBO, 0, data);
-    const gd = new Float32Array([this.slope, this.slope, this.slope, this.offset]);
-    this.device.queue.writeBuffer(this.gradeUBO, 0, gd as unknown as GPUAllowSharedBufferSource);
-    const gd2 = new Float32Array([this.power, this.power, this.power, this.saturation]);
-    this.device.queue.writeBuffer(this.grade2UBO, 0, gd2 as unknown as GPUAllowSharedBufferSource);
-    this.device.queue.writeBuffer(this.bloomParamsUBO, 0, new Float32Array([bloomIntensity, 0, 0, 0]) as unknown as GPUAllowSharedBufferSource);
-
-    if (!this.toneSampler) {
-      this.toneSampler = this.device.createSampler({ magFilter: "linear", minFilter: "linear" });
-    }
-    const effectiveBloomView = bloomView ?? this.blackTexView!;
-    if (!this.toneBindGroup || sceneView !== this.toneBGSceneView || effectiveBloomView !== this.toneBGBloomView) {
-      this.toneBindGroup = this.device.createBindGroup({
-        layout: this.tonePipeline.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.toneUBO } },
-          { binding: 1, resource: sceneView },
-          { binding: 2, resource: this.toneSampler },
-          { binding: 3, resource: this.filmicLUTView! },
-          { binding: 4, resource: { buffer: this.gradeUBO } },
-          { binding: 5, resource: { buffer: this.grade2UBO } },
-          { binding: 6, resource: effectiveBloomView },
-          { binding: 7, resource: { buffer: this.bloomParamsUBO } },
-        ],
-      });
-      this.toneBGSceneView = sceneView;
-      this.toneBGBloomView = effectiveBloomView;
-    }
-
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [{ view: screenView, loadOp: "clear", storeOp: "store" }],
-    });
-    pass.setPipeline(this.tonePipeline);
-    pass.setBindGroup(0, this.toneBindGroup);
-    pass.draw(3);
-    pass.end();
-  }
-
+  private ikDebugRenderer!: IKDebugRenderer;
 
   private setShadowResolution(size: number): void {
     if (size === this.shadowMap.size) return;
@@ -1690,14 +923,14 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     gui.add(this.bloom, "radius", 0.5, 10, 0.1).name("Bloom Radius");
     gui.add(this.bloom, "maxMips", [2, 3, 4, 5]).name("Bloom Mips");
     const toneFolder = gui.addFolder("Tone Mapping");
-    toneFolder.add(this, "exposure", 0.1, 3, 0.01).name("Exposure");
-    toneFolder.add(this, "gamma", 1.0, 3.0, 0.01).name("Gamma");
+    toneFolder.add(this.tonemapper, "exposure", 0.1, 3, 0.01).name("Exposure");
+    toneFolder.add(this.tonemapper, "gamma", 1.0, 3.0, 0.01).name("Gamma");
     const gradeFolder = gui.addFolder("Color Grading");
-    gradeFolder.add(this, "slope", 0.5, 2.0, 0.01).name("Slope");
-    gradeFolder.add(this, "offset", -0.5, 0.5, 0.01).name("Offset");
-    gradeFolder.add(this, "power", 0.5, 2.0, 0.01).name("Power");
-    gradeFolder.add(this, "saturation", 0, 2, 0.01).name("Saturation");
-    gradeFolder.add(this, "contrast", 0.5, 2.0, 0.01).name("Contrast");
+    gradeFolder.add(this.tonemapper, "slope", 0.5, 2.0, 0.01).name("Slope");
+    gradeFolder.add(this.tonemapper, "offset", -0.5, 0.5, 0.01).name("Offset");
+    gradeFolder.add(this.tonemapper, "power", 0.5, 2.0, 0.01).name("Power");
+    gradeFolder.add(this.tonemapper, "saturation", 0, 2, 0.01).name("Saturation");
+    gradeFolder.add(this.tonemapper, "contrast", 0.5, 2.0, 0.01).name("Contrast");
     const lightFolder = gui.addFolder("Light");
     lightFolder.add(this, "lightX", -30, 30, 0.5).name("X");
     lightFolder.add(this, "lightY", -30, 30, 0.5).name("Y");
@@ -1741,10 +974,8 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     this.bloomMaskTex?.destroy();
     this.bloomOutput?.destroy();
-    this.toneUBO?.destroy();
-    this.gradeUBO?.destroy();
-    this.grade2UBO?.destroy();
-    this.filmicLUT?.destroy();
+    this.tonemapper?.destroy();
+    this.ikDebugRenderer?.destroy();
     this._depthTex?.destroy();
     this.gpuSkinning?.destroy();
     this.gpuMorph?.destroy();

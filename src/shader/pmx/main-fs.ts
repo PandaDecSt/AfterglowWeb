@@ -1,0 +1,179 @@
+import { SHADOW_WGSL } from "../../passes/shadow";
+import { BRDF_LUT_SIZE } from "../../passes/brdf-lut";
+
+export function buildMainFS(): string {
+  return `
+override IS_OVER_EYES: bool = false;
+override IS_EYE: bool = false;
+
+struct Scene {
+  viewProj: mat4x4<f32>,
+  model: mat4x4<f32>,
+  lightDir: vec4<f32>,
+  lightColor: vec4<f32>,
+  cameraPos: vec4<f32>,
+
+};
+@group(0) @binding(0) var<uniform> scene: Scene;
+
+struct Mat {
+  diffuseColor_alpha: vec4<f32>,
+  ambient_shininess: vec4<f32>,
+  specular_sphereMode: vec4<f32>,
+  pbrParams: vec4<f32>,
+  rimColor_strength: vec4<f32>,
+  rimPower_pad: vec4<f32>,
+};
+@group(0) @binding(1) var<uniform> mat: Mat;
+
+@group(0) @binding(2) var diffuseTex: texture_2d<f32>;
+@group(0) @binding(3) var sphereTex: texture_2d<f32>;
+@group(0) @binding(4) var toonTex: texture_2d<f32>;
+@group(0) @binding(5) var texSampler: sampler;
+@group(0) @binding(6) var brdfLut: texture_2d<f32>;
+
+@group(1) @binding(0) var shadowTex: texture_depth_2d;
+@group(1) @binding(1) var shadowSampler: sampler_comparison;
+@group(1) @binding(2) var<uniform> lightVP: mat4x4<f32>;
+
+struct VSOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) worldNormal: vec3<f32>,
+  @location(1) worldPos: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+};
+
+${SHADOW_WGSL}
+
+fn ggxNDF(NH: f32, a2: f32) -> f32 {
+  let d = NH * NH * (a2 - 1.0) + 1.0;
+  return a2 / (3.14159265 * d * d);
+}
+
+fn smithG2(NL: f32, NV: f32, k: f32) -> f32 {
+  return 1.0 / (4.0 * (NL * (1.0 - k) + k) * (NV * (1.0 - k) + k));
+}
+
+fn fresnelSchlick(VH: f32, F0: vec3<f32>) -> vec3<f32> {
+  return F0 + (1.0 - F0) * pow(1.0 - VH, 5.0);
+}
+
+fn brdf_lut_sample(NV: f32, roughness: f32) -> vec4<f32> {
+  let LUT_SIZE: f32 = ${BRDF_LUT_SIZE}.0;
+  var uv = vec2f(clamp(roughness, 0.0, 1.0), sqrt(clamp(1.0 - NV, 0.0, 1.0)));
+  uv = uv * ((LUT_SIZE - 1.0) / LUT_SIZE) + 0.5 / LUT_SIZE;
+  return textureSampleLevel(brdfLut, texSampler, uv, 0.0);
+}
+
+fn F_brdf_multi_scatter(f0: vec3<f32>, f90: vec3<f32>, lut: vec2<f32>) -> vec3<f32> {
+  let FssEss = lut.y * f90 + lut.x * f0;
+  let Ess = lut.x + lut.y;
+  let Ems = 1.0 - Ess;
+  let Favg = f0 + (1.0 - f0) / 21.0;
+  let Fms = FssEss * Favg / (1.0 - (1.0 - Ess) * Favg);
+  return FssEss + Fms * Ems;
+}
+
+fn ltc_brdf_scale(lut: vec4<f32>) -> f32 {
+  return (lut.z + lut.w) / max(lut.x + lut.y, 1e-6);
+}
+
+fn hash3(p3: vec3<f32>) -> f32 {
+  var p = fract(p3 * 0.1031);
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.x + p.y) * p.z);
+}
+
+fn hashedAlphaThreshold(co: vec3<f32>, alphaHashScale: f32) -> f32 {
+  let dx = dpdx(co);
+  let dy = dpdy(co);
+  let maxDeriv = max(length(dx), length(dy));
+  let pixScale = 1.0 / max(alphaHashScale * maxDeriv, 1e-6);
+  let pixScaleFloor = floor(pixScale);
+  let baseHash = hash3(floor(co * pixScaleFloor));
+  let nextHash = hash3(floor(co * pixScaleFloor) + vec3<f32>(1.0));
+  let fracPart = fract(pixScale);
+  return mix(baseHash, nextHash, fracPart);
+}
+
+struct FSOut {
+  @location(0) color: vec4<f32>,
+  @location(1) mask: vec4<f32>,
+};
+
+@fragment
+fn fs_main(in: VSOut) -> FSOut {
+  if (IS_EYE && scene.cameraPos.z < in.worldPos.z) { discard; }
+  let tex_s = textureSample(diffuseTex, texSampler, in.uv);
+  let alpha = mat.diffuseColor_alpha.w * tex_s.a;
+  if (mat.rimPower_pad.y > 0.5) {
+    let threshold = hashedAlphaThreshold(in.worldPos, 1.0);
+    if (alpha < threshold) { discard; }
+  } else {
+    if (alpha < 0.001) { discard; }
+  }
+
+  var n = normalize(in.worldNormal);
+  let v = normalize(scene.cameraPos.xyz - in.worldPos);
+  n = select(-n, n, dot(n, v) >= 0.0);
+
+  let l = normalize(scene.lightDir.xyz);
+  let h = normalize(v + l);
+  let NL = max(dot(n, l), 0.0);
+  let NV = max(dot(n, v), 0.0);
+  let NH = max(dot(n, h), 0.0);
+  let VH = max(dot(v, h), 0.0);
+
+  let baseColor = tex_s.rgb * mat.diffuseColor_alpha.xyz;
+  let shadow = sampleShadowPCF(shadowTex, shadowSampler, lightVP, in.worldPos, n, l);
+
+  let toonT = clamp(NL * 0.5 + 0.5, 0.0, 1.0);
+  let toonShade = textureSample(toonTex, texSampler, vec2<f32>(toonT, 0.5)).r;
+
+  let nprDiffuse = baseColor * toonShade * shadow;
+  let nprSpecular = pow(NH, max(mat.ambient_shininess.w, 1.0)) * mat.specular_sphereMode.xyz * shadow;
+
+  let metallic = mat.pbrParams.x;
+  let roughness = max(mat.pbrParams.y, 0.04);
+  let a2 = roughness * roughness * roughness * roughness;
+  let F0 = mix(vec3<f32>(0.04), baseColor, metallic);
+  let f90 = vec3<f32>(1.0);
+
+  let lut = brdf_lut_sample(NV, roughness);
+  let F_ms = F_brdf_multi_scatter(F0, f90, lut.xy);
+
+  let pbrDiffuse = baseColor * (1.0 - metallic) / 3.14159265 * NL * shadow;
+  let D = ggxNDF(NH, a2);
+  let k = (roughness + 1.0) * (roughness + 1.0) / 8.0;
+  let G = smithG2(NL, NV, k);
+  let pbrSpecular = D * G * F_ms * shadow;
+
+  let nprMix = mat.pbrParams.w;
+  let diffuse = mix(pbrDiffuse, nprDiffuse, nprMix);
+  let specular = mix(pbrSpecular, nprSpecular, nprMix);
+
+  let rimFactor = pow(1.0 - NV, mat.rimPower_pad.x) * mat.rimColor_strength.w;
+  let rim = mat.rimColor_strength.xyz * rimFactor;
+
+  let emission = baseColor * mat.pbrParams.z;
+
+  var sphereAdd = vec3<f32>(0.0);
+  if (mat.specular_sphereMode.w > 0.5 && mat.specular_sphereMode.w < 1.5) {
+    let viewN = (scene.viewProj * vec4<f32>(n, 0.0)).xy;
+    let sphereUV = viewN * 0.5 + vec2<f32>(0.5, 0.5);
+    sphereAdd = textureSample(sphereTex, texSampler, sphereUV).rgb * baseColor;
+  } else if (mat.specular_sphereMode.w > 1.5) {
+    sphereAdd = textureSample(sphereTex, texSampler, in.uv).rgb * baseColor;
+  }
+
+  let ambient = baseColor * mat.ambient_shininess.xyz;
+  let color = ambient + (diffuse + specular) * scene.lightColor.rgb + rim + emission + sphereAdd;
+  var outAlpha = alpha;
+  if (IS_OVER_EYES) { outAlpha = alpha * 0.25; }
+  var out: FSOut;
+  out.color = vec4<f32>(color, outAlpha);
+  out.mask = vec4<f32>(1.0, outAlpha, 0.0, 0.0);
+  return out;
+}
+`;
+}
