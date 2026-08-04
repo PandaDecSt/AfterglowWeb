@@ -362,6 +362,13 @@ export class DeferredDemo implements Demo {
 
   private uboData = new Float32Array(88);
   private ballUboData = new Float32Array(88);
+  private shadowUboData = new Float32Array(32);
+  private jitteredVP = new Float32Array(16);
+  private cubeModel = new Float32Array(16);
+  private shadowCubeBG: GPUBindGroup | null = null;
+  private shadowBallBG: GPUBindGroup | null = null;
+  private gbufferCubeBG: GPUBindGroup | null = null;
+  private gbufferBallBG: GPUBindGroup | null = null;
   private frameTime = 0;
   private taaFrameIndex = 0;
   private taaJitter = true;
@@ -385,11 +392,11 @@ export class DeferredDemo implements Demo {
     // 0.5px jitter in NDC space
     const jx = (this.halton(index, 2) - 0.5) * 2.0 / w;
     const jy = (this.halton(index, 3) - 0.5) * 2.0 / h;
-    const out = new Float32Array(viewProj);
+    this.jitteredVP.set(viewProj as unknown as ArrayLike<number>);
     // this assumes column-major wgpu-matrix: proj[2][0]=8, proj[2][1]=9
-    out[8] += jx;
-    out[9] += jy;
-    return out;
+    this.jitteredVP[8] += jx;
+    this.jitteredVP[9] += jy;
+    return this.jitteredVP;
   }
 
   update(time: number) {
@@ -406,6 +413,7 @@ export class DeferredDemo implements Demo {
     ubo.set(this.prevViewProj as unknown as ArrayLike<number>, 16);
     const model = mat4.mul(mat4.rotationY(time * 0.5), mat4.scaling([1.5, 1.5, 1.5]));
     const invTransModel = mat4.transpose(mat4.inverse(model));
+    this.cubeModel.set(model as unknown as ArrayLike<number>);
     ubo.set(model as unknown as ArrayLike<number>, 32);
     ubo.set(invTransModel as unknown as ArrayLike<number>, 48);
     ubo.set(this.prevModel as unknown as ArrayLike<number>, 64);
@@ -480,31 +488,33 @@ export class DeferredDemo implements Demo {
             const shadowPass = this.csm.beginCascadePass(encoder, i);
             shadowPass.setPipeline(this.shadowPipeline);
 
-            const shadowUbo = new Float32Array(32);
+            const shadowUbo = this.shadowUboData;
             shadowUbo.set(this.csm.cascadeVPs[i] as unknown as ArrayLike<number>, 0);
-            const model = mat4.mul(mat4.rotationY(this.frameTime * 0.5), mat4.scaling([1.5, 1.5, 1.5]));
-            shadowUbo.set(model as unknown as ArrayLike<number>, 16);
+            shadowUbo.set(this.cubeModel as unknown as ArrayLike<number>, 16);
             this.device.queue.writeBuffer(this.shadowUBO, 0, shadowUbo as unknown as GPUAllowSharedBufferSource);
 
-            const shadowBG = this.device.createBindGroup({
-              layout: this.shadowPipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: this.shadowUBO } }],
-            });
-            shadowPass.setBindGroup(0, shadowBG);
+            if (!this.shadowCubeBG) {
+              this.shadowCubeBG = this.device.createBindGroup({
+                layout: this.shadowPipeline.getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: { buffer: this.shadowUBO } }],
+              });
+            }
+            shadowPass.setBindGroup(0, this.shadowCubeBG);
             shadowPass.setVertexBuffer(0, this.cubeVB);
             shadowPass.setIndexBuffer(this.cubeIB, "uint16");
             shadowPass.drawIndexed(this.cubeIndexCount);
 
-            const ballShadowUBO = new Float32Array(32);
-            ballShadowUBO.set(this.csm.cascadeVPs[i] as unknown as ArrayLike<number>, 0);
-            ballShadowUBO.set(this.ballUboData.subarray(32, 48) as unknown as ArrayLike<number>, 16);
-            this.device.queue.writeBuffer(this.shadowUBO, 0, ballShadowUBO as unknown as GPUAllowSharedBufferSource);
+            shadowUbo.set(this.csm.cascadeVPs[i] as unknown as ArrayLike<number>, 0);
+            shadowUbo.set(this.ballUboData.subarray(32, 48) as unknown as ArrayLike<number>, 16);
+            this.device.queue.writeBuffer(this.shadowUBO, 0, shadowUbo as unknown as GPUAllowSharedBufferSource);
 
-            const ballShadowBG = this.device.createBindGroup({
-              layout: this.shadowPipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: this.shadowUBO } }],
-            });
-            shadowPass.setBindGroup(0, ballShadowBG);
+            if (!this.shadowBallBG) {
+              this.shadowBallBG = this.device.createBindGroup({
+                layout: this.shadowPipeline.getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: { buffer: this.shadowUBO } }],
+              });
+            }
+            shadowPass.setBindGroup(0, this.shadowBallBG);
             shadowPass.setVertexBuffer(0, this.sphereVB);
             shadowPass.setIndexBuffer(this.sphereIB, "uint16");
             shadowPass.drawIndexed(this.sphereIndexCount);
@@ -516,23 +526,26 @@ export class DeferredDemo implements Demo {
         {
           const gbufferPass = this.gbuffer.beginGBufferPass(encoder);
           gbufferPass.setPipeline(this.gbufferPipeline);
-          const gbufferBG = this.device.createBindGroup({
-            layout: this.gbufferPipeline.getBindGroupLayout(0),
-            entries: [{ binding: 0, resource: { buffer: this.sceneUBO } }],
-          });
-          gbufferPass.setBindGroup(0, gbufferBG);
+          if (!this.gbufferCubeBG) {
+            this.gbufferCubeBG = this.device.createBindGroup({
+              layout: this.gbufferPipeline.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: this.sceneUBO } }],
+            });
+          }
+          gbufferPass.setBindGroup(0, this.gbufferCubeBG);
           gbufferPass.setVertexBuffer(0, this.cubeVB);
           gbufferPass.setIndexBuffer(this.cubeIB, "uint16");
           gbufferPass.drawIndexed(this.cubeIndexCount);
 
-          const ballBG = this.device.createBindGroup({
-            layout: this.gbufferPipeline.getBindGroupLayout(0),
-            entries: [{ binding: 0, resource: { buffer: this.ballUBO } }],
-          });
-          gbufferPass.setBindGroup(0, ballBG);
+          if (!this.gbufferBallBG) {
+            this.gbufferBallBG = this.device.createBindGroup({
+              layout: this.gbufferPipeline.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: this.ballUBO } }],
+            });
+          }
+          gbufferPass.setBindGroup(0, this.gbufferBallBG);
           gbufferPass.setVertexBuffer(0, this.sphereVB);
           gbufferPass.setIndexBuffer(this.sphereIB, "uint16");
-          gbufferPass.drawIndexed(this.sphereIndexCount);
           gbufferPass.end();
         }
 

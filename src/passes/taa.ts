@@ -7,16 +7,31 @@ export class TAAPass {
   private device: GPUDevice;
   private pipeline!: GPURenderPipeline;
   private history: [GPUTexture, GPUTexture] | null = null;
+  private historyViews: [GPUTextureView, GPUTextureView] | null = null;
   private frameIndex = 0;
   private width = 0;
   private height = 0;
   private format: GPUTextureFormat;
+  private ubo!: GPUBuffer;
+  private sampler!: GPUSampler;
+  private paramData = new Float32Array(4);
+  private cachedSceneTex: GPUTexture | null = null;
+  private cachedSceneView: GPUTextureView | null = null;
+  private cachedBG: GPUBindGroup | null = null;
+  private cachedMotionView: GPUTextureView | null = null;
+  private cachedHistView: GPUTextureView | null = null;
   alpha = 0.08;
   debugMode = 0; // 0 = normal, 1 = show motion vectors, 2 = no reprojection, 3 = no history
 
   constructor(device: GPUDevice, format: GPUTextureFormat = "rgba16float") {
     this.device = device;
     this.format = format;
+    this.sampler = this.device.createSampler({ label: "taa-linear", magFilter: "linear", minFilter: "linear" });
+    this.ubo = this.device.createBuffer({
+      label: "taa-uniforms",
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
 
     const module = this.device.createShaderModule({
       label: "taa",
@@ -169,7 +184,15 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
       }),
     ];
+    this.historyViews = [this.history[0].createView(), this.history[1].createView()];
     this.frameIndex = 0;
+  }
+
+  private getSceneView(tex: GPUTexture): GPUTextureView {
+    if (this.cachedSceneTex === tex && this.cachedSceneView) return this.cachedSceneView;
+    this.cachedSceneTex = tex;
+    this.cachedSceneView = tex.createView();
+    return this.cachedSceneView;
   }
 
   execute(
@@ -185,47 +208,55 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     const readIdx = this.frameIndex & 1;
     const writeIdx = readIdx ^ 1;
     const histTex = this.history![readIdx];
+    const histView = this.historyViews![readIdx];
     const outTex = this.history![writeIdx];
+    const outView = this.historyViews![writeIdx];
 
-    const data = new Float32Array(4);
+    const data = this.paramData;
     data[0] = 1 / width;
     data[1] = 1 / height;
     data[2] = this.frameIndex === 0 ? 1.0 : this.alpha;
     data[3] = this.debugMode;
-    const ubo = this.device.createBuffer({
-      label: "taa-uniforms",
-      size: 16,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(ubo, 0, data as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.ubo, 0, data as unknown as GPUAllowSharedBufferSource);
 
-    const bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: sceneTexture.createView() },
-        { binding: 1, resource: motionView },
-        { binding: 2, resource: histTex.createView() },
-        { binding: 3, resource: this.device.createSampler({ magFilter: "linear", minFilter: "linear" }) },
-        { binding: 4, resource: { buffer: ubo } },
-      ],
-    });
+    const sceneView = this.getSceneView(sceneTexture);
+    if (
+      this.cachedBG === null ||
+      this.cachedSceneView !== sceneView ||
+      this.cachedMotionView !== motionView ||
+      this.cachedHistView !== histView
+    ) {
+      this.cachedBG = this.device.createBindGroup({
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: sceneView },
+          { binding: 1, resource: motionView },
+          { binding: 2, resource: histView },
+          { binding: 3, resource: this.sampler },
+          { binding: 4, resource: { buffer: this.ubo } },
+        ],
+      });
+      this.cachedSceneView = sceneView;
+      this.cachedMotionView = motionView;
+      this.cachedHistView = histView;
+    }
 
     const pass = encoder.beginRenderPass({
       label: "taa",
       colorAttachments: [{
-        view: outTex.createView(),
+        view: outView,
         clearValue: { r: 0, g: 0, b: 0, a: 1 },
         loadOp: "clear",
         storeOp: "store",
       }],
     });
     pass.setPipeline(this.pipeline);
-    pass.setBindGroup(0, bindGroup);
+    pass.setBindGroup(0, this.cachedBG);
     pass.draw(3);
     pass.end();
 
     this.frameIndex++;
-    return { texture: outTex, view: outTex.createView() };
+    return { texture: outTex, view: outView };
   }
 
   reset(): void {
@@ -236,5 +267,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.history?.[0].destroy();
     this.history?.[1].destroy();
     this.history = null;
+    this.historyViews = null;
+    this.ubo?.destroy();
   }
 }

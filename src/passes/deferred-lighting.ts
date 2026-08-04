@@ -14,6 +14,13 @@ export class DeferredLightingPass {
   private fallbackAOView!: GPUTextureView;
   private cachedHasShadow: boolean | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
+  private nearestSampler!: GPUSampler;
+  private linearClampSampler!: GPUSampler;
+  private lastGBuffer: GBuffer | null = null;
+  private lastShadowView: GPUTextureView | null = null;
+  private lastShadowVPBuffer: GPUBuffer | null = null;
+  private lastAOView: GPUTextureView | null = null;
+  private lastIBL: { irradiance: GPUTextureView; prefilter: GPUTextureView; brdfLut: GPUTextureView } | null = null;
 
   envIntensity = 1.0;
 
@@ -50,6 +57,15 @@ export class DeferredLightingPass {
       { bytesPerRow: 4 },
       [1, 1],
     );
+    this.nearestSampler = this.device.createSampler({ label: "deferred-nearest", magFilter: "nearest", minFilter: "nearest" });
+    this.linearClampSampler = this.device.createSampler({
+      label: "deferred-linear-clamp",
+      magFilter: "linear",
+      minFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+      mipmapFilter: "linear",
+    });
   }
 
   update(
@@ -109,38 +125,52 @@ export class DeferredLightingPass {
       this.cachedHasShadow = needsShadow;
     }
 
-    const entries: GPUBindGroupEntry[] = [
-      { binding: 0, resource: { buffer: this.uniformBuffer } },
-      { binding: 1, resource: { buffer: this.lightBuffer } },
-      { binding: 2, resource: gbuffer.albedoView },
-      { binding: 3, resource: gbuffer.normalView },
-      { binding: 4, resource: gbuffer.materialView },
-      { binding: 5, resource: gbuffer.depthCopyView },
-      { binding: 6, resource: this.device.createSampler({ magFilter: "nearest", minFilter: "nearest" }) },
-      { binding: 10, resource: aoView ?? this.fallbackAOView },
-    ];
+    if (
+      this.bindGroup === null ||
+      this.lastGBuffer !== gbuffer ||
+      this.lastShadowView !== shadowView ||
+      this.lastShadowVPBuffer !== shadowVPBuffer ||
+      this.lastAOView !== aoView ||
+      this.lastIBL !== ibl
+    ) {
+      const entries: GPUBindGroupEntry[] = [
+        { binding: 0, resource: { buffer: this.uniformBuffer } },
+        { binding: 1, resource: { buffer: this.lightBuffer } },
+        { binding: 2, resource: gbuffer.albedoView },
+        { binding: 3, resource: gbuffer.normalView },
+        { binding: 4, resource: gbuffer.materialView },
+        { binding: 5, resource: gbuffer.depthCopyView },
+        { binding: 6, resource: this.nearestSampler },
+        { binding: 10, resource: aoView ?? this.fallbackAOView },
+      ];
 
-    if (shadowView && shadowSampler && shadowVPBuffer) {
-      entries.push(
-        { binding: 7, resource: shadowView },
-        { binding: 8, resource: shadowSampler },
-        { binding: 9, resource: { buffer: shadowVPBuffer } },
-      );
+      if (shadowView && shadowSampler && shadowVPBuffer) {
+        entries.push(
+          { binding: 7, resource: shadowView },
+          { binding: 8, resource: shadowSampler },
+          { binding: 9, resource: { buffer: shadowVPBuffer } },
+        );
+      }
+
+      if (ibl) {
+        entries.push(
+          { binding: 11, resource: ibl.irradiance },
+          { binding: 12, resource: ibl.prefilter },
+          { binding: 13, resource: ibl.brdfLut },
+          { binding: 14, resource: this.linearClampSampler },
+        );
+      }
+
+      this.bindGroup = this.device.createBindGroup({
+        layout: this.bindGroupLayout!,
+        entries,
+      });
+      this.lastGBuffer = gbuffer;
+      this.lastShadowView = shadowView ?? null;
+      this.lastShadowVPBuffer = shadowVPBuffer ?? null;
+      this.lastAOView = aoView ?? null;
+      this.lastIBL = ibl ?? null;
     }
-
-    if (ibl) {
-      entries.push(
-        { binding: 11, resource: ibl.irradiance },
-        { binding: 12, resource: ibl.prefilter },
-        { binding: 13, resource: ibl.brdfLut },
-        { binding: 14, resource: this.device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", mipmapFilter: "linear" }) },
-      );
-    }
-
-    this.bindGroup = this.device.createBindGroup({
-      layout: this.bindGroupLayout!,
-      entries,
-    });
 
     const pass = encoder.beginRenderPass({
       label: "deferred-lighting",

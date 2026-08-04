@@ -77,7 +77,7 @@ fn hash21(p: vec2<f32>) -> f32 {
 }
 
 fn heightFog(worldHeight: f32, sceneDepth: f32) -> f32 {
-  let heightDiff = max(pp.cameraPos.z - worldHeight + sceneDepth * 0.25, 0.0);
+  let heightDiff = max(pp.cameraPos.y - worldHeight + sceneDepth * 0.25, 0.0);
   let fog = heightDiff * heightDiff * 0.0001 * pp.heightFogDensity;
   return saturate(1.0 - exp(-2.0 * fog));
 }
@@ -97,7 +97,7 @@ fn underwaterMask(uv: vec2<f32>) -> f32 {
 
   // Simple water height comparison (water at y=0)
   let waterHeight = 0.0;
-  let heightDiff = waterHeight - nearWorld.z + 0.03;
+  let heightDiff = waterHeight - nearWorld.y + 0.03;
   return smoothstep(0.0, 0.01, max(heightDiff, 0.0));
 }
 
@@ -163,7 +163,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   let sceneDepth = length(worldPos - pp.cameraPos);
 
   // Height fog (world-space)
-  let hfog = heightFog(worldPos.z, sceneDepth);
+  let hfog = heightFog(worldPos.y, sceneDepth);
   color = mix(color, pp.fogColor, clamp(hfog * pp.heightFogBlend, 0.0, 1.0));
 
   // ACES Tonemapping
