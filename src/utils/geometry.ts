@@ -90,3 +90,50 @@ export function createGridGeometry(size = 10, divisions = 10): {
 
   return { vertices, indices };
 }
+
+export function createSphereGeometry(
+  radius = 1.0,
+  widthSegments = 32,
+  heightSegments = 16,
+): { vertices: Float32Array; indices: Uint16Array } {
+  const vertices: number[] = [];
+  const indices: number[] = [];
+
+  for (let y = 0; y <= heightSegments; y++) {
+    const v = y / heightSegments;
+    const phi = v * Math.PI;
+    const sinPhi = Math.sin(phi);
+    const cosPhi = Math.cos(phi);
+
+    for (let x = 0; x <= widthSegments; x++) {
+      const u = x / widthSegments;
+      const theta = u * Math.PI * 2;
+      const sinTheta = Math.sin(theta);
+      const cosTheta = Math.cos(theta);
+
+      const nx = sinPhi * cosTheta;
+      const ny = cosPhi;
+      const nz = sinPhi * sinTheta;
+
+      vertices.push(nx * radius, ny * radius, nz * radius);
+      vertices.push(nx, ny, nz);
+      vertices.push(u, v);
+    }
+  }
+
+  for (let y = 0; y < heightSegments; y++) {
+    for (let x = 0; x < widthSegments; x++) {
+      const a = y * (widthSegments + 1) + x;
+      const b = a + 1;
+      const c = a + widthSegments + 1;
+      const d = c + 1;
+      indices.push(a, c, b);
+      indices.push(b, c, d);
+    }
+  }
+
+  return {
+    vertices: new Float32Array(vertices),
+    indices: new Uint16Array(indices),
+  };
+}

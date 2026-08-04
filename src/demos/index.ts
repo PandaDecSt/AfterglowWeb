@@ -19,4 +19,5 @@ export { TerrainHydrologyDemo } from "./terrain-hydrology";
 export { ACESPipelineDemo } from "./aces-pipeline";
 export { HairEyeShadowDemo } from "./hair-eye-shadow";
 export { PMXDemo } from "./pmx-viewer";
+export { DeferredDemo } from "./deferred-pbr";
 export type { Demo } from "./types";

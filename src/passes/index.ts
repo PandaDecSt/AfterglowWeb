@@ -5,3 +5,8 @@ export type { ToneMappingMode } from "./hdr";
 export { MSAARenderTarget } from "./msaa";
 export { BloomPass } from "./bloom";
 export { PostProcessPass } from "./post-process";
+export { GBuffer, GBUFFER_GEOMETRY_WGSL } from "./gbuffer";
+export { DeferredLightingPass } from "./deferred-lighting";
+export { CascadedShadowMap, CSM_CASCADE_COUNT, CSM_WGSL } from "./csm";
+export { GTAOPass, SSAOPass } from "./ssao";
+export { ClusterLighting, CLUSTER_LIGHTING_WGSL } from "./cluster-lighting";

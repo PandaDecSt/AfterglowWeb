@@ -27,6 +27,7 @@ import {
   ACESPipelineDemo,
   HairEyeShadowDemo,
   PMXDemo,
+  DeferredDemo,
 } from "./demos";
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
@@ -59,6 +60,7 @@ const demoFactories: { label: string; create: () => Demo }[] = [
   { label: "Hair/Eye Shadow", create: () => new HairEyeShadowDemo() },
   { label: "Showcase (Full Pipeline)", create: () => new ShowcaseDemo() },
   { label: "PMX Viewer", create: () => new PMXDemo() },
+  { label: "Deferred PBR (Multi-Light+CSM+GTAO)", create: () => new DeferredDemo() },
 ];
 
 async function main() {

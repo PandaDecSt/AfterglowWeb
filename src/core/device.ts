@@ -32,7 +32,10 @@ export class GPUContext {
       requiredLimits: {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxBufferSize: adapter.limits.maxBufferSize,
-      },
+        maxColorAttachmentBytesPerSample: Math.min(128, adapter.limits.maxColorAttachmentBytesPerSample),
+        maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+        maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+      } as any,
     });
 
     ctx.format = navigator.gpu.getPreferredCanvasFormat();

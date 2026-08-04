@@ -228,7 +228,6 @@ export class PostProcessPass {
   private depthSampler!: GPUSampler;
   private paramData = new Float32Array(64);
   private cachedSceneTex: GPUTexture | null = null;
-  private cachedDepthTex: GPUTexture | null = null;
   private cachedSceneView: GPUTextureView | null = null;
   private cachedDepthView: GPUTextureView | null = null;
   private cachedBindGroup: GPUBindGroup | null = null;
@@ -287,14 +286,13 @@ export class PostProcessPass {
     });
   }
 
-  private ensureBindGroup(sceneTexture: GPUTexture, depthTexture: GPUTexture) {
-    if (this.cachedSceneTex === sceneTexture && this.cachedDepthTex === depthTexture && this.cachedBindGroup) {
+  private ensureBindGroup(sceneTexture: GPUTexture, depthView: GPUTextureView) {
+    if (this.cachedSceneTex === sceneTexture && this.cachedDepthView === depthView && this.cachedBindGroup) {
       return;
     }
     this.cachedSceneTex = sceneTexture;
-    this.cachedDepthTex = depthTexture;
+    this.cachedDepthView = depthView;
     this.cachedSceneView = sceneTexture.createView();
-    this.cachedDepthView = depthTexture.createView();
     this.cachedBindGroup = this.device.createBindGroup({
       layout: this.pipeline.getBindGroupLayout(0),
       entries: [
@@ -310,7 +308,7 @@ export class PostProcessPass {
   execute(
     encoder: GPUCommandEncoder,
     sceneTexture: GPUTexture,
-    depthTexture: GPUTexture,
+    depthView: GPUTextureView,
     outputView: GPUTextureView,
     resolution: [number, number],
     time: number
@@ -364,7 +362,7 @@ export class PostProcessPass {
     this.device.queue.writeBuffer(this.paramBuffer, 0, d as unknown as GPUAllowSharedBufferSource);
 
 
-    this.ensureBindGroup(sceneTexture, depthTexture);
+    this.ensureBindGroup(sceneTexture, depthView);
 
     const pass = encoder.beginRenderPass({
       colorAttachments: [

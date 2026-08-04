@@ -329,7 +329,7 @@ export class ShowcaseDemo implements Demo {
         pp.execute(
           encoder,
           bloomRT.texture,
-          depthTarget.texture,
+          depthTarget.texture.createView(),
           screenView,
           [this.ctx.canvas.width, this.ctx.canvas.height],
           performance.now() / 1000
