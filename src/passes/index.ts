@@ -10,3 +10,6 @@ export { DeferredLightingPass } from "./deferred-lighting";
 export { CascadedShadowMap, CSM_CASCADE_COUNT, CSM_WGSL } from "./csm";
 export { GTAOPass, SSAOPass } from "./ssao";
 export { ClusterLighting, CLUSTER_LIGHTING_WGSL } from "./cluster-lighting";
+export { EnvironmentMap, DEFAULT_SKY, ENV_BASE_SIZE, ENV_IRRADIANCE_SIZE, ENV_PREFILTER_SIZE } from "./environment";
+export { BrdfLut, BRDF_LUT_SIZE } from "./brdf-lut";
+export { TAAPass } from "./taa";

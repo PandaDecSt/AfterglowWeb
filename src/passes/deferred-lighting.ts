@@ -15,6 +15,8 @@ export class DeferredLightingPass {
   private cachedHasShadow: boolean | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
 
+  envIntensity = 1.0;
+
   private prevViewProj: Mat4 = mat4.identity(mat4.create());
 
   constructor(device: GPUDevice, lightScene: LightScene, outputFormat: GPUTextureFormat = "rgba16float") {
@@ -74,6 +76,10 @@ export class DeferredLightingPass {
     ubo[41] = this.lightScene.ambientColor[1] * this.lightScene.ambientIntensity;
     ubo[42] = this.lightScene.ambientColor[2] * this.lightScene.ambientIntensity;
     ubo[43] = 0;
+    ubo[44] = this.envIntensity;
+    ubo[45] = 0;
+    ubo[46] = 0;
+    ubo[47] = 0;
 
     this.device.queue.writeBuffer(this.uniformBuffer, 0, ubo as unknown as GPUAllowSharedBufferSource);
 
@@ -91,6 +97,11 @@ export class DeferredLightingPass {
     shadowSampler?: GPUSampler,
     shadowVPBuffer?: GPUBuffer,
     aoView?: GPUTextureView,
+    ibl?: {
+      irradiance: GPUTextureView;
+      prefilter: GPUTextureView;
+      brdfLut: GPUTextureView;
+    },
   ): void {
     const needsShadow = shadowView !== undefined;
     if (!this.pipeline || this.cachedHasShadow !== needsShadow) {
@@ -114,6 +125,15 @@ export class DeferredLightingPass {
         { binding: 7, resource: shadowView },
         { binding: 8, resource: shadowSampler },
         { binding: 9, resource: { buffer: shadowVPBuffer } },
+      );
+    }
+
+    if (ibl) {
+      entries.push(
+        { binding: 11, resource: ibl.irradiance },
+        { binding: 12, resource: ibl.prefilter },
+        { binding: 13, resource: ibl.brdfLut },
+        { binding: 14, resource: this.device.createSampler({ magFilter: "linear", minFilter: "linear", addressModeU: "clamp-to-edge", addressModeV: "clamp-to-edge", mipmapFilter: "linear" }) },
       );
     }
 
@@ -151,6 +171,10 @@ this.bindGroupLayout = this.device.createBindGroupLayout({
         { binding: 5, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 6, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         { binding: 10, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 11, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "cube" } },
+        { binding: 12, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float", viewDimension: "cube" } },
+        { binding: 13, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
+        { binding: 14, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         ...(hasShadow
         ? [
             { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } } as GPUBindGroupLayoutEntry,
@@ -224,6 +248,7 @@ struct Uniforms {
   invViewProj: mat4x4<f32>,
   prevViewProj: mat4x4<f32>,
   ambient: vec4<f32>,
+  envIntensity: vec4<f32>,
 };
 
 struct LightData {
@@ -240,6 +265,10 @@ struct LightData {
 @group(0) @binding(5) var depthTex: texture_2d<f32>;
 @group(0) @binding(6) var pointSampler: sampler;
 @group(0) @binding(10) var aoTex: texture_2d<f32>;
+@group(0) @binding(11) var irradianceTex: texture_cube<f32>;
+@group(0) @binding(12) var prefilterTex: texture_cube<f32>;
+@group(0) @binding(13) var brdfLutTex: texture_2d<f32>;
+@group(0) @binding(14) var envSampler: sampler;
 ${shadowBindings}
 
 @vertex
@@ -273,6 +302,22 @@ fn visibilitySmithJointApprox(a2: f32, nov: f32, nol: f32) -> f32 {
 fn fresnelSchlick(f0: vec3<f32>, voh: f32) -> vec3<f32> {
   let fc = pow(1.0 - voh, 5.0);
   return saturate(50.0 * f0.g) * fc + (1.0 - fc) * f0;
+}
+
+fn brdfLutSample(nv: f32, roughness: f32) -> vec2<f32> {
+  let LUT_SIZE: f32 = 64.0;
+  var uv = vec2<f32>(clamp(roughness, 0.0, 1.0), sqrt(clamp(1.0 - nv, 0.0, 1.0)));
+  uv = uv * ((LUT_SIZE - 1.0) / LUT_SIZE) + 0.5 / LUT_SIZE;
+  return textureSampleLevel(brdfLutTex, envSampler, uv, 0.0).xy;
+}
+
+fn brdfMultiScatter(f0: vec3<f32>, f90: vec3<f32>, lut: vec2<f32>) -> vec3<f32> {
+  let FssEss = lut.y * f90 + lut.x * f0;
+  let Ess = lut.x + lut.y;
+  let Ems = 1.0 - Ess;
+  let Favg = f0 + (1.0 - f0) / 21.0;
+  let Fms = FssEss * Favg / (1.0 - (1.0 - Ess) * Favg);
+  return FssEss + Fms * Ems;
 }
 
 fn cookTorrance(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, f0: vec3<f32>, roughness: f32) -> vec3<f32> {
@@ -367,7 +412,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let worldPos = reconstructWorldPos(uv, depth);
   let V = normalize(u.cameraPos.xyz - worldPos);
 
-  var color = u.ambient.rgb * baseColor * ao;
+  var color = u.ambient.rgb * baseColor * ao * (1.0 - min(u.envIntensity.x, 1.0));
 
   let numLights = i32(lights[0]);
   for (var i = 0; i < numLights; i++) {
@@ -385,6 +430,24 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
     color += evalLight(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, metallic, roughness) * shadowVis;
   }
+
+  // IBL: split-sum integration (irradiance + prefiltered specular, multi-scatter)
+  let NdotV = max(dot(N, V), 0.0);
+  let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
+  let f90 = vec3<f32>(saturate(f0.g * 50.0));
+  let lut = brdfLutSample(NdotV, roughness);
+  let Fms = brdfMultiScatter(f0, f90, lut);
+
+  let kD = (vec3<f32>(1.0) - Fms) * (1.0 - metallic);
+  let irradiance = textureSampleLevel(irradianceTex, envSampler, N, 0.0).rgb;
+  let diffuseIBL = irradiance * baseColor * kD;
+
+  let R = reflect(-V, N);
+  let mip = roughness * f32(textureNumLevels(prefilterTex) - 1u);
+  let prefiltered = textureSampleLevel(prefilterTex, envSampler, R, mip).rgb;
+  let specularIBL = prefiltered * Fms;
+
+  color += (diffuseIBL + specularIBL) * u.envIntensity.x * ao;
 
   color += baseColor * emissive;
 
