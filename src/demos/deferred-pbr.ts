@@ -487,7 +487,7 @@ export class DeferredDemo implements Demo {
     const pp = this.postProcessPass.params;
     const fxFolder = gui.addFolder("Post Process");
     fxFolder.add(pp, "exposure", 0.1, 3, 0.01).name("Exposure");
-    fxFolder.add(pp, "chromaticStrength", 0, 0.02, 0.001).name("Chromatic Aberr.");
+    fxFolder.add(pp, "chromaticStrength", 0, 0.05, 0.001).name("Chromatic Aberr.");
     fxFolder.add(pp, "vignetteStrength", 0, 1, 0.01).name("Vignette");
     fxFolder.add(pp, "saturation", 0, 2, 0.01).name("Saturation");
   }

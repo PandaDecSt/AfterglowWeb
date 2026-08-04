@@ -148,7 +148,7 @@ fn fs_main(in: VSOut) -> @location(0) vec4<f32> {
   // Chromatic aberration
   let dir = uv - 0.5;
   let dist = length(dir);
-  let offset = dir * dist * pp.chromaticStrength;
+  let offset = dir * dist * pp.chromaticStrength * 4.0;
   let r = textureSample(sceneTex, texSampler, uv + offset).r;
   let g = textureSample(sceneTex, texSampler, uv).g;
   let b = textureSample(sceneTex, texSampler, uv - offset).b;
