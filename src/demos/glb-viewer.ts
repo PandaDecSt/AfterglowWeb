@@ -1,14 +1,53 @@
+// GLB Viewer — a *shell* demo, not a renderer.
+//
+// This file used to own a 200-line forward fragment shader with a PBR branch
+// and five hand-rolled toon branches. That was the architectural bug: the look
+// of a character lived inside one viewer, so "switch to realistic" meant
+// editing demo code and nothing else in the project could reuse it.
+//
+// Now the demo does exactly three things:
+//   1. load a GLB and classify each material by name (body / face / hair / ...)
+//   2. let a RenderPreset map each category to a ShadingModelID
+//   3. stamp that id into the GBuffer and hand everything to DeferredLightingPass
+//
+// All shading lives in the kernel (passes/deferred-lighting.ts +
+// core/shading-registry.ts). Swapping "Endfield Default" for "Realistic
+// Character (SSS)" re-skins Scarlet without touching a line of shader code —
+// which is the whole point of the north star: one deferred pipeline, one set of
+// lights, both a photoreal and an anime character in it.
+
 import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo } from "./types";
-import { mat4 } from "wgpu-matrix";
+import { mat4, type Mat4 } from "wgpu-matrix";
 import { loadGLTF, interleaveMesh, type MeshData, type MaterialData } from "../utils/gltf-loader";
 import type { RenderPass } from "../core/renderer";
 import { MaterialInstance, type MaterialBlueprint } from "../core/material-instance";
+import {
+  MaterialCategory, classifyMaterial, RenderPreset, loadPresets, savePresets, PRESET_VERSION,
+} from "../render/render-preset";
+import { GBuffer, GBUFFER_VSOUT_WGSL, makeCharGbufferFS } from "../passes/gbuffer";
+import { DeferredLightingPass } from "../passes/deferred-lighting";
+import { TonemapBlitPass } from "../passes/tonemap-blit";
+import { LightScene, createDirectionalLight, type DirectionalLight } from "../scene/light";
+import { ShadingModel } from "../core/shading-model";
+import {
+  shadingModelOptions, packForModel, TOON_BODY, TOON_EYELASH, UNLIT,
+} from "../core/shading-registry";
 
-// Single source of truth for a GLB material's uniform block.
-// The WGSL `struct MatUniforms` is generated from this blueprint, so the
-// shader's struct and the CPU packing can never drift apart.
+// Single source of truth for a GLB material's uniform block. The WGSL
+// `struct MatUniforms` is generated from this blueprint, so the shader's struct
+// and the CPU packing can never drift apart.
+//
+//   params  = (packR, packG, hasBaseColorTex, lightmapStrength)
+//   params2 = (alphaCutoff, shadingModelId, outlineWidth, hasNormalTex)
+//   params3 = (objectId, _, _, _)
+//
+// packR/packG are whatever the *chosen shading model* wants in GBuffer
+// material.rg (metallic/roughness for STANDARD, sssStrength/roughness for SKIN,
+// rimWidth for the toon variants, ...). That decision is made on the CPU by
+// packForModel(), which is why the GBuffer fragment shader below has zero
+// per-model branching — and therefore no uniform-control-flow hazards.
 const GLB_MAT_BLUEPRINT: MaterialBlueprint = {
   name: "glb",
   group: 1,
@@ -16,116 +55,45 @@ const GLB_MAT_BLUEPRINT: MaterialBlueprint = {
   fields: [
     { name: "baseColorFactor", type: "vec4", value: [1, 1, 1, 1] },
     { name: "params", type: "vec4", value: [0, 0.5, 0, 0] },
-    { name: "params2", type: "vec4", value: [0, 1, 0.015, 0] },
+    { name: "params2", type: "vec4", value: [0, TOON_BODY, 0.015, 0] },
+    { name: "params3", type: "vec4", value: [1, 0, 0, 0] },
   ],
 };
 const GLB_MAT_WGSL = new MaterialInstance(GLB_MAT_BLUEPRINT).generateWGSLStruct();
 
-function buildGLBMaterialInstance(mat: MaterialData, outlineWidth: number, hasNormalTex: number): MaterialInstance {
+function buildGLBMaterialInstance(mat: MaterialData, outlineWidth: number, hasNormalTex: number, objectId: number): MaterialInstance {
   const instance = new MaterialInstance(GLB_MAT_BLUEPRINT);
   const hasBaseColorTex = mat.baseColorImage ? 1 : 0;
   const lightmapStrength = mat.occlusionImage ? mat.occlusionStrength : 0;
+  const [pr, pg] = packForModel(TOON_BODY, mat.metallicFactor, mat.roughnessFactor);
   instance.setField("baseColorFactor", [...mat.baseColorFactor]);
-  instance.setField("params", [mat.metallicFactor, mat.roughnessFactor, hasBaseColorTex, lightmapStrength]);
-  instance.setField("params2", [0.0, 1.0, outlineWidth, hasNormalTex]);
+  instance.setField("params", [pr, pg, hasBaseColorTex, lightmapStrength]);
+  instance.setField("params2", [0.0, TOON_BODY, outlineWidth, hasNormalTex]);
+  instance.setField("params3", [objectId, 0, 0, 0]);
   return instance;
 }
 
-// === Material Classification ===
-type MaterialCategory = "body" | "face" | "hair" | "eye" | "eyelash" | "other";
-
-function classifyMaterial(name: string): MaterialCategory {
-  const n = name.toLowerCase();
-  if (/face|脸|面部/.test(n)) return "face";
-  if (/hair|头发|发/.test(n)) return "hair";
-  if (/eyelash|睫毛/.test(n)) return "eyelash";
-  if (/eye|iris|眼|瞳孔|schlera/.test(n)) return "eye";
-  if (/body|dress|tights|nude|neck|hat|衣|身|裙|帽|颈/.test(n)) return "body";
-  return "other";
-}
-
-// Render modes: 0=PBR, 1=ToonBody, 2=ToonFace, 3=ToonHair, 4=ToonEye, 5=ToonEyelash
-const RENDER_MODE_NAMES = ["PBR", "Toon Body", "Toon Face", "Toon Hair", "Toon Eye", "Toon Eyelash", "Normal View"];
-
-// === Preset System ===
-interface RenderPreset {
-  name: string;
-  mapping: Record<MaterialCategory, number>;
-}
-
-const PRESETS_KEY = "afterglow-glb-presets";
-
-function loadPresets(): RenderPreset[] {
-  try {
-    const raw = localStorage.getItem(PRESETS_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return mergeBuiltinPresets(parsed);
-    }
-  } catch { /* ignore */ }
-  return builtinPresets();
-}
-
-function savePresets(presets: RenderPreset[]) {
-  localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
-}
-
-function defaultPreset(): RenderPreset {
-  return {
-    name: "Endfield Default",
-    mapping: { body: 1, face: 2, hair: 3, eye: 4, eyelash: 5, other: 1 },
-  };
-}
-
-// Built-in rendering-scheme presets. "Endfield Default" is the toon / anime
-// scheme; the rest cover a realistic look and a debug view. mergeBuiltinPresets
-// keeps any user-saved presets (from localStorage) while ensuring these always
-// appear in the dropdown even for returning visitors.
-function builtinPresets(): RenderPreset[] {
-  return [
-    defaultPreset(),
-    // 写实基础（剑星风格的 PBR 底子）：全身走标准 PBR（mode 0），无卡通色阶。
-    { name: "Realistic PBR", mapping: { body: 0, face: 0, hair: 0, eye: 0, eyelash: 0, other: 0 } },
-    // 写实皮肤 + 风格化眼发：身体/脸用 PBR，头发走各向异性高光、眼睛/睫毛走卡通。
-    { name: "Realistic Skin · Stylized Hair", mapping: { body: 0, face: 0, hair: 3, eye: 4, eyelash: 5, other: 0 } },
-    // 法线调试：全部显示世界空间法线（mode 6）。
-    { name: "Normal View (Debug)", mapping: { body: 6, face: 6, hair: 6, eye: 6, eyelash: 6, other: 6 } },
-  ];
-}
-
-function mergeBuiltinPresets(stored: RenderPreset[]): RenderPreset[] {
-  const names = new Set(stored.map(p => p.name));
-  for (const b of builtinPresets()) {
-    if (!names.has(b.name)) stored.push(b);
-  }
-  return stored;
-}
-
 // === Shaders ===
-const modelShaderBody = `
+const FRAME_UNIFORMS_WGSL = `
 struct FrameUniforms {
   viewProj: mat4x4<f32>,
   model: mat4x4<f32>,
   invTransModel: mat4x4<f32>,
+  prevViewProj: mat4x4<f32>,
+  prevModel: mat4x4<f32>,
   cameraPosition: vec4<f32>,
-  lightDir: vec4<f32>,
-  lightColor: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
-@group(1) @binding(0) var<uniform> mat: MatUniforms;
-@group(1) @binding(1) var baseColorTex: texture_2d<f32>;
-@group(1) @binding(2) var lightmapTex: texture_2d<f32>;
-@group(1) @binding(3) var texSampler: sampler;
-@group(1) @binding(4) var normalTex: texture_2d<f32>;
+`;
+/** floats in FrameUniforms: 5 mat4 + 1 vec4 */
+const FRAME_FLOATS = 5 * 16 + 4;
 
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) worldPos: vec3<f32>,
-  @location(1) worldNormal: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-};
-
+// GBuffer vertex stage. Emits the standard VSOut (including the previous-frame
+// clip position) so motion vectors come out for free.
+const gbufferVS = `
+${FRAME_UNIFORMS_WGSL}
+${GBUFFER_VSOUT_WGSL}
 @vertex
 fn vs_main(
   @location(0) pos: vec3<f32>,
@@ -134,43 +102,31 @@ fn vs_main(
 ) -> VSOut {
   var out: VSOut;
   let worldPos = frame.model * vec4<f32>(pos, 1.0);
-  out.position = frame.viewProj * worldPos;
+  let clip = frame.viewProj * worldPos;
+  out.position = clip;
   out.worldPos = worldPos.xyz;
   out.worldNormal = normalize((frame.invTransModel * vec4<f32>(normal, 0.0)).xyz);
   out.uv = uv;
+  let prevClip = frame.prevViewProj * (frame.prevModel * vec4<f32>(pos, 1.0));
+  out.prevClipXY = prevClip.xy;
+  out.prevClipW = prevClip.w;
+  out.curClipXY = clip.xy;
+  out.curClipW = clip.w;
   return out;
 }
+`;
 
-const PI: f32 = 3.14159265359;
+const GBUFFER_FS_DECLARATIONS = `
+@group(1) @binding(0) var<uniform> mat: MatUniforms;
+@group(1) @binding(1) var baseColorTex: texture_2d<f32>;
+@group(1) @binding(2) var lightmapTex: texture_2d<f32>;
+@group(1) @binding(3) var texSampler: sampler;
+@group(1) @binding(4) var normalTex: texture_2d<f32>;
 
-fn distributionGGX(N: vec3<f32>, H: vec3<f32>, roughness: f32) -> f32 {
-  let a2 = roughness * roughness * roughness * roughness;
-  let NdotH = max(dot(N, H), 0.0);
-  let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
-  return a2 / (PI * d * d);
-}
-
-fn geometrySmith(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, roughness: f32) -> f32 {
-  let r = roughness + 1.0;
-  let k = (r * r) / 8.0;
-  let nov = max(dot(N, V), 0.0);
-  let nol = max(dot(N, L), 0.0);
-  return (nov / (nov * (1.0 - k) + k)) * (nol / (nol * (1.0 - k) + k));
-}
-
-fn fresnelSchlick(cosTheta: f32, F0: vec3<f32>) -> vec3<f32> {
-  return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
-}
-
-fn acesTonemap(x: vec3<f32>) -> vec3<f32> {
-  let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
-  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-// Rebuild a tangent frame from screen-space derivatives (Mikkelsen /
-// Schüler "bump mapping unparametrized surfaces" technique). Lets us apply a
-// tangent-space normal map without per-vertex tangent attributes, which GLB
-// models rarely carry. Must be called in uniform control flow.
+// Rebuild a tangent frame from screen-space derivatives (Mikkelsen / Schüler
+// "bump mapping unparametrized surfaces"). Lets us apply a tangent-space normal
+// map without per-vertex tangents, which GLB characters rarely carry.
+// MUST be called in uniform control flow.
 fn cotangentFrame(N: vec3<f32>, p: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
   let dp1 = dpdx(p);
   let dp2 = dpdy(p);
@@ -183,211 +139,106 @@ fn cotangentFrame(N: vec3<f32>, p: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
   let invmax = inverseSqrt(max(dot(T, T), dot(B, B)));
   return mat3x3<f32>(T * invmax, B * invmax, N);
 }
-
-fn endfieldRimLighting(nov: f32, vol: f32, nol: f32, width: f32) -> f32 {
-  let rimStepMin = clamp(0.9 - width, 0.0, 0.99);
-  let rimStepMax = clamp(1.0 - width, 0.01, 1.0);
-  var rim = smoothstep(rimStepMin, rimStepMax, 1.0 - nov);
-  rim *= max(vol, 0.0) * max(nol + 0.5, 0.0) * 2.0;
-  return rim;
-}
-
-@fragment
-fn fs_main(in: VSOut, @builtin(front_facing) isFront: bool) -> @location(0) vec4<f32> {
-  var N = normalize(in.worldNormal);
-  if (!isFront) { N = -N; }
-  // Normal mapping. Geometry normals are baked in world space; the GLB normal
-  // map is tangent-space, so we rebuild the tangent frame from screen-space
-  // derivatives. BOTH textureSample and dpdx/dpdy MUST stay in UNIFORM control
-  // flow, so we sample + build the frame UNCONDITIONALLY and only blend the
-  // perturbed normal in when a normal map is present (params2.w > 0.5).
-  let nTex = textureSample(normalTex, texSampler, in.uv).xyz * 2.0 - vec3<f32>(1.0);
-  let TBN = cotangentFrame(N, in.worldPos, in.uv);
-  let mappedN = normalize(TBN * nTex);
-  N = normalize(mix(N, mappedN, select(0.0, 1.0, mat.params2.w > 0.5)));
-  let V = normalize(frame.cameraPosition.xyz - in.worldPos);
-  let L = normalize(-frame.lightDir.xyz);
-  let H = normalize(V + L);
-
-  var baseColor: vec3<f32>;
-  var texAlpha = 1.0;
-  if (mat.params.z > 0.5) {
-    let texColor = textureSample(baseColorTex, texSampler, in.uv);
-    baseColor = texColor.rgb * mat.baseColorFactor.rgb;
-    texAlpha = texColor.a * mat.baseColorFactor.a;
-  } else {
-    baseColor = mat.baseColorFactor.rgb;
-  }
-
-  if (mat.params2.x > 0.001 && texAlpha < mat.params2.x) {
-    discard;
-  }
-
-  let lightmapStrength = mat.params.w;
-  var lightmap = vec3<f32>(1.0);
-  if (lightmapStrength > 0.001) {
-    let lm = textureSample(lightmapTex, texSampler, in.uv);
-    lightmap = mix(vec3<f32>(1.0), lm.rgb, lightmapStrength);
-  }
-
-  let NdotL = dot(N, L);
-  let nov = dot(N, V);
-  let vol = dot(-V, L);
-  let nol = NdotL;
-  var color: vec3<f32>;
-  let mode = i32(mat.params2.y + 0.5);
-
-  if (mode == 0) {
-    // === PBR ===
-    let metallic = mat.params.x;
-    let roughness = max(mat.params.y, 0.04);
-    let F0 = mix(vec3<f32>(0.04), baseColor, metallic);
-    let NDF = distributionGGX(N, H, roughness);
-    let G = geometrySmith(N, V, L, roughness);
-    let F = fresnelSchlick(max(dot(H, V), 0.0), F0);
-    let spec = (NDF * G * F) / (4.0 * max(nov, 0.0) * max(NdotL, 0.0) + 0.0001);
-    let kD = (vec3<f32>(1.0) - F) * (1.0 - metallic);
-    let Lo = (kD * baseColor / PI + spec) * frame.lightColor.rgb * max(NdotL, 0.0);
-    let hemi = mix(vec3<f32>(0.2, 0.15, 0.1), vec3<f32>(0.5, 0.6, 0.8), N.y * 0.5 + 0.5);
-    let ambient = hemi * baseColor * 0.35 * lightmap;
-    color = acesTonemap((ambient + Lo) * lightmap * 1.3);
-    color = pow(color, vec3<f32>(1.0 / 2.2));
-
-  } else if (mode == 1) {
-    // === Toon Body (Endfield-style) ===
-    // viewAttenuation: darken at grazing angles for volume feel
-    // clamp viewFactor to 0.6 min to prevent washout on inconsistent normals
-    let viewAttenuation = 0.5;
-    var radiance = max(NdotL, 0.0);
-    let viewFactor = max(mix(1.0, max(nov, 0.0), viewAttenuation), 0.6);
-    radiance *= viewFactor;
-    let fadedSSS = 0.4 * (0.5 + viewFactor * 0.5);
-
-    let rampOffset = 0.2;
-    let rampCoord = clamp((1.0 - rampOffset) - radiance * (0.5 - rampOffset * 0.5), 0.1, 0.9);
-    let rampWarm = vec3<f32>(1.0, 0.6, 0.4);
-    let rampCool = vec3<f32>(0.7, 0.75, 0.9);
-    let rampColor = mix(rampCool, rampWarm, smoothstep(0.3, 0.7, rampCoord));
-    let rampAlpha = smoothstep(0.2, 0.8, rampCoord) * 0.6;
-
-    let finalToon = baseColor * (radiance + (rampColor * rampAlpha) * min(vec3<f32>(fadedSSS), baseColor));
-    let rim = endfieldRimLighting(nov, vol, nol, 0.12);
-    color = (finalToon * lightmap + rim * baseColor * 0.25) * frame.lightColor.rgb * frame.lightColor.w * 0.5;
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-
-  } else if (mode == 2) {
-    // === Toon Face (hard shadow, SDF-like) ===
-    // Simulate SDF face shadow: hard boundary based on light angle
-    let faceRadiance = smoothstep(0.0, 0.1, NdotL);
-    let viewFactor = mix(1.0, max(nov, 0.0), 0.3);
-    let finalFace = baseColor * (0.3 + faceRadiance * 0.7) * viewFactor;
-
-    // Subtle warm shadow tint
-    let shadowTint = baseColor * vec3<f32>(0.9, 0.7, 0.65);
-    let faceResult = mix(shadowTint * 0.5, finalFace, faceRadiance);
-
-    let rim = endfieldRimLighting(nov, vol, nol, 0.08);
-    color = (faceResult * lightmap + rim * 0.2) * frame.lightColor.rgb * frame.lightColor.w * 0.5;
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-
-  } else if (mode == 3) {
-    // === Toon Hair (anisotropic-like specular) ===
-    let radiance = max(NdotL, 0.0);
-    let viewFactor = mix(1.0, max(nov, 0.0), 0.4);
-
-    // Anisotropic-like: use shifted half vector along tangent approximation
-    // Approximate tangent from UV gradient (use worldNormal cross up)
-    let up = vec3<f32>(0.0, 1.0, 0.0);
-    let tangent = normalize(cross(up, N) + vec3<f32>(1e-6));
-    let TdotH = dot(tangent, H);
-    let anisoSpec = pow(sqrt(max(1.0 - TdotH * TdotH, 0.0)), 16.0);
-    let specSolid = smoothstep(0.3, 0.5, anisoSpec) * 0.6;
-
-    // Hard diffuse
-    let hairDiffuse = smoothstep(0.0, 0.15, radiance);
-    let hairColor = baseColor * (0.25 + hairDiffuse * 0.75) * viewFactor;
-
-    let rim = endfieldRimLighting(nov, vol, nol, 0.1);
-    color = (hairColor * lightmap + specSolid * frame.lightColor.rgb + rim * 0.25) * frame.lightColor.rgb * frame.lightColor.w * 0.5;
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-
-  } else if (mode == 4) {
-    // === Toon Eye/Iris ===
-    // Simple: high contrast, sharp specular, dark
-    let eyeDiffuse = smoothstep(0.0, 0.05, NdotL);
-    let eyeColor = baseColor * (0.4 + eyeDiffuse * 0.6);
-
-    // Sharp specular highlight
-    let NdotH = max(dot(N, H), 0.0);
-    let eyeSpec = smoothstep(0.85, 0.9, NdotH) * 0.8;
-
-    color = (eyeColor * lightmap + eyeSpec * frame.lightColor.rgb) * frame.lightColor.rgb * frame.lightColor.w * 0.5;
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-
-  } else if (mode == 5) {
-    // === Toon Eyelash ===
-    // Minimal shading, mostly flat with slight NdotL
-    let lashDiffuse = 0.5 + max(NdotL, 0.0) * 0.5;
-    color = baseColor * lashDiffuse * lightmap * frame.lightColor.rgb * frame.lightColor.w * 0.5;
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
-
-  } else {
-    // === Normal View (debug) ===
-    color = N * 0.5 + 0.5;
-  }
-
-  return vec4<f32>(color, 1.0);
-}
 `;
 
-const modelShader = GLB_MAT_WGSL + "\n" + modelShaderBody;
+// Everything look-specific is a WGSL *expression* handed to the shared factory,
+// so this stays a dumb GBuffer writer. Texture sampling and dpdx/dpdy live in
+// the prelude, which the factory injects at the very top of fs_main — i.e. in
+// UNIFORM control flow. Putting them behind `if (mat.params.z > 0.5)` is what
+// used to make Tint reject the whole pipeline.
+const GBUFFER_FS_PRELUDE = `
+  let baseTex = textureSample(baseColorTex, texSampler, in.uv);
+  let normTex = textureSample(normalTex, texSampler, in.uv);
+  let lightTex = textureSample(lightmapTex, texSampler, in.uv);
 
-const outlineShaderBody = `
-struct FrameUniforms {
-  viewProj: mat4x4<f32>,
-  model: mat4x4<f32>,
-  invTransModel: mat4x4<f32>,
-  cameraPosition: vec4<f32>,
-  lightDir: vec4<f32>,
-  lightColor: vec4<f32>,
-};
+  let geoN = normalize(in.worldNormal);
+  let TBN = cotangentFrame(geoN, in.worldPos, in.uv);
+  let mappedN = normalize(TBN * (normTex.xyz * 2.0 - vec3<f32>(1.0)));
+  // No normal map -> blend factor 0, so the sampled value is discarded rather
+  // than skipped. Same result, but the sample stays unconditional.
+  let shadedN = normalize(mix(geoN, mappedN, select(0.0, 1.0, mat.params2.w > 0.5)));
 
-@group(0) @binding(0) var<uniform> frame: FrameUniforms;
+  let useTex = select(0.0, 1.0, mat.params.z > 0.5);
+  let texAlpha = mix(1.0, baseTex.a, useTex) * mat.baseColorFactor.a;
+  let cutoff = mat.params2.x;
+  if (cutoff > 0.001 && texAlpha < cutoff) { discard; }
+
+  // This asset ships a baked lightmap in the glTF occlusion slot, so it
+  // modulates albedo directly (matching the old forward look). A true AO map
+  // would instead go to albedo.a, which the lighting pass applies to
+  // ambient/IBL only.
+  let lightmap = mix(vec3<f32>(1.0), lightTex.rgb, clamp(mat.params.w, 0.0, 1.0));
+  let albedoRGB = mix(mat.baseColorFactor.rgb, baseTex.rgb * mat.baseColorFactor.rgb, useTex) * lightmap;
+`;
+
+const gbufferFS = GLB_MAT_WGSL + "\n" + makeCharGbufferFS({
+  declarations: GBUFFER_FS_DECLARATIONS,
+  preludeStmts: GBUFFER_FS_PRELUDE,
+  albedoExpr: "albedoRGB",
+  normalExpr: "shadedN",
+  aoExpr: "1.0",
+  packExpr: "vec3<f32>(mat.params.x, mat.params.y, 0.0)",
+  // The one line that makes the whole preset system work: the shading model is
+  // data, uploaded per material, not a shader variant.
+  idExpr: "mat.params2.y",
+  objectIdExpr: "mat.params3.x",
+});
+
+// Outline = inverted-hull shell written into the GBuffer as an UNLIT surface.
+// Doing it here rather than as a separate forward pass means the outline gets
+// correct depth against the character for free and the lighting pass composites
+// it in one go.
+const outlineVS = `
+${GLB_MAT_WGSL}
+${FRAME_UNIFORMS_WGSL}
 @group(1) @binding(0) var<uniform> mat: MatUniforms;
+${GBUFFER_VSOUT_WGSL}
+
+fn expandOutline(pos: vec3<f32>, normal: vec3<f32>, model: mat4x4<f32>, invTransModel: mat4x4<f32>) -> vec4<f32> {
+  let outlineWidth = mat.params2.z;
+  let worldPos = (model * vec4<f32>(pos, 1.0)).xyz;
+  let worldNormal = normalize((invTransModel * vec4<f32>(normal, 0.0)).xyz);
+  // Endfield-style: expand along a view/normal blend, scaled by distance so the
+  // outline keeps a constant screen-space width.
+  let camToVert = worldPos - frame.cameraPosition.xyz;
+  let dist = length(camToVert);
+  let viewDir = camToVert / max(dist, 0.001);
+  let expandDir = normalize(viewDir * 0.5 + worldNormal * 0.5);
+  return vec4<f32>(worldPos + expandDir * outlineWidth * (dist * 0.04), 1.0);
+}
 
 @vertex
 fn vs_main(
   @location(0) pos: vec3<f32>,
   @location(1) normal: vec3<f32>,
   @location(2) uv: vec2<f32>,
-) -> @builtin(position) vec4<f32> {
-  let outlineWidth = mat.params2.z;
-  let worldPos = (frame.model * vec4<f32>(pos, 1.0)).xyz;
-  let worldNormal = normalize((frame.invTransModel * vec4<f32>(normal, 0.0)).xyz);
-
-  // Endfield-style outline: expand along view dir + normal, scaled by distance
-  // This ensures constant screen-space width regardless of viewing angle
-  let camToVert = worldPos - frame.cameraPosition.xyz;
-  let dist = length(camToVert);
-  let viewDir = camToVert / max(dist, 0.001);
-
-  // Distance-based scaling: farther = wider expansion to maintain screen-space size
-  let distScale = dist * 0.04;
-
-  // Mix view direction and normal expansion (0.5/0.5 blend)
-  let expandDir = normalize(viewDir * 0.5 + worldNormal * 0.5);
-  let expandedWorldPos = worldPos + expandDir * outlineWidth * distScale;
-
-  return frame.viewProj * vec4<f32>(expandedWorldPos, 1.0);
-}
-
-@fragment
-fn fs_main() -> @location(0) vec4<f32> {
-  return vec4<f32>(0.02, 0.02, 0.02, 1.0);
+) -> VSOut {
+  var out: VSOut;
+  let expanded = expandOutline(pos, normal, frame.model, frame.invTransModel);
+  let clip = frame.viewProj * expanded;
+  out.position = clip;
+  out.worldPos = expanded.xyz;
+  out.worldNormal = normalize((frame.invTransModel * vec4<f32>(normal, 0.0)).xyz);
+  out.uv = uv;
+  let prevExpanded = expandOutline(pos, normal, frame.prevModel, frame.invTransModel);
+  let prevClip = frame.prevViewProj * prevExpanded;
+  out.prevClipXY = prevClip.xy;
+  out.prevClipW = prevClip.w;
+  out.curClipXY = clip.xy;
+  out.curClipW = clip.w;
+  return out;
 }
 `;
 
-const outlineShader = GLB_MAT_WGSL + "\n" + outlineShaderBody;
+// Near-black in LINEAR space. The old forward shader wrote 0.02 straight to the
+// swapchain after its own gamma pass; now the shared tonemap applies gamma once
+// at the end, so the linear value has to be much smaller to read as black.
+const outlineFS = makeCharGbufferFS({
+  albedoExpr: "vec3<f32>(0.002, 0.002, 0.0024)",
+  packExpr: "vec3<f32>(0.0, 0.0, 0.0)",
+  idExpr: `${UNLIT}.0`,
+  objectIdExpr: "0.0",
+});
 
 // === Main Demo Class ===
 interface MeshBuffers {
@@ -407,6 +258,7 @@ interface MaterialResources {
   materialInstance: MaterialInstance;
   name: string;
   category: MaterialCategory;
+  objectId: number;
   baseColorFactor: [number, number, number, number];
   metallic: number;
   roughness: number;
@@ -416,8 +268,14 @@ interface MaterialResources {
   hasNormalTex: number;
   previewImage: ImageBitmap | null;
   alphaCutoff: number;
-  renderMode: number;
+  /** ShadingModelID — see core/shading-registry. Chosen by the active preset. */
+  shadingModelId: number;
   outlineWidth: number;
+}
+
+/** Models whose BxDF bakes its own shadow floor and wants flat, unmuddied colors. */
+function isToonModel(id: number): boolean {
+  return id === ShadingModel.TOON || (id >= TOON_BODY && id <= TOON_EYELASH);
 }
 
 export class GLBViewerDemo implements Demo {
@@ -427,14 +285,12 @@ export class GLBViewerDemo implements Demo {
   private ctx!: GPUContext;
   private camera!: Camera;
   private format!: GPUTextureFormat;
-  private pipeline!: GPURenderPipeline;
+  private gbufferPipeline!: GPURenderPipeline;
   private outlinePipeline!: GPURenderPipeline;
   private frameUbo!: GPUBuffer;
   private meshBuffers: MeshBuffers[] = [];
   private materialResources: MaterialResources[] = [];
-  private depthTexture: GPUTexture | null = null;
-  private cachedDepthView: GPUTextureView | null = null;
-  private frameData = new Float32Array(60);
+  private frameData = new Float32Array(FRAME_FLOATS);
   private loaded = false;
   private totalTriangles = 0;
   private modelName = "";
@@ -443,9 +299,21 @@ export class GLBViewerDemo implements Demo {
   private frameBindGroup!: GPUBindGroup;
   private presets: RenderPreset[] = [];
 
+  // --- Deferred kernel ---
+  private gbuffer!: GBuffer;
+  private lightScene!: LightScene;
+  private keyLight!: DirectionalLight;
+  private deferredLighting!: DeferredLightingPass;
+  private tonemap!: TonemapBlitPass;
+  private hdrTexture: GPUTexture | null = null;
+  private hdrView: GPUTextureView | null = null;
+  private prevViewProj: Mat4 = mat4.identity(mat4.create());
+  private prevModel: Mat4 = mat4.identity(mat4.create());
+
   rotationSpeed = 0.3;
   showOutline = true;
   globalOutlineWidth = 0.015;
+  private activePresetName = "";
 
   async init(ctx: GPUContext, camera: Camera) {
     this.device = ctx.device;
@@ -475,9 +343,25 @@ export class GLBViewerDemo implements Demo {
 
     this.frameUbo = this.device.createBuffer({
       label: "glb-frame-ubo",
-      size: 240,
+      size: FRAME_FLOATS * 4,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
+
+    // --- Deferred kernel wiring -------------------------------------------
+    this.gbuffer = new GBuffer(this.device);
+    this.lightScene = new LightScene();
+    this.keyLight = createDirectionalLight([-0.5, -1.0, -0.3], [1, 1, 1], 1.0);
+    this.keyLight.castShadow = false;
+    this.lightScene.addLight(this.keyLight);
+    // A soft sky fill so the realistic presets are not lit by the key light
+    // alone (this demo has no environment probe yet).
+    this.lightScene.ambientColor = [0.35, 0.38, 0.45];
+    this.lightScene.ambientIntensity = 0.5;
+    this.deferredLighting = new DeferredLightingPass(this.device, this.lightScene, "rgba16float");
+    // No IBL cubemap here, so tell the pass not to reserve headroom for one —
+    // otherwise ambient gets scaled to zero and STANDARD surfaces go black.
+    this.deferredLighting.envIntensity = 0.0;
+    this.tonemap = new TonemapBlitPass(this.device, this.format);
 
     const vertexLayout: GPUVertexBufferLayout = {
       arrayStride: 8 * 4,
@@ -488,12 +372,14 @@ export class GLBViewerDemo implements Demo {
       ],
     };
 
-    const module = this.device.createShaderModule({ code: modelShader });
-    const outlineModule = this.device.createShaderModule({ code: outlineShader });
+    const vsModule = this.device.createShaderModule({ label: "glb-gbuffer-vs", code: gbufferVS });
+    const fsModule = this.device.createShaderModule({ label: "glb-gbuffer-fs", code: gbufferFS });
+    const outlineVsModule = this.device.createShaderModule({ label: "glb-outline-vs", code: outlineVS });
+    const outlineFsModule = this.device.createShaderModule({ label: "glb-outline-fs", code: outlineFS });
 
     const frameBGL = this.device.createBindGroupLayout({
       entries: [
-        { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
+        { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } },
       ],
     });
     const matBGL = this.device.createBindGroupLayout({
@@ -507,23 +393,30 @@ export class GLBViewerDemo implements Demo {
     });
 
     const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [frameBGL, matBGL] });
+    const gbufferTargets: GPUColorTargetState[] = [
+      { format: GBuffer.ALBEDO_FORMAT },
+      { format: GBuffer.NORMAL_FORMAT },
+      { format: GBuffer.MATERIAL_FORMAT },
+      { format: GBuffer.MOTION_FORMAT },
+      { format: GBuffer.DEPTH_COPY_FORMAT },
+    ];
 
-    this.pipeline = this.device.createRenderPipeline({
-      label: "glb-render",
+    this.gbufferPipeline = this.device.createRenderPipeline({
+      label: "glb-gbuffer",
       layout: pipelineLayout,
-      vertex: { module, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module, entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: fsModule, entryPoint: "fs_main", targets: gbufferTargets },
       primitive: { topology: "triangle-list", cullMode: "none" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+      depthStencil: { format: GBuffer.DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less" },
     });
 
     this.outlinePipeline = this.device.createRenderPipeline({
       label: "glb-outline",
       layout: pipelineLayout,
-      vertex: { module: outlineModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module: outlineModule, entryPoint: "fs_main", targets: [{ format: this.format }] },
+      vertex: { module: outlineVsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: outlineFsModule, entryPoint: "fs_main", targets: gbufferTargets },
       primitive: { topology: "triangle-list", cullMode: "front" },
-      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less", depthBias: 5 },
+      depthStencil: { format: GBuffer.DEPTH_FORMAT, depthWriteEnabled: true, depthCompare: "less", depthBias: 5 },
     });
 
     this.frameBindGroup = this.device.createBindGroup({
@@ -562,7 +455,6 @@ export class GLBViewerDemo implements Demo {
         this.uploadMesh(mesh);
       }
 
-      // Apply default preset
       this.applyPreset(this.presets[0]);
 
       this.loaded = true;
@@ -585,9 +477,11 @@ export class GLBViewerDemo implements Demo {
     const hasNormalTex = matData.normalImage ? 1 : 0;
 
     const category = classifyMaterial(matData.name);
+    // normal.w object id — 0 is reserved for the outline shell / background.
+    const objectId = this.materialResources.length + 1;
 
     // MaterialInstance owns the uniform buffer + packing + upload.
-    const materialInstance = buildGLBMaterialInstance(matData, this.globalOutlineWidth, hasNormalTex);
+    const materialInstance = buildGLBMaterialInstance(matData, this.globalOutlineWidth, hasNormalTex, objectId);
     materialInstance.upload(this.device);
 
     const bindGroup = this.device.createBindGroup({
@@ -606,6 +500,7 @@ export class GLBViewerDemo implements Demo {
       materialInstance,
       name: matData.name,
       category,
+      objectId,
       baseColorFactor: matData.baseColorFactor,
       metallic: matData.metallicFactor,
       roughness: matData.roughnessFactor,
@@ -615,7 +510,7 @@ export class GLBViewerDemo implements Demo {
       hasNormalTex,
       previewImage: matData.baseColorImage ?? null,
       alphaCutoff: 0.0,
-      renderMode: 1,
+      shadingModelId: TOON_BODY,
       outlineWidth: this.globalOutlineWidth,
     });
   }
@@ -718,17 +613,20 @@ export class GLBViewerDemo implements Demo {
     console.log(`[GLBViewer] Recalculated normals for "${mb.name}" (${vertexCount} verts)`);
   }
 
-  private ensureDepth() {
+  private ensureTargets() {
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    if (this.depthTexture && this.depthTexture.width === w && this.depthTexture.height === h) return;
-    this.depthTexture?.destroy();
-    this.depthTexture = this.device.createTexture({
+    if (w === 0 || h === 0) return;
+    this.gbuffer.resize(w, h);
+    if (this.hdrTexture && this.hdrTexture.width === w && this.hdrTexture.height === h) return;
+    this.hdrTexture?.destroy();
+    this.hdrTexture = this.device.createTexture({
+      label: "glb-hdr",
       size: [w, h],
-      format: "depth24plus",
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+      format: "rgba16float",
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
-    this.cachedDepthView = this.depthTexture.createView();
+    this.hdrView = this.hdrTexture.createView();
   }
 
   update(time: number) {
@@ -736,19 +634,37 @@ export class GLBViewerDemo implements Demo {
 
     const w = this.ctx.canvas.width;
     const h = this.ctx.canvas.height;
-    const viewProj = this.camera.getViewProjectionMatrix(w / h);
+    // camera.getViewProjectionMatrix() hands back a scratch matrix, so snapshot
+    // it before anything (including the lighting pass) stores a reference.
+    const viewProj = mat4.copy(this.camera.getViewProjectionMatrix(w / h));
     const model = mat4.rotationY(time * this.rotationSpeed);
     const invTrans = mat4.transpose(mat4.inverse(model));
+    const invViewProj = mat4.inverse(viewProj);
 
     const d = this.frameData;
     d.set(viewProj as unknown as ArrayLike<number>, 0);
     d.set(model as unknown as ArrayLike<number>, 16);
     d.set(invTrans as unknown as ArrayLike<number>, 32);
-    d[48] = this.camera.position[0]; d[49] = this.camera.position[1]; d[50] = this.camera.position[2]; d[51] = 1;
-    d[52] = -0.5; d[53] = -1.0; d[54] = -0.3; d[55] = 0;
-    d[56] = 1.0; d[57] = 1.0; d[58] = 1.0; d[59] = 2.0;
-
+    d.set(this.prevViewProj as unknown as ArrayLike<number>, 48);
+    d.set(this.prevModel as unknown as ArrayLike<number>, 64);
+    d[80] = this.camera.position[0];
+    d[81] = this.camera.position[1];
+    d[82] = this.camera.position[2];
+    d[83] = 1;
     this.device.queue.writeBuffer(this.frameUbo, 0, d as unknown as GPUAllowSharedBufferSource);
+
+    this.deferredLighting.update(
+      viewProj,
+      [this.camera.position[0], this.camera.position[1], this.camera.position[2]],
+      invViewProj,
+      w,
+      h,
+      this.camera.near,
+      this.camera.far,
+    );
+
+    this.prevViewProj = viewProj;
+    this.prevModel = model;
   }
 
   createPasses(): RenderPass[] {
@@ -756,27 +672,17 @@ export class GLBViewerDemo implements Demo {
       label: this.label,
       execute: (encoder: GPUCommandEncoder, view: GPUTextureView) => {
         if (!this.loaded || this.meshBuffers.length === 0) return;
-        this.ensureDepth();
+        this.ensureTargets();
+        if (!this.hdrView) return;
 
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [{
-            view,
-            clearValue: { r: 0.08, g: 0.08, b: 0.12, a: 1 },
-            loadOp: "clear",
-            storeOp: "store",
-          }],
-          depthStencilAttachment: {
-            view: this.cachedDepthView!,
-            depthClearValue: 1.0,
-            depthLoadOp: "clear",
-            depthStoreOp: "store",
-          },
-        });
+        // --- 1. Geometry -> GBuffer -----------------------------------------
+        const pass = this.gbuffer.beginGBufferPass(encoder);
+        pass.setBindGroup(0, this.frameBindGroup);
 
-        // Outline pass (backface expansion, rendered first)
+        // Outline shell first: it is written as an UNLIT surface, so depth sorts
+        // it behind the character automatically.
         if (this.showOutline) {
           pass.setPipeline(this.outlinePipeline);
-          pass.setBindGroup(0, this.frameBindGroup);
           for (const mb of this.meshBuffers) {
             if (!mb.visible) continue;
             const matRes = this.materialResources[Math.min(mb.materialIndex, this.materialResources.length - 1)];
@@ -788,9 +694,7 @@ export class GLBViewerDemo implements Demo {
           }
         }
 
-        // Main pass
-        pass.setPipeline(this.pipeline);
-        pass.setBindGroup(0, this.frameBindGroup);
+        pass.setPipeline(this.gbufferPipeline);
         for (const mb of this.meshBuffers) {
           if (!mb.visible) continue;
           const matRes = this.materialResources[Math.min(mb.materialIndex, this.materialResources.length - 1)];
@@ -799,25 +703,45 @@ export class GLBViewerDemo implements Demo {
           pass.setIndexBuffer(mb.indexBuffer, mb.use32bit ? "uint32" : "uint16");
           pass.drawIndexed(mb.indexCount);
         }
-
         pass.end();
+
+        // --- 2. One deferred pass shades every model in the GBuffer ---------
+        this.deferredLighting.execute(encoder, this.gbuffer, this.hdrView);
+
+        // --- 3. HDR -> swapchain --------------------------------------------
+        this.tonemap.execute(encoder, this.hdrView, view);
       },
     }];
   }
 
   // === Preset System ===
+  // A preset is the rendering scheme: it decides the shading model per material
+  // category *and* the exposure/key-light regime those models were authored
+  // for. Applying one is the only way the demo changes how anything looks.
   applyPreset(preset: RenderPreset) {
+    if (!preset) return;
     for (const matRes of this.materialResources) {
-      const mode = preset.mapping[matRes.category] ?? preset.mapping.other ?? 1;
-      matRes.renderMode = mode;
+      matRes.shadingModelId = preset.mapping[matRes.category] ?? preset.mapping.other ?? TOON_BODY;
       this.updateMatUbo(matRes);
     }
+    this.activePresetName = preset.name;
+
+    // Toon looks are authored at a key-light intensity of ~1 and get muddied by
+    // the ACES curve; PBR wants a brighter key and the filmic rolloff.
+    const toonHeavy = this.materialResources.length > 0
+      && this.materialResources.every(m => isToonModel(m.shadingModelId));
+    this.keyLight.intensity = toonHeavy ? 1.0 : 3.0;
+    this.tonemap.mode = toonHeavy ? 1 : 0;
   }
 
   private updateMatUbo(matRes: MaterialResources) {
+    // packForModel decides what material.rg means for the chosen model, so the
+    // GBuffer shader never has to know.
+    const [pr, pg] = packForModel(matRes.shadingModelId, matRes.metallic, matRes.roughness);
     matRes.materialInstance.setField("baseColorFactor", [...matRes.baseColorFactor]);
-    matRes.materialInstance.setField("params", [matRes.metallic, matRes.roughness, matRes.hasBaseColorTex, matRes.lightmapStrength]);
-    matRes.materialInstance.setField("params2", [matRes.alphaCutoff, matRes.renderMode, matRes.outlineWidth, matRes.hasNormalTex]);
+    matRes.materialInstance.setField("params", [pr, pg, matRes.hasBaseColorTex, matRes.lightmapStrength]);
+    matRes.materialInstance.setField("params2", [matRes.alphaCutoff, matRes.shadingModelId, matRes.outlineWidth, matRes.hasNormalTex]);
+    matRes.materialInstance.setField("params3", [matRes.objectId, 0, 0, 0]);
     matRes.materialInstance.upload(this.device);
   }
 
@@ -855,12 +779,14 @@ export class GLBViewerDemo implements Demo {
 
   stats() {
     return {
-      drawCalls: this.meshBuffers.length * (this.showOutline ? 2 : 1),
+      drawCalls: this.meshBuffers.length * (this.showOutline ? 2 : 1) + 2,
       triangles: this.totalTriangles,
       custom: {
         "Model": this.modelName || "Loading...",
         "Meshes": this.meshBuffers.length,
         "Materials": this.materialResources.length,
+        "Pipeline": "Deferred",
+        "Preset": this.activePresetName || "-",
         "Outline": this.showOutline ? "On" : "Off",
       },
     };
@@ -868,13 +794,22 @@ export class GLBViewerDemo implements Demo {
 
   registerGUI(gui: any) {
     gui.add(this, "rotationSpeed", 0, 2, 0.05).name("Rotation Speed");
-    gui.add(this, "showOutline").name("Show Outline").onChange(() => {});
+    gui.add(this, "showOutline").name("Show Outline");
     gui.add(this, "globalOutlineWidth", 0, 0.05, 0.001).name("Outline Width").onChange((v: number) => {
       for (const matRes of this.materialResources) {
         matRes.outlineWidth = v;
         this.updateMatUbo(matRes);
       }
     });
+
+    // === Lighting / Tonemap (kernel-level, shared by every shading model) ===
+    const lightFolder = gui.addFolder("Lighting");
+    lightFolder.add(this.keyLight, "intensity", 0, 8, 0.05).name("Key Intensity");
+    lightFolder.add({ ambient: this.lightScene.ambientIntensity }, "ambient", 0, 2, 0.01)
+      .name("Ambient")
+      .onChange((v: number) => { this.lightScene.ambientIntensity = v; });
+    lightFolder.add(this.tonemap, "exposure", 0.1, 4, 0.05).name("Exposure");
+    lightFolder.add(this.tonemap, "mode", { "ACES Filmic": 0, "Clamp (toon-safe)": 1 }).name("Tonemap");
 
     // === Preset System ===
     const presetFolder = gui.addFolder("Presets");
@@ -887,10 +822,14 @@ export class GLBViewerDemo implements Demo {
       save: () => {
         const mapping: Record<string, number> = {};
         for (const matRes of this.materialResources) {
-          mapping[matRes.category] = matRes.renderMode;
+          mapping[matRes.category] = matRes.shadingModelId;
         }
         const name = prompt("Preset name:", "My Preset") ?? "My Preset";
-        const preset: RenderPreset = { name, mapping: mapping as Record<MaterialCategory, number> };
+        const preset: RenderPreset = {
+          name,
+          version: PRESET_VERSION,
+          mapping: mapping as Record<MaterialCategory, number>,
+        };
         this.presets.push(preset);
         savePresets(this.presets);
         presetCtrl.current = name;
@@ -935,6 +874,7 @@ export class GLBViewerDemo implements Demo {
     });
 
     // === Per-Material Controls ===
+    const modelOptions = shadingModelOptions();
     const matFolder = gui.addFolder("Materials");
     this.materialResources.forEach((matRes, i) => {
       const f = matFolder.addFolder(`${i}: ${matRes.name} [${matRes.category}]`);
@@ -953,14 +893,16 @@ export class GLBViewerDemo implements Demo {
       }
 
       const ctrl = {
-        renderMode: RENDER_MODE_NAMES[matRes.renderMode] ?? "PBR",
+        shadingModelId: matRes.shadingModelId,
         metallic: matRes.metallic,
         roughness: matRes.roughness,
         alphaCutoff: matRes.alphaCutoff,
         outlineWidth: matRes.outlineWidth,
       };
-      f.add(ctrl, "renderMode", RENDER_MODE_NAMES).name("Render Mode").onChange((v: string) => {
-        matRes.renderMode = RENDER_MODE_NAMES.indexOf(v);
+      // The dropdown lists the shading-model registry, not a demo-local enum:
+      // register a new look once and every viewer picks it up.
+      f.add(ctrl, "shadingModelId", modelOptions).name("Shading Model").onChange((v: number) => {
+        matRes.shadingModelId = Number(v);
         this.updateMatUbo(matRes);
       });
       f.add(ctrl, "metallic", 0, 1, 0.01).name("Metallic").onChange((v: number) => {
@@ -995,7 +937,10 @@ export class GLBViewerDemo implements Demo {
       mr.previewImage?.close();
     }
     this.frameUbo.destroy();
-    this.depthTexture?.destroy();
     this.defaultTexture.destroy();
+    this.hdrTexture?.destroy();
+    this.gbuffer?.destroy();
+    this.deferredLighting?.destroy();
+    this.tonemap?.destroy();
   }
 }

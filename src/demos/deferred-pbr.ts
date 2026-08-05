@@ -2,7 +2,8 @@ import { GPUContext } from "../core/device";
 import { Camera } from "../scene/camera";
 import { Demo, ShaderStageDesc } from "./types";
 import { PassManager } from "../passes/render-target";
-import { GBuffer, GBUFFER_GEOMETRY_WGSL } from "../passes/gbuffer";
+import { GBuffer, GBUFFER_GEOMETRY_WGSL, makeCharGbufferFS } from "../passes/gbuffer";
+import { OUTLINE_SCREEN_SHADER } from "../passes/outline-screen";
 import { DeferredLightingPass } from "../passes/deferred-lighting";
 import { CascadedShadowMap, CSM_CASCADE_COUNT } from "../passes/csm";
 import { GTAOPass } from "../passes/ssao";
@@ -232,53 +233,6 @@ const EYE_MATERIAL_BLUEPRINT: MaterialBlueprint = {
   ],
 };
 
-// Generic GBuffer FS for a character part: writes a flat albedo and stamps
-// ShadingModelID into material.a. `albedoExpr` / `packExpr` are WGSL
-// expressions (they may reference the material's fields via `mat_<name>.x`).
-function makeCharGbufferFS(
-  id: number,
-  material: MaterialInstance,
-  albedoExpr: string,
-  packExpr: string,
-  objectId: number,
-): string {
-  return `
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-  @location(0) worldPos: vec3<f32>,
-  @location(1) worldNormal: vec3<f32>,
-  @location(2) uv: vec2<f32>,
-  @location(3) prevClipXY: vec2<f32>,
-  @location(4) prevClipW: f32,
-  @location(5) curClipXY: vec2<f32>,
-  @location(6) curClipW: f32,
-};
-
-struct GBufferOutput {
-  @location(0) albedo: vec4<f32>,
-  @location(1) normal: vec4<f32>,
-  @location(2) material: vec4<f32>,
-  @location(3) motion: vec2<f32>,
-  @location(4) depthCopy: vec4<f32>,
-};
-
-@fragment
-fn fs_main(in: VSOut) -> GBufferOutput {
-  var out: GBufferOutput;
-  var baseColor = ${albedoExpr};
-  out.albedo = vec4<f32>(baseColor, 1.0);
-  // normal.w carries the object ID for the screen-space selection outline.
-  out.normal = vec4<f32>(normalize(in.worldNormal), ${objectId.toFixed(1)});
-  // material = (paramR, paramG, paramB, shadingModelId)
-  out.material = vec4<f32>(${packExpr}, ${id.toFixed(1)});
-  let prevNDC = in.prevClipXY / in.prevClipW;
-  let curNDC = in.curClipXY / in.curClipW;
-  out.motion = vec2<f32>((curNDC.x - prevNDC.x) * 0.5, (prevNDC.y - curNDC.y) * 0.5);
-  out.depthCopy = vec4<f32>(in.position.z, 0.0, 0.0, 0.0);
-  return out;
-}
-`;
-}
 
 /** One character part in the Step-2 demo scene. */
 interface CharPart {
@@ -323,65 +277,6 @@ fn vs_main(
 //   • selection     → reads the GBuffer normal.w (object id), targetId = selectedId
 // Winding- and depth-independent, so it can never "fill" the object the way an
 // inverted hull can.
-const outlineScreenShader = `
-struct OutlineCfg {
-  resolution: vec2<f32>,
-  targetId: f32,
-  radius: f32,
-  color: vec3<f32>,
-  enabled: f32,
-};
-
-@group(0) @binding(0) var idTex: texture_2d<f32>;
-@group(0) @binding(1) var idSamp: sampler;
-@group(0) @binding(2) var<uniform> cfg: OutlineCfg;
-
-struct VSOut {
-  @builtin(position) position: vec4<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
-  var p = array<vec2<f32>, 3>(
-    vec2<f32>(-1.0, -1.0),
-    vec2<f32>(3.0, -1.0),
-    vec2<f32>(-1.0, 3.0)
-  );
-  var out: VSOut;
-  out.position = vec4<f32>(p[vi], 0.0, 1.0);
-  return out;
-}
-
-fn idAt(uv: vec2<f32>) -> f32 {
-  return textureSampleLevel(idTex, idSamp, uv, 0.0).a;
-}
-
-@fragment
-fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
-  if (cfg.enabled < 0.5) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
-  let uv = fragCoord.xy / cfg.resolution;
-  let texel = 1.0 / cfg.resolution;
-  let selfId = idAt(uv);
-  let maxR = i32(cfg.radius);
-  for (var r = 1; r <= maxR; r = r + 1) {
-    let o = f32(r) * texel;
-    var offs = array<vec2<f32>, 8>(
-      vec2<f32>(o.x, 0.0), vec2<f32>(-o.x, 0.0),
-      vec2<f32>(0.0, o.y), vec2<f32>(0.0, -o.y),
-      vec2<f32>(o.x, o.y), vec2<f32>(-o.x, o.y),
-      vec2<f32>(o.x, -o.y), vec2<f32>(-o.x, -o.y)
-    );
-    for (var i = 0; i < 8; i = i + 1) {
-      let nId = idAt(uv + offs[i]);
-      // self is background, neighbor belongs to the target → rim on this pixel
-      if (selfId < 0.5 && abs(nId - cfg.targetId) < 0.5) {
-        return vec4<f32>(cfg.color, 1.0);
-      }
-    }
-  }
-  return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-}
-`;
 
 const gizmoVS = `
 struct GizmoOut {
@@ -577,11 +472,26 @@ export class DeferredDemo implements Demo {
     this.hairMaterial = new MaterialInstance(HAIR_MATERIAL_BLUEPRINT);
     this.eyeMaterial = new MaterialInstance(EYE_MATERIAL_BLUEPRINT);
     this.skinFsCode = this.skinMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT
-      + makeCharGbufferFS(ShadingModel.SKIN, this.skinMaterial, "vec3<f32>(0.95, 0.72, 0.62)", "vec3<f32>(mat_skin.sssStrength, mat_skin.roughness, 0.0)", 3);
+      + makeCharGbufferFS({
+        albedoExpr: "vec3<f32>(0.95, 0.72, 0.62)",
+        packExpr: "vec3<f32>(mat_skin.sssStrength, mat_skin.roughness, 0.0)",
+        idExpr: `${ShadingModel.SKIN}.0`,
+        objectIdExpr: "3.0",
+      });
     this.hairFsCode = this.hairMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT
-      + makeCharGbufferFS(ShadingModel.HAIR, this.hairMaterial, "vec3<f32>(0.28, 0.18, 0.13)", "vec3<f32>(mat_hair.roughness, mat_hair.aniso, 0.0)", 4);
+      + makeCharGbufferFS({
+        albedoExpr: "vec3<f32>(0.28, 0.18, 0.13)",
+        packExpr: "vec3<f32>(mat_hair.roughness, mat_hair.aniso, 0.0)",
+        idExpr: `${ShadingModel.HAIR}.0`,
+        objectIdExpr: "4.0",
+      });
     this.eyeFsCode = this.eyeMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT
-      + makeCharGbufferFS(ShadingModel.EYE, this.eyeMaterial, "vec3<f32>(0.85, 0.9, 0.95)", "vec3<f32>(mat_eye.cornea, mat_eye.irisDark, 0.0)", 5);
+      + makeCharGbufferFS({
+        albedoExpr: "vec3<f32>(0.85, 0.9, 0.95)",
+        packExpr: "vec3<f32>(mat_eye.cornea, mat_eye.irisDark, 0.0)",
+        idExpr: `${ShadingModel.EYE}.0`,
+        objectIdExpr: "5.0",
+      });
 
     const mkCharUbo = (label: string) => this.device.createBuffer({
       label, size: 352, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -812,7 +722,7 @@ export class DeferredDemo implements Demo {
       primitive: { topology: "line-list" },
     });
 
-    const outlineScreenModule = this.device.createShaderModule({ code: outlineScreenShader });
+    const outlineScreenModule = this.device.createShaderModule({ code: OUTLINE_SCREEN_SHADER });
     this.outlineScreenPipeline = this.device.createRenderPipeline({
       label: "deferred-outline-screen",
       layout: "auto",

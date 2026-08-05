@@ -1,6 +1,8 @@
-import { GBuffer, GBUFFER_GEOMETRY_WGSL } from "./gbuffer";
+import { GBuffer } from "./gbuffer";
 import { LightScene, MAX_LIGHTS } from "../scene/light";
-import { mat4, vec3, type Mat4 } from "wgpu-matrix";
+import { ShadingModel } from "../core/shading-model";
+import { TOON_BODY, TOON_FACE, TOON_HAIR, TOON_EYE, TOON_EYELASH, NORMAL_DEBUG, UNLIT } from "../core/shading-registry";
+import { mat4, type Mat4 } from "wgpu-matrix";
 
 export class DeferredLightingPass {
   private device: GPUDevice;
@@ -12,6 +14,13 @@ export class DeferredLightingPass {
   private outputFormat: GPUTextureFormat;
   private fallbackAOTexture!: GPUTexture;
   private fallbackAOView!: GPUTextureView;
+  // IBL is optional: a demo that has no environment map still needs *some*
+  // resource bound for bindings 11-14 or bind-group creation fails. These 1x1
+  // black stand-ins let any demo use the deferred pass without an env probe.
+  private fallbackCubeTexture!: GPUTexture;
+  private fallbackCubeView!: GPUTextureView;
+  private fallbackLutTexture!: GPUTexture;
+  private fallbackLutView!: GPUTextureView;
   private cachedHasShadow: boolean | null = null;
   private bindGroupLayout: GPUBindGroupLayout | null = null;
   private nearestSampler!: GPUSampler;
@@ -57,6 +66,23 @@ export class DeferredLightingPass {
       { bytesPerRow: 4 },
       [1, 1],
     );
+    // Textures are zero-initialized by WebGPU, so these read as black.
+    this.fallbackCubeTexture = device.createTexture({
+      label: "deferred-fallback-env-cube",
+      size: [1, 1, 6],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.fallbackCubeView = this.fallbackCubeTexture.createView({ dimension: "cube" });
+
+    this.fallbackLutTexture = device.createTexture({
+      label: "deferred-fallback-brdf-lut",
+      size: [1, 1],
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.fallbackLutView = this.fallbackLutTexture.createView();
+
     this.nearestSampler = this.device.createSampler({ label: "deferred-nearest", magFilter: "nearest", minFilter: "nearest" });
     this.linearClampSampler = this.device.createSampler({
       label: "deferred-linear-clamp",
@@ -142,6 +168,12 @@ export class DeferredLightingPass {
         { binding: 5, resource: gbuffer.depthCopyView },
         { binding: 6, resource: this.nearestSampler },
         { binding: 10, resource: aoView ?? this.fallbackAOView },
+        // Bindings 11-14 are always present in the layout; without an env probe
+        // they point at 1x1 black stand-ins so the IBL terms evaluate to zero.
+        { binding: 11, resource: ibl?.irradiance ?? this.fallbackCubeView },
+        { binding: 12, resource: ibl?.prefilter ?? this.fallbackCubeView },
+        { binding: 13, resource: ibl?.brdfLut ?? this.fallbackLutView },
+        { binding: 14, resource: this.linearClampSampler },
       ];
 
       if (shadowView && shadowSampler && shadowVPBuffer) {
@@ -149,15 +181,6 @@ export class DeferredLightingPass {
           { binding: 7, resource: shadowView },
           { binding: 8, resource: shadowSampler },
           { binding: 9, resource: { buffer: shadowVPBuffer } },
-        );
-      }
-
-      if (ibl) {
-        entries.push(
-          { binding: 11, resource: ibl.irradiance },
-          { binding: 12, resource: ibl.prefilter },
-          { binding: 13, resource: ibl.brdfLut },
-          { binding: 14, resource: this.linearClampSampler },
         );
       }
 
@@ -191,7 +214,7 @@ export class DeferredLightingPass {
     const code = this.buildShaderCode(hasShadow);
     const module = this.device.createShaderModule({ label: "deferred-lighting", code });
 
-this.bindGroupLayout = this.device.createBindGroupLayout({
+    this.bindGroupLayout = this.device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: {} },
@@ -206,7 +229,7 @@ this.bindGroupLayout = this.device.createBindGroupLayout({
         { binding: 13, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "float" } },
         { binding: 14, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
         ...(hasShadow
-        ? [
+          ? [
             { binding: 7, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } } as GPUBindGroupLayoutEntry,
             { binding: 8, visibility: GPUShaderStage.FRAGMENT, sampler: { type: "comparison" } } as GPUBindGroupLayoutEntry,
             { binding: 9, visibility: GPUShaderStage.FRAGMENT, buffer: {} } as GPUBindGroupLayoutEntry,
@@ -266,11 +289,31 @@ fn sampleShadowPCF(worldPos: vec3<f32>, normal: vec3<f32>, lightDir: vec3<f32>) 
 }
 ` : "";
 
+    // Only directional lights get a shadow map; emit nothing at all when the
+    // caller passed no shadow atlas (an empty `if` body reads as a mistake).
+    const shadowBlock = hasShadow ? `
+    if (lightParams.x == 0.0) {
+      shadowVis = sampleShadowPCF(worldPos, N, rl.L);
+    }` : "";
 
     return `
 const PI: f32 = 3.14159265359;
 const INV_PI: f32 = 0.31830988618;
 const EPSILON: f32 = 1.0e-10;
+
+// ShadingModelIDs, mirrored from src/core/shading-model.ts + shading-registry.ts.
+const SM_STANDARD: f32 = ${ShadingModel.STANDARD}.0;
+const SM_TOON: f32 = ${ShadingModel.TOON}.0;
+const SM_SKIN: f32 = ${ShadingModel.SKIN}.0;
+const SM_HAIR: f32 = ${ShadingModel.HAIR}.0;
+const SM_EYE: f32 = ${ShadingModel.EYE}.0;
+const SM_TOON_BODY: f32 = ${TOON_BODY}.0;
+const SM_TOON_FACE: f32 = ${TOON_FACE}.0;
+const SM_TOON_HAIR: f32 = ${TOON_HAIR}.0;
+const SM_TOON_EYE: f32 = ${TOON_EYE}.0;
+const SM_TOON_EYELASH: f32 = ${TOON_EYELASH}.0;
+const SM_NORMAL_DEBUG: f32 = ${NORMAL_DEBUG}.0;
+const SM_UNLIT: f32 = ${UNLIT}.0;
 
 struct Uniforms {
   cameraPos: vec4<f32>,
@@ -279,12 +322,6 @@ struct Uniforms {
   prevViewProj: mat4x4<f32>,
   ambient: vec4<f32>,
   envIntensity: vec4<f32>,
-};
-
-struct LightData {
-  typeAndParams: vec4<f32>,
-  posOrDir: vec4<f32>,
-  colorOrDir2: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -317,6 +354,64 @@ fn reconstructWorldPos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 
 ${shadowSampleFn}
 
+// ===========================================================================
+// Light resolution — one place that turns the packed light array into an
+// (incoming direction, radiance) pair. Every BxDF below consumes that pair, so
+// adding a shading model never means re-implementing attenuation again.
+// ===========================================================================
+struct ResolvedLight {
+  L: vec3<f32>,
+  color: vec3<f32>,
+  valid: bool,
+};
+
+fn resolveLight(
+  lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>, worldPos: vec3<f32>
+) -> ResolvedLight {
+  var out: ResolvedLight;
+  out.L = vec3<f32>(0.0, 1.0, 0.0);
+  out.color = vec3<f32>(0.0);
+  out.valid = false;
+
+  let lt = i32(lightParams.x);
+  if (lt == 0) {
+    // Directional.
+    out.L = normalize(-posOrDir.xyz);
+    out.color = colorOrDir2.rgb * lightParams.y;
+    out.valid = true;
+  } else if (lt == 1) {
+    // Point.
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    out.L = toLight / max(dist, EPSILON);
+    let distRatio = dist / lightParams.z;
+    var attenuation = saturate(1.0 - pow(distRatio, lightParams.w));
+    attenuation = attenuation * attenuation;
+    out.color = colorOrDir2.rgb * lightParams.y * attenuation;
+    out.valid = true;
+  } else if (lt == 2) {
+    // Spot.
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    out.L = toLight / max(dist, EPSILON);
+    let distRatio = dist / lightParams.z;
+    var attenuation = saturate(1.0 - pow(distRatio, 2.0));
+    attenuation = attenuation * attenuation;
+    let spotDir = normalize(colorOrDir2.xyz);
+    let cosAngle = dot(-out.L, spotDir);
+    let outerCone = lightParams.w;
+    let innerCone = posOrDir.w;
+    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
+    attenuation = attenuation * spotAtten * spotAtten;
+    out.color = vec3<f32>(1.0) * lightParams.y * attenuation;
+    out.valid = true;
+  }
+  return out;
+}
+
+// ===========================================================================
+// Shared BRDF building blocks.
+// ===========================================================================
 fn distributionGGX(a2: f32, noh: f32) -> f32 {
   let d = (noh * a2 - noh) * noh + 1.0;
   return a2 / (PI * d * d + EPSILON);
@@ -363,324 +458,232 @@ fn cookTorrance(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, f0: vec3<f32>, roughne
   return D * G * F;
 }
 
-// ---- Toon / cel shading (ShadingModelID == TOON) -------------------------
-// Quantize N·L into discrete bands for the flat anime look, plus a crisp
-// stepped specular. Shadows still apply (sampled in the caller).
+// Endfield-style rim term, ported verbatim from the old glb-viewer forward
+// shader. Kept as a shared helper because all four toon variants use it.
+fn endfieldRim(nov: f32, vol: f32, nol: f32, width: f32) -> f32 {
+  let rimStepMin = clamp(0.9 - width, 0.0, 0.99);
+  let rimStepMax = clamp(1.0 - width, 0.01, 1.0);
+  var rim = smoothstep(rimStepMin, rimStepMax, 1.0 - nov);
+  rim = rim * max(vol, 0.0) * max(nol + 0.5, 0.0) * 2.0;
+  return rim;
+}
+
+// ===========================================================================
+// BxDFs — one function per ShadingModelID. Each takes the same signature:
+// surface (N, V, baseColor) + light (L, lightColor) + the model's two packed
+// params from GBuffer material.rg. Adding a look = adding one of these plus a
+// dispatch line in shadeOne().
+// ===========================================================================
+
+// STANDARD (0): Cook-Torrance GGX metallic/roughness.
+fn bxdfStandard(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
+  baseColor: vec3<f32>, metallic: f32, roughness: f32
+) -> vec3<f32> {
+  let nol = max(dot(N, L), 0.0);
+  let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
+  let specular = cookTorrance(N, V, L, f0, roughness) * nol;
+  let kS = fresnelSchlick(f0, max(dot(N, V), 0.0));
+  let kD = (vec3<f32>(1.0) - kS) * (1.0 - metallic);
+  let diffuse = kD * baseColor * INV_PI * nol;
+  return (diffuse + specular) * lightColor;
+}
+
+// TOON (1): generic cel shading — quantized diffuse, stepped specular.
 fn quantizeToon(x: f32, bands: f32) -> f32 {
   let b = max(bands, 1.0);
   let scaled = clamp(x, 0.0, 1.0) * b;
   let lo = floor(scaled);
   let frac = scaled - lo;
-  // small soft edge at each band boundary for anti-aliasing
   let edge = smoothstep(0.9, 1.0, frac);
   return (lo + edge) / max(b - 1.0, 1.0);
 }
 
-fn evalLightToon(
-  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
-  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+fn bxdfToon(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
   baseColor: vec3<f32>, bands: f32
 ) -> vec3<f32> {
-  var L: vec3<f32>;
-  var attenuation = 1.0;
-  var lightColor: vec3<f32>;
-  let lt = i32(lightType);
-
-  if (lt == 0) {
-    L = normalize(-posOrDir.xyz);
-    lightColor = colorOrDir2.rgb * lightParams.y;
-  } else if (lt == 1) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let falloff = lightParams.w;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, falloff));
-    attenuation = attenuation * attenuation;
-    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
-  } else if (lt == 2) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, 2.0));
-    attenuation = attenuation * attenuation;
-    let spotDir = normalize(colorOrDir2.xyz);
-    let cosAngle = dot(-L, spotDir);
-    let outerCone = lightParams.w;
-    let innerCone = posOrDir.w;
-    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
-    attenuation *= spotAtten * spotAtten;
-    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
-  } else {
-    return vec3<f32>(0.0);
-  }
-
   let nol = max(dot(N, L), 0.0);
-  if (nol <= 0.0) { return vec3<f32>(0.0); }
-
   let diffuseTone = quantizeToon(nol, bands);
   var col = baseColor * diffuseTone * lightColor;
-
-  // crisp cartoon highlight
   let H = normalize(V + L);
   let spec = smoothstep(0.86, 0.94, max(dot(N, H), 0.0));
-  col += lightColor * spec * 0.7;
-
+  col = col + lightColor * spec * 0.7;
   return col;
 }
 
-// ---- Skin / subsurface scattering (ShadingModelID == SKIN) ----------------
-// Cheap SSS approximation: a wrap-diffuse term so light bleeds slightly past
-// the terminator, tinted with a reddish subsurface color on the shadowed
-// side. Far from a real screen-space diffusion profile, but reads as "skin".
-fn evalSkin(
-  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
-  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+// SKIN (2): wrap diffuse + reddish back-scatter, a cheap SSS stand-in.
+fn bxdfSkin(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
   baseColor: vec3<f32>, sssStrength: f32, roughness: f32
 ) -> vec3<f32> {
-  var L: vec3<f32>;
-  var attenuation = 1.0;
-  var lightColor: vec3<f32>;
-  let lt = i32(lightType);
-  if (lt == 0) {
-    L = normalize(-posOrDir.xyz);
-    lightColor = colorOrDir2.rgb * lightParams.y;
-  } else if (lt == 1) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let falloff = lightParams.w;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, falloff));
-    attenuation = attenuation * attenuation;
-    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
-  } else if (lt == 2) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, 2.0));
-    attenuation = attenuation * attenuation;
-    let spotDir = normalize(colorOrDir2.xyz);
-    let cosAngle = dot(-L, spotDir);
-    let outerCone = lightParams.w;
-    let innerCone = posOrDir.w;
-    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
-    attenuation *= spotAtten * spotAtten;
-    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
-  } else {
-    return vec3<f32>(0.0);
-  }
-
   let nol = max(dot(N, L), 0.0);
-  if (nol <= 0.0) { return vec3<f32>(0.0); }
-
-  // Wrap diffuse: light wraps a bit past the terminator (subsurface scatter).
   let wrap = 0.35;
   let wrapNL = max(0.0, (nol + wrap) / (1.0 + wrap));
-  // Reddish transmission glow on the shadowed side (back-lit skin).
   let backWrap = max(0.0, (dot(-N, L) + wrap * 2.0) / (1.0 + wrap * 2.0));
   let subsurfaceColor = vec3<f32>(1.0, 0.5, 0.42);
-  var diffuse = baseColor * wrapNL + baseColor * subsurfaceColor * backWrap * sssStrength * 0.6;
+  let diffuse = baseColor * wrapNL + baseColor * subsurfaceColor * backWrap * sssStrength * 0.6;
 
   let f0 = vec3<f32>(0.03);
   let specular = cookTorrance(N, V, L, f0, roughness) * nol;
   let kS = fresnelSchlick(f0, max(dot(N, V), 0.0));
-  let kD = (vec3<f32>(1.0) - kS);
-  let diffuseLit = kD * diffuse * INV_PI * nol;
-
-  return (diffuseLit + specular) * lightColor;
+  let kD = vec3<f32>(1.0) - kS;
+  return (kD * diffuse * INV_PI * nol + specular) * lightColor;
 }
 
-// ---- Hair / anisotropic dual-spec (ShadingModelID == HAIR) ----------------
-// Kajiya-Kay hair model: the specular highlight rides along a tangent
-// direction. Without per-vertex tangents we derive a streak direction from
-// the normal and world up, which is enough to read as "hair strands".
-fn evalHair(
-  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
-  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+// HAIR (3): Kajiya-Kay dual-lobe anisotropic specular.
+fn bxdfHair(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
   baseColor: vec3<f32>, roughness: f32, aniso: f32
 ) -> vec3<f32> {
-  var L: vec3<f32>;
-  var attenuation = 1.0;
-  var lightColor: vec3<f32>;
-  let lt = i32(lightType);
-  if (lt == 0) {
-    L = normalize(-posOrDir.xyz);
-    lightColor = colorOrDir2.rgb * lightParams.y;
-  } else if (lt == 1) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let falloff = lightParams.w;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, falloff));
-    attenuation = attenuation * attenuation;
-    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
-  } else if (lt == 2) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, 2.0));
-    attenuation = attenuation * attenuation;
-    let spotDir = normalize(colorOrDir2.xyz);
-    let cosAngle = dot(-L, spotDir);
-    let outerCone = lightParams.w;
-    let innerCone = posOrDir.w;
-    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
-    attenuation *= spotAtten * spotAtten;
-    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
-  } else {
-    return vec3<f32>(0.0);
-  }
-
   let nol = max(dot(N, L), 0.0);
-  if (nol <= 0.0) { return vec3<f32>(0.0); }
-
-  // Streak tangent from normal + world up.
   let up = vec3<f32>(0.0, 1.0, 0.0);
-  var T = normalize(cross(up, N));
-  if (length(T) < 0.001) { T = normalize(cross(vec3<f32>(1.0, 0.0, 0.0), N)); }
+  var T = cross(up, N);
+  if (length(T) < 0.001) { T = cross(vec3<f32>(1.0, 0.0, 0.0), N); }
+  T = normalize(T);
   let H = normalize(V + L);
 
-  // Two shifted specular lobes (primary highlight + secondary sheen).
-  let shift1 = aniso * 0.12;
-  let shift2 = -aniso * 0.12;
-  let tH1 = dot(T, H) + shift1;
-  let tH2 = dot(T, H) + shift2;
+  let tH1 = dot(T, H) + aniso * 0.12;
+  let tH2 = dot(T, H) - aniso * 0.12;
   let sinTH1 = sqrt(max(1.0 - tH1 * tH1, 0.0));
   let sinTH2 = sqrt(max(1.0 - tH2 * tH2, 0.0));
-  let gloss1 = mix(90.0, 12.0, roughness);
-  let gloss2 = mix(45.0, 6.0, roughness);
-  let spec1 = pow(sinTH1, gloss1) * 0.85;
-  let spec2 = pow(sinTH2, gloss2) * 0.5;
+  let spec1 = pow(sinTH1, mix(90.0, 12.0, roughness)) * 0.85;
+  let spec2 = pow(sinTH2, mix(45.0, 6.0, roughness)) * 0.5;
 
   let diffuse = baseColor * nol * INV_PI;
   let specular = (spec1 + spec2) * vec3<f32>(1.0, 0.95, 0.85);
-
   return (diffuse + specular) * lightColor;
 }
 
-// ---- Eye / cornea + iris (ShadingModelID == EYE) --------------------------
-// A bright tight cornea highlight plus a darker iris disc. Demonstrative,
-// not anatomically exact — a real eye needs a parallax/iris texture.
-fn evalEye(
-  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
-  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+// EYE (4): tight cornea highlight + darkened iris disc.
+fn bxdfEye(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
   baseColor: vec3<f32>, cornea: f32, irisDark: f32
 ) -> vec3<f32> {
-  var L: vec3<f32>;
-  var attenuation = 1.0;
-  var lightColor: vec3<f32>;
-  let lt = i32(lightType);
-  if (lt == 0) {
-    L = normalize(-posOrDir.xyz);
-    lightColor = colorOrDir2.rgb * lightParams.y;
-  } else if (lt == 1) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let falloff = lightParams.w;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, falloff));
-    attenuation = attenuation * attenuation;
-    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
-  } else if (lt == 2) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, 2.0));
-    attenuation = attenuation * attenuation;
-    let spotDir = normalize(colorOrDir2.xyz);
-    let cosAngle = dot(-L, spotDir);
-    let outerCone = lightParams.w;
-    let innerCone = posOrDir.w;
-    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
-    attenuation *= spotAtten * spotAtten;
-    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
-  } else {
-    return vec3<f32>(0.0);
-  }
-
   let nol = max(dot(N, L), 0.0);
-  if (nol <= 0.0) { return vec3<f32>(0.0); }
-
   let H = normalize(V + L);
-  // Tight bright cornea highlight.
   let spec = pow(max(dot(N, H), 0.0), mix(500.0, 120.0, 1.0 - cornea)) * cornea * 2.0;
-  // Fresnel rim (wet look).
   let fresnel = fresnelSchlick(vec3<f32>(0.02), max(dot(N, V), 0.0)).r;
-  // Iris disc = base color darkened.
   let iris = baseColor * irisDark * nol;
-
-  var col = iris + baseColor * spec + baseColor * fresnel * 0.3;
-  return col * lightColor;
+  return (iris + baseColor * spec + baseColor * fresnel * 0.3) * lightColor;
 }
 
-fn evalLight(
-  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
-  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
-  baseColor: vec3<f32>, metallic: f32, roughness: f32
+// TOON_BODY (5): Endfield toon ramp + rim, ported from glb-viewer's forward
+// mode 1. The warm/cool ramp fakes bounce light on the shadow side.
+fn bxdfToonBody(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
+  baseColor: vec3<f32>, rimWidth: f32
 ) -> vec3<f32> {
-  var L: vec3<f32>;
-  var attenuation = 1.0;
-  var lightColor: vec3<f32>;
-  let lt = i32(lightType);
+  let ndl = dot(N, L);
+  let nov = dot(N, V);
+  let vol = dot(-V, L);
 
-  if (lt == 0) {
-    L = normalize(-posOrDir.xyz);
-    lightColor = colorOrDir2.rgb * lightParams.y;
-  } else if (lt == 1) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let falloff = lightParams.w;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, falloff));
-    attenuation = attenuation * attenuation;
-    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
-  } else if (lt == 2) {
-    let toLight = posOrDir.xyz - worldPos;
-    let dist = length(toLight);
-    L = toLight / max(dist, EPSILON);
-    let range = lightParams.z;
-    let distRatio = dist / range;
-    attenuation = saturate(1.0 - pow(distRatio, 2.0));
-    attenuation = attenuation * attenuation;
-    let spotDir = normalize(colorOrDir2.xyz);
-    let cosAngle = dot(-L, spotDir);
-    let outerCone = lightParams.w;
-    let innerCone = posOrDir.w;
-    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
-    attenuation *= spotAtten * spotAtten;
-    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
-  } else {
-    return vec3<f32>(0.0);
+  let viewFactor = max(mix(1.0, max(nov, 0.0), 0.5), 0.6);
+  let radiance = max(ndl, 0.0) * viewFactor;
+  let fadedSSS = 0.4 * (0.5 + viewFactor * 0.5);
+
+  let rampOffset = 0.2;
+  let rampCoord = clamp((1.0 - rampOffset) - radiance * (0.5 - rampOffset * 0.5), 0.1, 0.9);
+  let rampWarm = vec3<f32>(1.0, 0.6, 0.4);
+  let rampCool = vec3<f32>(0.7, 0.75, 0.9);
+  let rampColor = mix(rampCool, rampWarm, smoothstep(0.3, 0.7, rampCoord));
+  let rampAlpha = smoothstep(0.2, 0.8, rampCoord) * 0.6;
+
+  let finalToon = baseColor * (radiance + (rampColor * rampAlpha) * min(vec3<f32>(fadedSSS), baseColor));
+  let rim = endfieldRim(nov, vol, ndl, rimWidth);
+  return (finalToon + rim * baseColor * 0.25) * lightColor;
+}
+
+// TOON_FACE (6): hard SDF-like terminator, no soft ramp — anime faces must not
+// pick up nose/brow shadows from the geometric normal.
+fn bxdfToonFace(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
+  baseColor: vec3<f32>, rimWidth: f32
+) -> vec3<f32> {
+  let ndl = dot(N, L);
+  let nov = dot(N, V);
+  let vol = dot(-V, L);
+
+  let faceRadiance = smoothstep(0.0, 0.1, ndl);
+  let viewFactor = mix(1.0, max(nov, 0.0), 0.3);
+  let finalFace = baseColor * (0.3 + faceRadiance * 0.7) * viewFactor;
+  let shadowTint = baseColor * vec3<f32>(0.9, 0.7, 0.65);
+  let faceResult = mix(shadowTint * 0.5, finalFace, faceRadiance);
+  let rim = endfieldRim(nov, vol, ndl, rimWidth);
+  return (faceResult + rim * 0.2) * lightColor;
+}
+
+// TOON_HAIR (7): hard diffuse step + a solid anisotropic streak.
+fn bxdfToonHair(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
+  baseColor: vec3<f32>, rimWidth: f32
+) -> vec3<f32> {
+  let ndl = dot(N, L);
+  let nov = dot(N, V);
+  let vol = dot(-V, L);
+  let H = normalize(V + L);
+
+  let viewFactor = mix(1.0, max(nov, 0.0), 0.4);
+  let tangent = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), N) + vec3<f32>(1e-6));
+  let tdh = dot(tangent, H);
+  let anisoSpec = pow(sqrt(max(1.0 - tdh * tdh, 0.0)), 16.0);
+  let specSolid = smoothstep(0.3, 0.5, anisoSpec) * 0.6;
+
+  let hairDiffuse = smoothstep(0.0, 0.15, max(ndl, 0.0));
+  let hairColor = baseColor * (0.25 + hairDiffuse * 0.75) * viewFactor;
+  let rim = endfieldRim(nov, vol, ndl, rimWidth);
+  return (hairColor + specSolid + rim * 0.25) * lightColor;
+}
+
+// TOON_EYE (8): high contrast iris + one sharp square highlight.
+fn bxdfToonEye(
+  N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
+  baseColor: vec3<f32>
+) -> vec3<f32> {
+  let H = normalize(V + L);
+  let eyeDiffuse = smoothstep(0.0, 0.05, dot(N, L));
+  let eyeColor = baseColor * (0.4 + eyeDiffuse * 0.6);
+  let eyeSpec = smoothstep(0.85, 0.9, max(dot(N, H), 0.0)) * 0.8;
+  return (eyeColor + eyeSpec) * lightColor;
+}
+
+// TOON_EYELASH (9): almost flat — lashes must stay a solid graphic shape.
+fn bxdfToonEyelash(
+  N: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>, baseColor: vec3<f32>
+) -> vec3<f32> {
+  let lash = 0.5 + max(dot(N, L), 0.0) * 0.5;
+  return baseColor * lash * lightColor;
+}
+
+// Dispatch one light against one surface. This is the whole "unified pipeline":
+// a realistic character and a toon character differ by this single switch.
+fn shadeOne(
+  matID: f32, N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, lightColor: vec3<f32>,
+  baseColor: vec3<f32>, pr: f32, pg: f32
+) -> vec3<f32> {
+  if (matID < 0.5) {
+    return bxdfStandard(N, V, L, lightColor, baseColor, pr, max(pg, 0.04));
+  } else if (matID < 1.5) {
+    return bxdfToon(N, V, L, lightColor, baseColor, max(pg, 1.0));
+  } else if (matID < 2.5) {
+    return bxdfSkin(N, V, L, lightColor, baseColor, pr, max(pg, 0.04));
+  } else if (matID < 3.5) {
+    return bxdfHair(N, V, L, lightColor, baseColor, max(pr, 0.04), pg);
+  } else if (matID < 4.5) {
+    return bxdfEye(N, V, L, lightColor, baseColor, pr, max(pg, 0.1));
+  } else if (matID < 5.5) {
+    return bxdfToonBody(N, V, L, lightColor, baseColor, pr);
+  } else if (matID < 6.5) {
+    return bxdfToonFace(N, V, L, lightColor, baseColor, pr);
+  } else if (matID < 7.5) {
+    return bxdfToonHair(N, V, L, lightColor, baseColor, pr);
+  } else if (matID < 8.5) {
+    return bxdfToonEye(N, V, L, lightColor, baseColor);
+  } else if (matID < 9.5) {
+    return bxdfToonEyelash(N, L, lightColor, baseColor);
   }
-
-  let nol = max(dot(N, L), 0.0);
-  if (nol <= 0.0) { return vec3<f32>(0.0); }
-
-  let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
-  let specular = cookTorrance(N, V, L, f0, roughness) * nol;
-
-  let kS = fresnelSchlick(f0, max(dot(N, V), 0.0));
-  let kD = (vec3<f32>(1.0) - kS) * (1.0 - metallic);
-  let diffuse = kD * baseColor * INV_PI * nol;
-
-  return (diffuse + specular) * lightColor;
+  // NORMAL_DEBUG / UNLIT never reach here (they return before the light loop).
+  return vec3<f32>(0.0);
 }
 
 @fragment
@@ -691,153 +694,82 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   let normalSample = textureSample(normalTex, pointSampler, uv);
   let material = textureSample(materialTex, pointSampler, uv);
   let depth = textureSample(depthTex, pointSampler, uv).r;
-  let ao = textureSample(aoTex, pointSampler, uv).r;
+  let ssao = textureSample(aoTex, pointSampler, uv).r;
 
   if (depth >= 1.0) {
     return vec4<f32>(0.02, 0.02, 0.04, 1.0);
   }
 
   let baseColor = albedo.rgb;
+  // albedo.a carries baked occlusion from the GBuffer writer; the AO texture
+  // carries screen-space occlusion. Both apply.
+  let ao = ssao * albedo.a;
   let N = normalize(normalSample.rgb);
-
-  let metallic = material.r;
-  let roughness = max(material.g, 0.04);
+  let matID = material.a;
+  // material.rg meaning is per-model (see shading-registry packMeaning).
+  let pr = material.r;
+  let pg = material.g;
   let emissive = material.b;
+
+  // --- Unlit models: bail out before touching a single light ---------------
+  if (matID > SM_NORMAL_DEBUG - 0.5 && matID < SM_NORMAL_DEBUG + 0.5) {
+    return vec4<f32>(N * 0.5 + 0.5, 1.0);
+  }
+  if (matID > SM_UNLIT - 0.5) {
+    return vec4<f32>(baseColor, 1.0);
+  }
 
   let worldPos = reconstructWorldPos(uv, depth);
   let V = normalize(u.cameraPos.xyz - worldPos);
 
-  // --- ShadingModelID dispatch -------------------------------------------
-  // material.a carries the shading model id written by the GBuffer pass.
-  let matID = material.a;
+  let isStandard = matID < 0.5;
+  // The Endfield toon variants bake their own shadow floor into the ramp, so
+  // piling scene ambient on top of them just washes the flat colors out.
+  let isEndfieldToon = matID > SM_TOON_BODY - 0.5 && matID < SM_TOON_EYELASH + 0.5;
+  var ambientScale = 1.0;
+  if (isStandard) { ambientScale = 1.0 - min(u.envIntensity.x, 1.0); }
+  if (isEndfieldToon) { ambientScale = 0.0; }
 
-  // SKIN (2): subsurface-scattering skin.
-  if (matID > 1.5 && matID < 2.5) {
-    let sssStrength = material.r;
-    let skinRough = max(material.g, 0.04);
-    var skinColor = u.ambient.rgb * baseColor * ao;
-    let numLightsS = i32(lights[0]);
-    for (var i = 0; i < numLightsS; i = i + 1) {
-      let base = 1 + i * 12;
-      let lightType = lights[base + 0];
-      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
-      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
-      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
-      var shadowVis = 1.0;
-      if (lightType == 0.0) {
-        let L = normalize(-posOrDir.xyz);
-        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
-      }
-      skinColor += evalSkin(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, sssStrength, skinRough) * shadowVis;
-    }
-    skinColor += baseColor * emissive;
-    return vec4<f32>(skinColor, 1.0);
-  }
+  var color = u.ambient.rgb * baseColor * ao * ambientScale;
 
-  // HAIR (3): anisotropic dual-spec (Kajiya-Kay).
-  if (matID > 2.5 && matID < 3.5) {
-    let hairRough = max(material.r, 0.04);
-    let aniso = material.g;
-    var hairColor = u.ambient.rgb * baseColor * ao;
-    let numLightsH = i32(lights[0]);
-    for (var i = 0; i < numLightsH; i = i + 1) {
-      let base = 1 + i * 12;
-      let lightType = lights[base + 0];
-      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
-      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
-      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
-      var shadowVis = 1.0;
-      if (lightType == 0.0) {
-        let L = normalize(-posOrDir.xyz);
-        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
-      }
-      hairColor += evalHair(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, hairRough, aniso) * shadowVis;
-    }
-    hairColor += baseColor * emissive;
-    return vec4<f32>(hairColor, 1.0);
-  }
-
-  // EYE (4): cornea highlight + iris disc.
-  if (matID > 3.5) {
-    let cornea = material.r;
-    let irisDark = max(material.g, 0.1);
-    var eyeColor = u.ambient.rgb * baseColor * ao;
-    let numLightsE = i32(lights[0]);
-    for (var i = 0; i < numLightsE; i = i + 1) {
-      let base = 1 + i * 12;
-      let lightType = lights[base + 0];
-      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
-      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
-      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
-      var shadowVis = 1.0;
-      if (lightType == 0.0) {
-        let L = normalize(-posOrDir.xyz);
-        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
-      }
-      eyeColor += evalEye(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, cornea, irisDark) * shadowVis;
-    }
-    eyeColor += baseColor * emissive;
-    return vec4<f32>(eyeColor, 1.0);
-  }
-
-  if (matID > 0.5) {
-    // TOON / cel shading: quantized diffuse, crisp specular, shadows kept.
-    let bands = max(material.g, 1.0);
-    var toonColor = u.ambient.rgb * baseColor * ao;
-    let numLightsT = i32(lights[0]);
-    for (var i = 0; i < numLightsT; i = i + 1) {
-      let base = 1 + i * 12;
-      let lightType = lights[base + 0];
-      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
-      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
-      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
-      var shadowVis = 1.0;
-      if (lightType == 0.0) {
-        let L = normalize(-posOrDir.xyz);
-        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
-      }
-      toonColor += evalLightToon(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, bands) * shadowVis;
-    }
-    toonColor += baseColor * emissive;
-    return vec4<f32>(toonColor, 1.0);
-  }
-
-  var color = u.ambient.rgb * baseColor * ao * (1.0 - min(u.envIntensity.x, 1.0));
-
+  // --- One loop, every shading model ---------------------------------------
   let numLights = i32(lights[0]);
   for (var i = 0; i < numLights; i++) {
     let base = 1 + i * 12;
-    let lightType = lights[base + 0];
     let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
     let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
     let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
 
-    var shadowVis = 1.0;
-    if (lightType == 0.0) {
-      let L = normalize(-posOrDir.xyz);
-      ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : "let _l = L;"}
-    }
+    let rl = resolveLight(lightParams, posOrDir, colorOrDir2, worldPos);
+    if (!rl.valid) { continue; }
 
-    color += evalLight(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, metallic, roughness) * shadowVis;
+    var shadowVis = 1.0;${shadowBlock}
+
+    color += shadeOne(matID, N, V, rl.L, rl.color, baseColor, pr, pg) * shadowVis;
   }
 
-  // IBL: split-sum integration (irradiance + prefiltered specular, multi-scatter)
-  let NdotV = max(dot(N, V), 0.0);
-  let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
-  let f90 = vec3<f32>(saturate(f0.g * 50.0));
-  let lut = brdfLutSample(NdotV, roughness);
-  let Fms = brdfMultiScatter(f0, f90, lut);
+  // --- Image-based lighting (STANDARD only) --------------------------------
+  // Without an env probe bindings 11-13 are 1x1 black, so these terms vanish.
+  if (isStandard) {
+    let metallic = pr;
+    let roughness = max(pg, 0.04);
+    let NdotV = max(dot(N, V), 0.0);
+    let f0 = mix(vec3<f32>(0.04), baseColor, metallic);
+    let f90 = vec3<f32>(saturate(f0.g * 50.0));
+    let lut = brdfLutSample(NdotV, roughness);
+    let Fms = brdfMultiScatter(f0, f90, lut);
 
-  let kD = (vec3<f32>(1.0) - Fms) * (1.0 - metallic);
-  let irradiance = textureSampleLevel(irradianceTex, envSampler, N, 0.0).rgb;
-  let diffuseIBL = irradiance * baseColor * kD;
+    let kD = (vec3<f32>(1.0) - Fms) * (1.0 - metallic);
+    let irradiance = textureSampleLevel(irradianceTex, envSampler, N, 0.0).rgb;
+    let diffuseIBL = irradiance * baseColor * kD;
 
-  let R = reflect(-V, N);
-  let mip = roughness * f32(textureNumLevels(prefilterTex) - 1u);
-  let prefiltered = textureSampleLevel(prefilterTex, envSampler, R, mip).rgb;
-  let specularIBL = prefiltered * Fms;
+    let R = reflect(-V, N);
+    let mip = roughness * f32(textureNumLevels(prefilterTex) - 1u);
+    let prefiltered = textureSampleLevel(prefilterTex, envSampler, R, mip).rgb;
+    let specularIBL = prefiltered * Fms;
 
-  color += (diffuseIBL + specularIBL) * u.envIntensity.x * ao;
+    color += (diffuseIBL + specularIBL) * u.envIntensity.x * ao;
+  }
 
   color += baseColor * emissive;
 
@@ -850,5 +782,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     this.uniformBuffer?.destroy();
     this.lightBuffer?.destroy();
     this.fallbackAOTexture?.destroy();
+    this.fallbackCubeTexture?.destroy();
+    this.fallbackLutTexture?.destroy();
   }
 }

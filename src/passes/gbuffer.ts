@@ -19,7 +19,11 @@ export class GBuffer {
 
   static readonly ALBEDO_FORMAT: GPUTextureFormat = "rgba8unorm";
   static readonly NORMAL_FORMAT: GPUTextureFormat = "rgba16float";
-  static readonly MATERIAL_FORMAT: GPUTextureFormat = "rgba8unorm";
+  // MUST stay a float format. material.a carries the raw ShadingModelID (2, 3,
+  // 5, 9, ...) and material.g can carry values > 1 (e.g. toon band count), both
+  // of which an 8-bit unorm target silently clamps to 1.0 — that clamp is what
+  // made every SKIN/HAIR/EYE surface fall through to the TOON branch.
+  static readonly MATERIAL_FORMAT: GPUTextureFormat = "rgba16float";
   static readonly MOTION_FORMAT: GPUTextureFormat = "rg16float";
   static readonly DEPTH_COPY_FORMAT: GPUTextureFormat = "rgba16float";
   static readonly DEPTH_FORMAT: GPUTextureFormat = "depth24plus";
@@ -202,3 +206,94 @@ fn decodeGBufferMaterialID(material: vec4<f32>) -> f32 {
   return material.a;
 }
 `;
+
+/** Standard GBuffer vertex-stage output. Any GBuffer VS must match this. */
+export const GBUFFER_VSOUT_WGSL = `
+struct VSOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) worldNormal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+  @location(3) prevClipXY: vec2<f32>,
+  @location(4) prevClipW: f32,
+  @location(5) curClipXY: vec2<f32>,
+  @location(6) curClipW: f32,
+};
+`;
+
+export interface CharGbufferFSOptions {
+  /** WGSL expression (vec3<f32>) producing the base color. */
+  albedoExpr: string;
+  /** WGSL expression (vec3<f32>) packed into material.rgb = (paramR, paramG, emissive). */
+  packExpr: string;
+  /**
+   * WGSL expression (f32) for the ShadingModelID stamped into material.a.
+   * A literal for single-look pipelines, a uniform read when one pipeline
+   * serves many materials (glb-viewer stamps a per-material id).
+   */
+  idExpr: string;
+  /** WGSL expression (f32) for the object id stamped into normal.w. */
+  objectIdExpr: string;
+  /** WGSL expression (f32) written to albedo.a (ambient occlusion). Default "1.0". */
+  aoExpr?: string;
+  /** WGSL expression (vec3<f32>) for the world normal. Default: interpolated geometric normal. */
+  normalExpr?: string;
+  /** WGSL declarations emitted before fs_main (extra bindings, helper fns). */
+  declarations?: string;
+  /**
+   * WGSL statements injected at the very top of fs_main, before anything else.
+   * This is where texture sampling / normal-map decoding belongs: it runs in
+   * UNIFORM control flow, so textureSample and dpdx/dpdy are legal there.
+   */
+  preludeStmts?: string;
+}
+
+// Generic GBuffer fragment-shader factory shared by every demo that writes the
+// GBuffer (deferred-pbr character parts, glb-viewer, ...). Stamps albedo +
+// ShadingModelID (material.a) + object id (normal.w) so the deferred lighting
+// pass can dispatch by id. Everything look-specific arrives as a WGSL
+// expression, so this stays a dumb writer with no per-model branching — and
+// therefore no uniform-control-flow hazards.
+export function makeCharGbufferFS(opts: CharGbufferFSOptions): string {
+  const {
+    albedoExpr,
+    packExpr,
+    idExpr,
+    objectIdExpr,
+    aoExpr = "1.0",
+    normalExpr = "in.worldNormal",
+    declarations = "",
+    preludeStmts = "",
+  } = opts;
+
+  return `
+${GBUFFER_VSOUT_WGSL}
+struct GBufferOutput {
+  @location(0) albedo: vec4<f32>,
+  @location(1) normal: vec4<f32>,
+  @location(2) material: vec4<f32>,
+  @location(3) motion: vec2<f32>,
+  @location(4) depthCopy: vec4<f32>,
+};
+${declarations}
+@fragment
+fn fs_main(in: VSOut, @builtin(front_facing) isFront: bool) -> GBufferOutput {
+${preludeStmts}
+  var out: GBufferOutput;
+  var baseColor = ${albedoExpr};
+  out.albedo = vec4<f32>(baseColor, ${aoExpr});
+  // Double-sided geometry: flip the normal on back faces so lighting is sane.
+  var gbufN = normalize(${normalExpr});
+  if (!isFront) { gbufN = -gbufN; }
+  // normal.w carries the object ID for the screen-space selection outline.
+  out.normal = vec4<f32>(gbufN, ${objectIdExpr});
+  // material = (paramR, paramG, emissive, shadingModelId)
+  out.material = vec4<f32>(${packExpr}, ${idExpr});
+  let prevNDC = in.prevClipXY / in.prevClipW;
+  let curNDC = in.curClipXY / in.curClipW;
+  out.motion = vec2<f32>((curNDC.x - prevNDC.x) * 0.5, (prevNDC.y - curNDC.y) * 0.5);
+  out.depthCopy = vec4<f32>(in.position.z, 0.0, 0.0, 0.0);
+  return out;
+}
+`;
+}
