@@ -2,6 +2,7 @@ node_modules/
 dist/
 original/
 .vite-verify/
+.vbuild-*/
 .workbuddy/
 *.glb
 .arts/
