@@ -42,7 +42,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
   );
   var out: VSOut;
   out.position = vec4<f32>(pos[vi], 0.0, 1.0);
-  out.uv = pos[vi] * 0.5 + 0.5;
+  out.uv = vec2<f32>(pos[vi].x * 0.5 + 0.5, 0.5 - pos[vi].y * 0.5);
   return out;
 }
 
@@ -63,7 +63,7 @@ fn linearToSRGB(c: vec3<f32>) -> vec3<f32> {
 }
 
 fn reconstructWorldPos(uv: vec2<f32>, depth: f32) -> vec3<f32> {
-  let ndc = vec4<f32>(uv * 2.0 - 1.0, depth, 1.0);
+  let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
   let worldPos = pp.invVP * ndc;
   return worldPos.xyz / worldPos.w;
 }
@@ -91,7 +91,7 @@ fn atmosphericDust(uv: vec2<f32>, sceneDepth: f32) -> vec3<f32> {
 
 fn underwaterMask(uv: vec2<f32>) -> f32 {
   // Reconstruct near plane world position
-  let ndc = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+  let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
   let nearWorldPos = pp.invVP * ndc;
   let nearWorld = nearWorldPos.xyz / nearWorldPos.w;
 
