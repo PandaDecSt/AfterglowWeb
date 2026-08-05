@@ -21,13 +21,13 @@ const GLB_MAT_BLUEPRINT: MaterialBlueprint = {
 };
 const GLB_MAT_WGSL = new MaterialInstance(GLB_MAT_BLUEPRINT).generateWGSLStruct();
 
-function buildGLBMaterialInstance(mat: MaterialData, outlineWidth: number): MaterialInstance {
+function buildGLBMaterialInstance(mat: MaterialData, outlineWidth: number, hasNormalTex: number): MaterialInstance {
   const instance = new MaterialInstance(GLB_MAT_BLUEPRINT);
   const hasBaseColorTex = mat.baseColorImage ? 1 : 0;
   const lightmapStrength = mat.occlusionImage ? mat.occlusionStrength : 0;
   instance.setField("baseColorFactor", [...mat.baseColorFactor]);
   instance.setField("params", [mat.metallicFactor, mat.roughnessFactor, hasBaseColorTex, lightmapStrength]);
-  instance.setField("params2", [0.0, 1.0, outlineWidth, 0.0]);
+  instance.setField("params2", [0.0, 1.0, outlineWidth, hasNormalTex]);
   return instance;
 }
 
@@ -58,9 +58,12 @@ const PRESETS_KEY = "afterglow-glb-presets";
 function loadPresets(): RenderPreset[] {
   try {
     const raw = localStorage.getItem(PRESETS_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return mergeBuiltinPresets(parsed);
+    }
   } catch { /* ignore */ }
-  return [defaultPreset()];
+  return builtinPresets();
 }
 
 function savePresets(presets: RenderPreset[]) {
@@ -72,6 +75,30 @@ function defaultPreset(): RenderPreset {
     name: "Endfield Default",
     mapping: { body: 1, face: 2, hair: 3, eye: 4, eyelash: 5, other: 1 },
   };
+}
+
+// Built-in rendering-scheme presets. "Endfield Default" is the toon / anime
+// scheme; the rest cover a realistic look and a debug view. mergeBuiltinPresets
+// keeps any user-saved presets (from localStorage) while ensuring these always
+// appear in the dropdown even for returning visitors.
+function builtinPresets(): RenderPreset[] {
+  return [
+    defaultPreset(),
+    // 写实基础（剑星风格的 PBR 底子）：全身走标准 PBR（mode 0），无卡通色阶。
+    { name: "Realistic PBR", mapping: { body: 0, face: 0, hair: 0, eye: 0, eyelash: 0, other: 0 } },
+    // 写实皮肤 + 风格化眼发：身体/脸用 PBR，头发走各向异性高光、眼睛/睫毛走卡通。
+    { name: "Realistic Skin · Stylized Hair", mapping: { body: 0, face: 0, hair: 3, eye: 4, eyelash: 5, other: 0 } },
+    // 法线调试：全部显示世界空间法线（mode 6）。
+    { name: "Normal View (Debug)", mapping: { body: 6, face: 6, hair: 6, eye: 6, eyelash: 6, other: 6 } },
+  ];
+}
+
+function mergeBuiltinPresets(stored: RenderPreset[]): RenderPreset[] {
+  const names = new Set(stored.map(p => p.name));
+  for (const b of builtinPresets()) {
+    if (!names.has(b.name)) stored.push(b);
+  }
+  return stored;
 }
 
 // === Shaders ===
@@ -90,6 +117,7 @@ struct FrameUniforms {
 @group(1) @binding(1) var baseColorTex: texture_2d<f32>;
 @group(1) @binding(2) var lightmapTex: texture_2d<f32>;
 @group(1) @binding(3) var texSampler: sampler;
+@group(1) @binding(4) var normalTex: texture_2d<f32>;
 
 struct VSOut {
   @builtin(position) position: vec4<f32>,
@@ -139,6 +167,23 @@ fn acesTonemap(x: vec3<f32>) -> vec3<f32> {
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Rebuild a tangent frame from screen-space derivatives (Mikkelsen /
+// Schüler "bump mapping unparametrized surfaces" technique). Lets us apply a
+// tangent-space normal map without per-vertex tangent attributes, which GLB
+// models rarely carry. Must be called in uniform control flow.
+fn cotangentFrame(N: vec3<f32>, p: vec3<f32>, uv: vec2<f32>) -> mat3x3<f32> {
+  let dp1 = dpdx(p);
+  let dp2 = dpdy(p);
+  let duv1 = dpdx(uv);
+  let duv2 = dpdy(uv);
+  let dp2perp = cross(dp2, N);
+  let dp1perp = cross(N, dp1);
+  let T = dp2perp * duv1.x + dp1perp * duv2.x;
+  let B = dp2perp * duv1.y + dp1perp * duv2.y;
+  let invmax = inverseSqrt(max(dot(T, T), dot(B, B)));
+  return mat3x3<f32>(T * invmax, B * invmax, N);
+}
+
 fn endfieldRimLighting(nov: f32, vol: f32, nol: f32, width: f32) -> f32 {
   let rimStepMin = clamp(0.9 - width, 0.0, 0.99);
   let rimStepMax = clamp(1.0 - width, 0.01, 1.0);
@@ -151,6 +196,15 @@ fn endfieldRimLighting(nov: f32, vol: f32, nol: f32, width: f32) -> f32 {
 fn fs_main(in: VSOut, @builtin(front_facing) isFront: bool) -> @location(0) vec4<f32> {
   var N = normalize(in.worldNormal);
   if (!isFront) { N = -N; }
+  // Normal mapping. Geometry normals are baked in world space; the GLB normal
+  // map is tangent-space, so we rebuild the tangent frame from screen-space
+  // derivatives. BOTH textureSample and dpdx/dpdy MUST stay in UNIFORM control
+  // flow, so we sample + build the frame UNCONDITIONALLY and only blend the
+  // perturbed normal in when a normal map is present (params2.w > 0.5).
+  let nTex = textureSample(normalTex, texSampler, in.uv).xyz * 2.0 - vec3<f32>(1.0);
+  let TBN = cotangentFrame(N, in.worldPos, in.uv);
+  let mappedN = normalize(TBN * nTex);
+  N = normalize(mix(N, mappedN, select(0.0, 1.0, mat.params2.w > 0.5)));
   let V = normalize(frame.cameraPosition.xyz - in.worldPos);
   let L = normalize(-frame.lightDir.xyz);
   let H = normalize(V + L);
@@ -359,6 +413,7 @@ interface MaterialResources {
   hasBaseColorTex: number;
   lightmapStrength: number;
   hasLightmap: boolean;
+  hasNormalTex: number;
   previewImage: ImageBitmap | null;
   alphaCutoff: number;
   renderMode: number;
@@ -447,6 +502,7 @@ export class GLBViewerDemo implements Demo {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: {} },
         { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: {} },
+        { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: {} },
       ],
     });
 
@@ -476,7 +532,7 @@ export class GLBViewerDemo implements Demo {
     });
 
     try {
-      const model = await loadGLTF("/Qin_DL.glb");
+      const model = await loadGLTF("/SB_X_Nikke_Scarlet.glb");
       this.modelName = model.name;
 
       console.log(`[GLBViewer] Materials found: ${model.materials.length}`);
@@ -523,11 +579,15 @@ export class GLBViewerDemo implements Demo {
     const lightmapView = matData.occlusionImage
       ? this.createTextureFromBitmap(matData.occlusionImage, `lightmap-${matData.name}`, "rgba8unorm").createView()
       : this.defaultTexture.createView();
+    const normalView = matData.normalImage
+      ? this.createTextureFromBitmap(matData.normalImage, `normal-${matData.name}`, "rgba8unorm").createView()
+      : this.defaultTexture.createView();
+    const hasNormalTex = matData.normalImage ? 1 : 0;
 
     const category = classifyMaterial(matData.name);
 
     // MaterialInstance owns the uniform buffer + packing + upload.
-    const materialInstance = buildGLBMaterialInstance(matData, this.globalOutlineWidth);
+    const materialInstance = buildGLBMaterialInstance(matData, this.globalOutlineWidth, hasNormalTex);
     materialInstance.upload(this.device);
 
     const bindGroup = this.device.createBindGroup({
@@ -537,6 +597,7 @@ export class GLBViewerDemo implements Demo {
         { binding: 1, resource: baseColorView },
         { binding: 2, resource: lightmapView },
         { binding: 3, resource: this.defaultSampler },
+        { binding: 4, resource: normalView },
       ],
     });
 
@@ -551,6 +612,7 @@ export class GLBViewerDemo implements Demo {
       hasBaseColorTex: matData.baseColorImage ? 1 : 0,
       lightmapStrength: matData.occlusionImage ? matData.occlusionStrength : 0,
       hasLightmap: !!matData.occlusionImage,
+      hasNormalTex,
       previewImage: matData.baseColorImage ?? null,
       alphaCutoff: 0.0,
       renderMode: 1,
@@ -755,7 +817,7 @@ export class GLBViewerDemo implements Demo {
   private updateMatUbo(matRes: MaterialResources) {
     matRes.materialInstance.setField("baseColorFactor", [...matRes.baseColorFactor]);
     matRes.materialInstance.setField("params", [matRes.metallic, matRes.roughness, matRes.hasBaseColorTex, matRes.lightmapStrength]);
-    matRes.materialInstance.setField("params2", [matRes.alphaCutoff, matRes.renderMode, matRes.outlineWidth, 0]);
+    matRes.materialInstance.setField("params2", [matRes.alphaCutoff, matRes.renderMode, matRes.outlineWidth, matRes.hasNormalTex]);
     matRes.materialInstance.upload(this.device);
   }
 
@@ -919,6 +981,7 @@ export class GLBViewerDemo implements Demo {
       });
       f.add({ diffuse: matRes.hasBaseColorTex ? "Yes" : "No" }, "diffuse").name("Diffuse Tex").disable();
       f.add({ lightmap: matRes.hasLightmap ? "Yes" : "No" }, "lightmap").name("Lightmap Tex").disable();
+      f.add({ normal: matRes.hasNormalTex ? "Yes" : "No" }, "normal").name("Normal Tex").disable();
     });
   }
 

@@ -89,6 +89,18 @@ interface GLTFJson {
   materials?: GLTFMaterial[];
   textures?: GLTFTexture[];
   images?: GLTFImage[];
+  nodes?: {
+    name?: string;
+    matrix?: number[];
+    translation?: number[];
+    rotation?: number[];
+    scale?: number[];
+    children?: number[];
+    mesh?: number;
+    skin?: number;
+  }[];
+  scenes?: { name?: string; nodes?: number[] }[];
+  scene?: number;
 }
 
 const COMPONENT_SIZES: Record<number, number> = {
@@ -107,6 +119,69 @@ const TYPE_COUNTS: Record<string, number> = {
   VEC4: 4,
   MAT4: 16,
 };
+
+// --- Minimal column-major 4x4 matrix helpers (no external dep) -----------
+// glTF stores matrices column-major; a local node matrix is T * R * S.
+type Mat4 = number[];
+
+function mat4Multiply(a: Mat4, b: Mat4): Mat4 {
+  const o = new Array<number>(16);
+  for (let c = 0; c < 4; c++) {
+    for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] =
+        a[0 * 4 + r] * b[c * 4 + 0] +
+        a[1 * 4 + r] * b[c * 4 + 1] +
+        a[2 * 4 + r] * b[c * 4 + 2] +
+        a[3 * 4 + r] * b[c * 4 + 3];
+    }
+  }
+  return o;
+}
+
+function nodeLocalMatrix(node: {
+  matrix?: number[];
+  translation?: number[];
+  rotation?: number[];
+  scale?: number[];
+}): Mat4 {
+  if (node.matrix) return node.matrix.slice();
+  const t = node.translation ?? [0, 0, 0];
+  const q = node.rotation ?? [0, 0, 0, 1];
+  const s = node.scale ?? [1, 1, 1];
+  const [x, y, z, w] = q;
+  const x2 = x + x, y2 = y + y, z2 = z + z, w2 = w + w;
+  const xx = x * x2, xy = x * y2, xz = x * z2;
+  const yy = y * y2, yz = y * z2, zz = z * z2;
+  const wx = w * x2, wy = w * y2, wz = w * z2;
+  const r00 = 1 - (yy + zz), r01 = xy - wz, r02 = xz + wy;
+  const r10 = xy + wz, r11 = 1 - (xx + zz), r12 = yz - wx;
+  const r20 = xz - wy, r21 = yz + wx, r22 = 1 - (xx + yy);
+  // column-major: T * R * S  (each rotation column scaled by s)
+  return [
+    r00 * s[0], r10 * s[0], r20 * s[0], 0,
+    r01 * s[1], r11 * s[1], r21 * s[1], 0,
+    r02 * s[2], r12 * s[2], r22 * s[2], 0,
+    t[0], t[1], t[2], 1,
+  ];
+}
+
+function transformPoint(m: Mat4, x: number, y: number, z: number): [number, number, number] {
+  return [
+    m[0] * x + m[4] * y + m[8] * z + m[12],
+    m[1] * x + m[5] * y + m[9] * z + m[13],
+    m[2] * x + m[6] * y + m[10] * z + m[14],
+  ];
+}
+
+// Upper 3x3 (no translation) for normals; not the strict inverse-transpose,
+// but fine for viewing (character scales are near-uniform).
+function transformDir(m: Mat4, x: number, y: number, z: number): [number, number, number] {
+  return [
+    m[0] * x + m[4] * y + m[8] * z,
+    m[1] * x + m[5] * y + m[9] * z,
+    m[2] * x + m[6] * y + m[10] * z,
+  ];
+}
 
 export async function loadGLTF(url: string): Promise<LoadedModel> {
   const response = await fetch(url);
@@ -236,16 +311,35 @@ export async function loadGLTF(url: string): Promise<LoadedModel> {
     }
   }
 
-  // Load meshes
+  // Load meshes — walk the node hierarchy and bake each primitive's local
+  // vertices into world space via the node's world matrix. This is required
+  // for rigged/hierarchical models (e.g. character GLBs) whose primitives are
+  // stored in node-local space; without it the body parts collapse to origin.
+  // Models without nodes (or the trivial-identity case) fall back to the old
+  // direct-json.meshes behaviour, so existing models are unaffected.
   const meshes: MeshData[] = [];
-  for (const mesh of json.meshes) {
-    for (const prim of mesh.primitives) {
-      if (prim.mode !== undefined && prim.mode !== 4) continue;
 
+  const nodes: any[] = json.nodes ?? [];
+  if (nodes.length > 0) {
+    const childrenOf: number[][] = nodes.map(() => []);
+    const isChild = new Array<boolean>(nodes.length).fill(false);
+    nodes.forEach((n, i) => (n.children ?? []).forEach((c: number) => { childrenOf[i].push(c); isChild[c] = true; }));
+    const sceneNodes = json.scenes && json.scenes[json.scene ?? 0] ? json.scenes[json.scene ?? 0].nodes : null;
+    const roots = sceneNodes ?? nodes.map((_, i) => i).filter((i) => !isChild[i]);
+
+    const worldMat: Mat4[] = new Array(nodes.length);
+    const dfs = (i: number, parentW: Mat4 | null) => {
+      const w = parentW ? mat4Multiply(parentW, nodeLocalMatrix(nodes[i])) : nodeLocalMatrix(nodes[i]);
+      worldMat[i] = w;
+      for (const c of childrenOf[i]) dfs(c, w);
+    };
+    for (const r of roots) dfs(r, null);
+
+    const bakePrimitive = (mesh: any, prim: any, world: Mat4) => {
+      if (prim.mode !== undefined && prim.mode !== 4) return;
       const positions = extractFloat32(prim.attributes["POSITION"], 3);
-      const normals = prim.attributes["NORMAL"] !== undefined
-        ? extractFloat32(prim.attributes["NORMAL"], 3)
-        : new Float32Array(positions.length);
+      const hasNormal = prim.attributes["NORMAL"] !== undefined;
+      const normals = hasNormal ? extractFloat32(prim.attributes["NORMAL"], 3) : new Float32Array(positions.length);
       const uvs = prim.attributes["TEXCOORD_0"] !== undefined
         ? extractFloat32(prim.attributes["TEXCOORD_0"], 2)
         : new Float32Array((positions.length / 3) * 2);
@@ -253,7 +347,45 @@ export async function loadGLTF(url: string): Promise<LoadedModel> {
         ? extractIndices(prim.indices)
         : createSequentialIndices(positions.length / 3);
 
-      meshes.push({ positions, normals, uvs, indices, materialIndex: prim.material ?? 0, name: mesh.name ?? `mesh_${meshes.length}` });
+      const bp = new Float32Array(positions.length);
+      const bn = new Float32Array(normals.length);
+      const vCount = positions.length / 3;
+      for (let v = 0; v < vCount; v++) {
+        const p = transformPoint(world, positions[v * 3], positions[v * 3 + 1], positions[v * 3 + 2]);
+        bp[v * 3] = p[0]; bp[v * 3 + 1] = p[1]; bp[v * 3 + 2] = p[2];
+        if (hasNormal) {
+          const n = transformDir(world, normals[v * 3], normals[v * 3 + 1], normals[v * 3 + 2]);
+          const len = Math.hypot(n[0], n[1], n[2]) || 1;
+          bn[v * 3] = n[0] / len; bn[v * 3 + 1] = n[1] / len; bn[v * 3 + 2] = n[2] / len;
+        }
+      }
+      meshes.push({ positions: bp, normals: bn, uvs, indices, materialIndex: prim.material ?? 0, name: mesh.name ?? `mesh_${meshes.length}` });
+    };
+
+    nodes.forEach((n, i) => {
+      if (n.mesh == null) return;
+      const world = worldMat[i] ?? nodeLocalMatrix(n);
+      const gm = json.meshes[n.mesh];
+      if (!gm) return;
+      for (const prim of gm.primitives) bakePrimitive(gm, prim, world);
+    });
+  } else {
+    // No nodes: original direct-mesh behaviour.
+    for (const mesh of json.meshes) {
+      for (const prim of mesh.primitives) {
+        if (prim.mode !== undefined && prim.mode !== 4) continue;
+        const positions = extractFloat32(prim.attributes["POSITION"], 3);
+        const normals = prim.attributes["NORMAL"] !== undefined
+          ? extractFloat32(prim.attributes["NORMAL"], 3)
+          : new Float32Array(positions.length);
+        const uvs = prim.attributes["TEXCOORD_0"] !== undefined
+          ? extractFloat32(prim.attributes["TEXCOORD_0"], 2)
+          : new Float32Array((positions.length / 3) * 2);
+        const indices = prim.indices !== undefined
+          ? extractIndices(prim.indices)
+          : createSequentialIndices(positions.length / 3);
+        meshes.push({ positions, normals, uvs, indices, materialIndex: prim.material ?? 0, name: mesh.name ?? `mesh_${meshes.length}` });
+      }
     }
   }
 
