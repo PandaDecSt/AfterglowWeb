@@ -169,7 +169,10 @@ export class MaterialInstance {
       offset += FIELD_SIZE_BYTES[f.type];
       align = Math.max(align, a);
     }
-    return Math.ceil(offset / align) * align;
+    // Uniform buffers require the block size (and therefore the binding
+    // size) to be a multiple of 16 bytes. Round up to be safe — the
+    // trailing padding bytes are simply never read by the shader.
+    return Math.max(Math.ceil(offset / 16) * 16, 16);
   }
 
   /**
@@ -194,7 +197,7 @@ export class MaterialInstance {
     if (!this.buffer) {
       this.buffer = device.createBuffer({
         label: `ubo-${this.name}`,
-        size: Math.max(data.byteLength, 16),
+        size: data.byteLength,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
     }

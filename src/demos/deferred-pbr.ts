@@ -17,6 +17,7 @@ import { mat4, vec3, vec4, type Mat4 } from "wgpu-matrix";
 import type { EngineContext } from "../core/engine";
 import type { RenderPass } from "../core/renderer";
 import { MaterialInstance, type MaterialBlueprint } from "../core/material-instance";
+import { ShadingModel } from "../core/shading-model";
 
 // Per-object / per-frame matrices + selection tint. These are camera/object
 // state, NOT material state, so they stay in an explicit "globals" block.
@@ -44,6 +45,21 @@ const STANDARD_MATERIAL_BLUEPRINT: MaterialBlueprint = {
     { name: "time", type: "f32", value: 0 },
     { name: "metallic", type: "f32", value: 0.1 },
     { name: "roughness", type: "f32", value: 0.5 },
+  ],
+};
+
+// Toon material: flat base color + band count. The GBuffer FS stamps
+// materialID = ShadingModel.TOON (1) and stashes bandCount in material.g so
+// the lighting pass can read it straight from the GBuffer.
+const TOON_MATERIAL_BLUEPRINT: MaterialBlueprint = {
+  name: "toon",
+  group: 1,
+  fields: [
+    { name: "time", type: "f32", value: 0 },
+    { name: "r", type: "f32", value: 0.26 },
+    { name: "g", type: "f32", value: 0.56 },
+    { name: "b", type: "f32", value: 0.95 },
+    { name: "bandCount", type: "f32", value: 3 },
   ],
 };
 
@@ -111,15 +127,64 @@ fn fs_main(in: VSOut) -> GBufferOutput {
     0.5 + 0.5 * cos(mat_standard.time * 0.5 + in.uv.y * 6.28),
     0.7
   );
-  // Blender-style selection tint (selectedTint = 1 when selected)
-  baseColor = mix(baseColor, vec3<f32>(0.97, 0.66, 0.11), globals.selectedTint * 0.45);
 
   out.albedo = vec4<f32>(baseColor, 1.0);
-  out.normal = vec4<f32>(normalize(in.worldNormal), 0.0);
-  out.material = vec4<f32>(mat_standard.metallic, mat_standard.roughness, 0.0, 0.0);
+  // normal.w carries the object ID (1 = standard cube) for the screen-space outline pass.
+  out.normal = vec4<f32>(normalize(in.worldNormal), 1.0);
+  // material = (metallic, roughness, emissive, shadingModelId=STANDARD)
+  out.material = vec4<f32>(mat_standard.metallic, mat_standard.roughness, 0.0, ${ShadingModel.STANDARD}.0);
 
   // perspective-correct NDC: clip.xy and clip.w are interpolated separately
   // note: NDC.y grows upward but texture uv.y grows downward, so flip y
+  let prevNDC = in.prevClipXY / in.prevClipW;
+  let curNDC = in.curClipXY / in.curClipW;
+  let motion = vec2<f32>(
+    (curNDC.x - prevNDC.x) * 0.5,
+    (prevNDC.y - curNDC.y) * 0.5,
+  );
+  out.motion = motion;
+
+  out.depthCopy = vec4<f32>(in.position.z, 0.0, 0.0, 0.0);
+
+  return out;
+}
+`;
+
+// Toon variant of the GBuffer pass. Writes a flat base color and stamps
+// materialID = TOON (1); bandCount is parked in material.g so the deferred
+// lighting pass can read it straight from the GBuffer without extra plumbing.
+const gbufferToonFSBody = `
+struct VSOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) worldNormal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+  @location(3) prevClipXY: vec2<f32>,
+  @location(4) prevClipW: f32,
+  @location(5) curClipXY: vec2<f32>,
+  @location(6) curClipW: f32,
+};
+
+struct GBufferOutput {
+  @location(0) albedo: vec4<f32>,
+  @location(1) normal: vec4<f32>,
+  @location(2) material: vec4<f32>,
+  @location(3) motion: vec2<f32>,
+  @location(4) depthCopy: vec4<f32>,
+};
+
+@fragment
+fn fs_main(in: VSOut) -> GBufferOutput {
+  var out: GBufferOutput;
+
+  var baseColor = vec3<f32>(mat_toon.r, mat_toon.g, mat_toon.b);
+
+  out.albedo = vec4<f32>(baseColor, 1.0);
+  // normal.w carries the object ID (2 = toon sphere) for the screen-space outline pass.
+  out.normal = vec4<f32>(normalize(in.worldNormal), 2.0);
+  // material = (metallic=0, bandCount, emissive=0, shadingModelId=TOON)
+  out.material = vec4<f32>(0.0, mat_toon.bandCount, 0.0, ${ShadingModel.TOON}.0);
+
   let prevNDC = in.prevClipXY / in.prevClipW;
   let curNDC = in.curClipXY / in.curClipW;
   let motion = vec2<f32>(
@@ -151,26 +216,70 @@ fn vs_main(
 }
 `;
 
-const outlineVS = `
-struct OutlineUniforms {
-  viewProj: mat4x4<f32>,
-  model: mat4x4<f32>,
-  scale: f32,
+// Screen-space outline machine (Blender-style). One parameterized shader draws
+// a rim on background pixels around any fragment whose id == cfg.targetId.
+// Two independent layers reuse this same machine:
+//   • cel outline  → reads the GBuffer material channel, targetId = ShadingModelID.TOON
+//   • selection     → reads the GBuffer normal.w (object id), targetId = selectedId
+// Winding- and depth-independent, so it can never "fill" the object the way an
+// inverted hull can.
+const outlineScreenShader = `
+struct OutlineCfg {
+  resolution: vec2<f32>,
+  targetId: f32,
+  radius: f32,
+  color: vec3<f32>,
+  enabled: f32,
 };
 
-@group(0) @binding(0) var<uniform> u: OutlineUniforms;
+@group(0) @binding(0) var idTex: texture_2d<f32>;
+@group(0) @binding(1) var idSamp: sampler;
+@group(0) @binding(2) var<uniform> cfg: OutlineCfg;
+
+struct VSOut {
+  @builtin(position) position: vec4<f32>,
+};
 
 @vertex
-fn vs_main(
-  @location(0) pos: vec3<f32>,
-) -> @builtin(position) vec4<f32> {
-  let worldPos = u.model * vec4<f32>(pos * u.scale, 1.0);
-  return u.viewProj * worldPos;
+fn vs_main(@builtin(vertex_index) vi: u32) -> VSOut {
+  var p = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>(3.0, -1.0),
+    vec2<f32>(-1.0, 3.0)
+  );
+  var out: VSOut;
+  out.position = vec4<f32>(p[vi], 0.0, 1.0);
+  return out;
+}
+
+fn idAt(uv: vec2<f32>) -> f32 {
+  return textureSampleLevel(idTex, idSamp, uv, 0.0).a;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-  return vec4<f32>(0.02, 0.02, 0.03, 1.0);
+fn fs_main(@builtin(position) fragCoord: vec4<f32>) -> @location(0) vec4<f32> {
+  if (cfg.enabled < 0.5) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+  let uv = fragCoord.xy / cfg.resolution;
+  let texel = 1.0 / cfg.resolution;
+  let selfId = idAt(uv);
+  let maxR = i32(cfg.radius);
+  for (var r = 1; r <= maxR; r = r + 1) {
+    let o = f32(r) * texel;
+    var offs = array<vec2<f32>, 8>(
+      vec2<f32>(o.x, 0.0), vec2<f32>(-o.x, 0.0),
+      vec2<f32>(0.0, o.y), vec2<f32>(0.0, -o.y),
+      vec2<f32>(o.x, o.y), vec2<f32>(-o.x, o.y),
+      vec2<f32>(o.x, -o.y), vec2<f32>(-o.x, -o.y)
+    );
+    for (var i = 0; i < 8; i = i + 1) {
+      let nId = idAt(uv + offs[i]);
+      // self is background, neighbor belongs to the target → rim on this pixel
+      if (selfId < 0.5 && abs(nId - cfg.targetId) < 0.5) {
+        return vec4<f32>(cfg.color, 1.0);
+      }
+    }
+  }
+  return vec4<f32>(0.0, 0.0, 0.0, 0.0);
 }
 `;
 
@@ -217,7 +326,8 @@ export class DeferredDemo implements Demo {
   private envMap!: EnvironmentMap;
   private brdfLut!: BrdfLut;
 
-  private gbufferPipeline!: GPURenderPipeline;
+  private gbufferStdPipeline!: GPURenderPipeline;
+  private gbufferToonPipeline!: GPURenderPipeline;
   private shadowPipeline!: GPURenderPipeline;
 
   private cubeVB!: GPUBuffer;
@@ -228,10 +338,12 @@ export class DeferredDemo implements Demo {
   private sphereIndexCount = 0;
 
   private globalsCubeUBO!: GPUBuffer;
-  private globalsBallUBO!: GPUBuffer;
+  private globalsSphereUBO!: GPUBuffer;
   private shadowUBO!: GPUBuffer;
-  private materialBG: GPUBindGroup | null = null;
+  private stdMaterialBG: GPUBindGroup | null = null;
+  private toonMaterialBG: GPUBindGroup | null = null;
   private standardMaterial!: MaterialInstance;
+  private toonMaterial!: MaterialInstance;
   private dummyDepthTexture!: GPUTexture;
 
   private prevViewProj: Float32Array = new Float32Array(16);
@@ -247,6 +359,7 @@ export class DeferredDemo implements Demo {
 
   private vsCode = "";
   private fsCode = "";
+  private toonFsCode = "";
 
   private cubePos: [number, number, number] = [0, 0, 0];
   private ballPos: [number, number, number] = [2.6, 0, 0];
@@ -262,12 +375,37 @@ export class DeferredDemo implements Demo {
   private gizmoPipeline!: GPURenderPipeline;
   private gizmoData = new Float32Array(6 * 8);
   private gizmoNDC = new Float32Array(6 * 2);
-  private outlinePipeline!: GPURenderPipeline;
-  private outlineUBO!: GPUBuffer;
-  private outlineUboData = new Float32Array(48);
-  private outlineBG: GPUBindGroup | null = null;
+  private outlineScreenPipeline!: GPURenderPipeline;
+  private outlineSampler!: GPUSampler;
+
+  // Layer A — cel (toon) outline: driven by ShadingModelID in the GBuffer
+  // material channel, so it belongs to the artwork and is included in exports.
+  private celOutlineUBO!: GPUBuffer;
+  private celOutlineUboData = new Float32Array(8);
+  private celOutlineBG: GPUBindGroup | null = null;
+
+  // Layer B — selection highlight: driven by the editor's selected object id
+  // (GBuffer normal.w). Editor-only overlay, EXCLUDED from exports.
+  private selOutlineUBO!: GPUBuffer;
+  private selOutlineUboData = new Float32Array(8);
+  private selOutlineBG: GPUBindGroup | null = null;
+
+  /** Editor-only selection outline (Blender-style orange rim). Off for exports. */
   outlineEnabled = true;
-  outlineScale = 1.04;
+  /** When false, the selection overlay is suppressed (e.g. when rendering to a file). */
+  editorOverlay = true;
+  /** Selection outline width in pixels (screen-space). */
+  selectionWidth = 2;
+  /** Always draw a cel-shading outline around TOON-shaded geometry. */
+  toonOutline = true;
+  /** Cel outline width in pixels (screen-space). */
+  celOutlineWidth = 1;
+  /** Number of diffuse bands for the toon sphere's cel shading. */
+  toonBands = 3;
+  /** Toon base color (also pushed into the toon MaterialInstance). */
+  toonR = 0.26;
+  toonG = 0.56;
+  toonB = 0.95;
 
   init(ctx: GPUContext, camera: Camera, engine?: EngineContext) {
     this.device = ctx.device;
@@ -302,8 +440,10 @@ export class DeferredDemo implements Demo {
     this.taaPass = new TAAPass(ctx.device, "rgba16float");
 
     this.standardMaterial = new MaterialInstance(STANDARD_MATERIAL_BLUEPRINT);
+    this.toonMaterial = new MaterialInstance(TOON_MATERIAL_BLUEPRINT);
     this.vsCode = GLOBALS_STRUCT + gbufferVSBody;
     this.fsCode = this.standardMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT + gbufferFSBody;
+    this.toonFsCode = this.toonMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT + gbufferToonFSBody;
 
     this.createGeometry();
     this.buildPipelines();
@@ -314,8 +454,8 @@ export class DeferredDemo implements Demo {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    this.globalsBallUBO = this.device.createBuffer({
-      label: "deferred-globals-ball-ubo",
+    this.globalsSphereUBO = this.device.createBuffer({
+      label: "deferred-globals-sphere-ubo",
       size: 352,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -342,10 +482,20 @@ export class DeferredDemo implements Demo {
       size: 6 * 8 * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
     });
-    this.outlineUBO = this.device.createBuffer({
-      label: "deferred-outline-ubo",
-      size: 192,
+    this.celOutlineUBO = this.device.createBuffer({
+      label: "deferred-cel-outline-ubo",
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.selOutlineUBO = this.device.createBuffer({
+      label: "deferred-sel-outline-ubo",
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    this.outlineSampler = this.device.createSampler({
+      label: "deferred-outline-sampler",
+      magFilter: "nearest",
+      minFilter: "nearest",
     });
 
     const cv = ctx.canvas;
@@ -399,8 +549,9 @@ export class DeferredDemo implements Demo {
     // Reset bind groups so they are recreated against the new pipeline layout
     // (also happens on shader hot-reload).
     this.gbufferCubeBG = null;
-    this.gbufferBallBG = null;
-    this.materialBG = null;
+    this.gbufferSphereBG = null;
+    this.stdMaterialBG = null;
+    this.toonMaterialBG = null;
 
     const vertexLayout: GPUVertexBufferLayout = {
       arrayStride: 8 * 4,
@@ -412,33 +563,42 @@ export class DeferredDemo implements Demo {
     };
 
     const vsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-vs", this.vsCode);
-    const fsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-fs", this.fsCode);
+    const stdFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-fs", this.fsCode);
+    const toonFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-toon-fs", this.toonFsCode);
 
-    this.gbufferPipeline = this.device.createRenderPipeline({
-      label: "deferred-gbuffer",
-      layout: "auto",
-      vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: {
-        module: fsModule,
-        entryPoint: "fs_main",
-        targets: [
-          { format: GBuffer.ALBEDO_FORMAT },
-          { format: GBuffer.NORMAL_FORMAT },
-          { format: GBuffer.MATERIAL_FORMAT },
-          { format: GBuffer.MOTION_FORMAT },
-          { format: GBuffer.DEPTH_COPY_FORMAT },
-        ],
-      },
-      primitive: { topology: "triangle-list", cullMode: "back" },
-      depthStencil: {
-        format: GBuffer.DEPTH_FORMAT,
-        depthWriteEnabled: true,
-        depthCompare: "less",
-      },
-    });
+    const makeGBufferPipeline = (label: string, fsModule: GPUShaderModule): GPURenderPipeline => {
+      return this.device.createRenderPipeline({
+        label,
+        layout: "auto",
+        vertex: { module: vsModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+        fragment: {
+          module: fsModule,
+          entryPoint: "fs_main",
+          targets: [
+            { format: GBuffer.ALBEDO_FORMAT },
+            { format: GBuffer.NORMAL_FORMAT },
+            { format: GBuffer.MATERIAL_FORMAT },
+            { format: GBuffer.MOTION_FORMAT },
+            { format: GBuffer.DEPTH_COPY_FORMAT },
+          ],
+        },
+        primitive: { topology: "triangle-list", cullMode: "back" },
+        depthStencil: {
+          format: GBuffer.DEPTH_FORMAT,
+          depthWriteEnabled: true,
+          depthCompare: "less",
+        },
+      });
+    };
 
-    // The material's uniform block (group 1) is shared across both draws.
-    this.materialBG = this.standardMaterial.createBindGroup(this.device, this.gbufferPipeline);
+    // Two GBuffer pipelines sharing the same vertex stage but writing
+    // different ShadingModelIDs into the material channel.
+    this.gbufferStdPipeline = makeGBufferPipeline("deferred-gbuffer-std", stdFsModule);
+    this.gbufferToonPipeline = makeGBufferPipeline("deferred-gbuffer-toon", toonFsModule);
+
+    // The material's uniform block (group 1) is per-pipeline.
+    this.stdMaterialBG = this.standardMaterial.createBindGroup(this.device, this.gbufferStdPipeline);
+    this.toonMaterialBG = this.toonMaterial.createBindGroup(this.device, this.gbufferToonPipeline);
 
     const shadowVsModule = this.device.createShaderModule({ code: shadowVS });
     this.shadowPipeline = this.device.createRenderPipeline({
@@ -472,18 +632,23 @@ export class DeferredDemo implements Demo {
       primitive: { topology: "line-list" },
     });
 
-    const outlineModule = this.device.createShaderModule({ code: outlineVS });
-    this.outlinePipeline = this.device.createRenderPipeline({
-      label: "deferred-outline",
+    const outlineScreenModule = this.device.createShaderModule({ code: outlineScreenShader });
+    this.outlineScreenPipeline = this.device.createRenderPipeline({
+      label: "deferred-outline-screen",
       layout: "auto",
-      vertex: { module: outlineModule, entryPoint: "vs_main", buffers: [vertexLayout] },
-      fragment: { module: outlineModule, entryPoint: "fs_main", targets: [{ format: this.ctx.format }] },
-      primitive: { topology: "triangle-list", cullMode: "front" },
-      depthStencil: {
-        format: GBuffer.DEPTH_FORMAT,
-        depthWriteEnabled: false,
-        depthCompare: "less",
+      vertex: { module: outlineScreenModule, entryPoint: "vs_main" },
+      fragment: {
+        module: outlineScreenModule,
+        entryPoint: "fs_main",
+        targets: [{
+          format: this.ctx.format,
+          blend: {
+            color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha" },
+          },
+        }],
       },
+      primitive: { topology: "triangle-list" },
     });
   }
 
@@ -506,9 +671,9 @@ export class DeferredDemo implements Demo {
   private jitteredVP = new Float32Array(16);
   private cubeModel = new Float32Array(16);
   private shadowCubeBG: GPUBindGroup | null = null;
-  private shadowBallBG: GPUBindGroup | null = null;
+  private shadowSphereBG: GPUBindGroup | null = null;
   private gbufferCubeBG: GPUBindGroup | null = null;
-  private gbufferBallBG: GPUBindGroup | null = null;
+  private gbufferSphereBG: GPUBindGroup | null = null;
   private frameTime = 0;
   private taaFrameIndex = 0;
   private taaJitter = true;
@@ -573,6 +738,14 @@ export class DeferredDemo implements Demo {
     this.standardMaterial.setField("metallic", this.metallic);
     this.standardMaterial.setField("roughness", this.roughness);
     this.standardMaterial.upload(this.device);
+
+    // Toon material: tint animates slowly, band count + base color from GUI.
+    this.toonMaterial.setField("time", time);
+    this.toonMaterial.setField("bandCount", this.toonBands);
+    this.toonMaterial.setField("r", this.toonR);
+    this.toonMaterial.setField("g", this.toonG);
+    this.toonMaterial.setField("b", this.toonB);
+    this.toonMaterial.upload(this.device);
     this.prevViewProj.set(viewProj as unknown as ArrayLike<number>);
     this.prevModel.set(model as unknown as ArrayLike<number>);
 
@@ -595,7 +768,7 @@ export class DeferredDemo implements Demo {
     ballUbo[83] = 1.0;
     ballUbo[84] = this.selectedId === 2 ? 1 : 0;
 
-    this.device.queue.writeBuffer(this.globalsBallUBO, 0, ballUbo as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.globalsSphereUBO, 0, ballUbo as unknown as GPUAllowSharedBufferSource);
     this.prevBallModel.set(ballModel as unknown as ArrayLike<number>);
 
     this.bloomPass.bloomIntensity = this.bloomIntensity;
@@ -624,6 +797,10 @@ export class DeferredDemo implements Demo {
         const w = this.ctx.canvas.width;
         const h = this.ctx.canvas.height;
         this.gbuffer.resize(w, h);
+        // Outline bind groups reference GBuffer textures, which are recreated on
+        // resize — drop the cached groups so they rebuild against the new views.
+        this.celOutlineBG = null;
+        this.selOutlineBG = null;
         this.passManager.resize(w, h);
 
         // Step 1: CSM shadow passes
@@ -652,13 +829,13 @@ export class DeferredDemo implements Demo {
             shadowUbo.set(this.ballUboData.subarray(32, 48) as unknown as ArrayLike<number>, 16);
             this.device.queue.writeBuffer(this.shadowUBO, 0, shadowUbo as unknown as GPUAllowSharedBufferSource);
 
-            if (!this.shadowBallBG) {
-              this.shadowBallBG = this.device.createBindGroup({
+            if (!this.shadowSphereBG) {
+              this.shadowSphereBG = this.device.createBindGroup({
                 layout: this.shadowPipeline.getBindGroupLayout(0),
                 entries: [{ binding: 0, resource: { buffer: this.shadowUBO } }],
               });
             }
-            shadowPass.setBindGroup(0, this.shadowBallBG);
+            shadowPass.setBindGroup(0, this.shadowSphereBG);
             shadowPass.setVertexBuffer(0, this.sphereVB);
             shadowPass.setIndexBuffer(this.sphereIB, "uint16");
             shadowPass.drawIndexed(this.sphereIndexCount);
@@ -666,32 +843,40 @@ export class DeferredDemo implements Demo {
           }
         }
 
-        // Step 2: GBuffer pass
+        // Step 2: GBuffer pass. Cube = STANDARD PBR, Sphere = TOON.
+        // Both write the same GBuffer layout; the lighting pass reads the
+        // materialID channel to pick the right BxDF — one scene, one light.
         {
           const gbufferPass = this.gbuffer.beginGBufferPass(encoder);
-          gbufferPass.setPipeline(this.gbufferPipeline);
+
+          // --- Cube: Standard PBR ---
+          gbufferPass.setPipeline(this.gbufferStdPipeline);
           if (!this.gbufferCubeBG) {
             this.gbufferCubeBG = this.device.createBindGroup({
-              layout: this.gbufferPipeline.getBindGroupLayout(0),
+              layout: this.gbufferStdPipeline.getBindGroupLayout(0),
               entries: [{ binding: 0, resource: { buffer: this.globalsCubeUBO } }],
             });
           }
           gbufferPass.setBindGroup(0, this.gbufferCubeBG);
-          gbufferPass.setBindGroup(1, this.materialBG!);
+          gbufferPass.setBindGroup(1, this.stdMaterialBG!);
           gbufferPass.setVertexBuffer(0, this.cubeVB);
           gbufferPass.setIndexBuffer(this.cubeIB, "uint16");
           gbufferPass.drawIndexed(this.cubeIndexCount);
 
-          if (!this.gbufferBallBG) {
-            this.gbufferBallBG = this.device.createBindGroup({
-              layout: this.gbufferPipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: this.globalsBallUBO } }],
+          // --- Sphere: Toon / cel ---
+          gbufferPass.setPipeline(this.gbufferToonPipeline);
+          if (!this.gbufferSphereBG) {
+            this.gbufferSphereBG = this.device.createBindGroup({
+              layout: this.gbufferToonPipeline.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: this.globalsSphereUBO } }],
             });
           }
-          gbufferPass.setBindGroup(0, this.gbufferBallBG);
-          gbufferPass.setBindGroup(1, this.materialBG!);
+          gbufferPass.setBindGroup(0, this.gbufferSphereBG);
+          gbufferPass.setBindGroup(1, this.toonMaterialBG!);
           gbufferPass.setVertexBuffer(0, this.sphereVB);
           gbufferPass.setIndexBuffer(this.sphereIB, "uint16");
+          gbufferPass.drawIndexed(this.sphereIndexCount);
+
           gbufferPass.end();
         }
 
@@ -755,47 +940,79 @@ export class DeferredDemo implements Demo {
           this.frameTime,
         );
 
-        // Step 8: Selection outline (Blender-style inverted hull) over the final image
-        if (this.outlineEnabled && this.selectedId > 0) {
-          if (!this.outlineBG) {
-            this.outlineBG = this.device.createBindGroup({
-              layout: this.outlinePipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: this.outlineUBO } }],
+        // Step 8: Screen-space outlines — two independent layers sharing one
+        // edge-detection machine.
+        //
+        // Layer A (cel/toon outline): driven by ShadingModelID in the GBuffer
+        // material channel. Belongs to the artwork → part of the beauty pass and
+        // included when rendering to a file.
+        if (this.toonOutline) {
+          if (!this.celOutlineBG) {
+            this.celOutlineBG = this.device.createBindGroup({
+              layout: this.outlineScreenPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: this.gbuffer.materialView },
+                { binding: 1, resource: this.outlineSampler },
+                { binding: 2, resource: { buffer: this.celOutlineUBO } },
+              ],
             });
           }
-          const oUbo = this.outlineUboData;
-          oUbo.set(this.frameViewProj as unknown as ArrayLike<number>, 0);
-          oUbo[32] = this.outlineScale;
-          const outlinePass = encoder.beginRenderPass({
-            label: "outline",
+          const c = this.celOutlineUboData;
+          c[0] = w; c[1] = h;
+          c[2] = ShadingModel.TOON;          // target id = TOON shading model
+          c[3] = this.celOutlineWidth;        // radius (px)
+          c[4] = 0.03; c[5] = 0.03; c[6] = 0.04; // near-black cel color
+          c[7] = 1.0;                          // enabled
+          this.device.queue.writeBuffer(this.celOutlineUBO, 0, c as unknown as GPUAllowSharedBufferSource);
+          const celPass = encoder.beginRenderPass({
+            label: "outline-cel",
             colorAttachments: [{
               view: screenView,
-              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
               loadOp: "load",
               storeOp: "store",
             }],
-            depthStencilAttachment: {
-              view: this.gbuffer.depthView,
-              depthLoadOp: "load",
-              depthStoreOp: "store",
-            },
           });
-          outlinePass.setPipeline(this.outlinePipeline);
-          outlinePass.setBindGroup(0, this.outlineBG);
-          if (this.selectedId === 1) {
-            oUbo.set(this.cubeModel as unknown as ArrayLike<number>, 16);
-            this.device.queue.writeBuffer(this.outlineUBO, 0, oUbo as unknown as GPUAllowSharedBufferSource);
-            outlinePass.setVertexBuffer(0, this.cubeVB);
-            outlinePass.setIndexBuffer(this.cubeIB, "uint16");
-            outlinePass.drawIndexed(this.cubeIndexCount);
-          } else {
-            oUbo.set(this.ballModel as unknown as ArrayLike<number>, 16);
-            this.device.queue.writeBuffer(this.outlineUBO, 0, oUbo as unknown as GPUAllowSharedBufferSource);
-            outlinePass.setVertexBuffer(0, this.sphereVB);
-            outlinePass.setIndexBuffer(this.sphereIB, "uint16");
-            outlinePass.drawIndexed(this.sphereIndexCount);
+          celPass.setPipeline(this.outlineScreenPipeline);
+          celPass.setBindGroup(0, this.celOutlineBG);
+          celPass.draw(3);
+          celPass.end();
+        }
+
+        // Layer B (selection highlight): driven by the editor's selected object
+        // id (GBuffer normal.w). Editor-only overlay → suppressed for exports by
+        // clearing editorOverlay.
+        if (this.outlineEnabled && this.editorOverlay && this.selectedId > 0) {
+          if (!this.selOutlineBG) {
+            this.selOutlineBG = this.device.createBindGroup({
+              layout: this.outlineScreenPipeline.getBindGroupLayout(0),
+              entries: [
+                { binding: 0, resource: this.gbuffer.normalView },
+                { binding: 1, resource: this.outlineSampler },
+                { binding: 2, resource: { buffer: this.selOutlineUBO } },
+              ],
+            });
           }
-          outlinePass.end();
+          const s = this.selOutlineUboData;
+          s[0] = w; s[1] = h;
+          s[2] = this.selectedId;            // target id = selected object
+          s[3] = this.selectionWidth;         // radius (px)
+          s[4] = 0.97; s[5] = 0.66; s[6] = 0.11; // Blender-style orange
+          s[7] = 1.0;                          // enabled
+          this.device.queue.writeBuffer(this.selOutlineUBO, 0, s as unknown as GPUAllowSharedBufferSource);
+          const selPass = encoder.beginRenderPass({
+            label: "outline-selection",
+            colorAttachments: [{
+              view: screenView,
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
+              loadOp: "load",
+              storeOp: "store",
+            }],
+          });
+          selPass.setPipeline(this.outlineScreenPipeline);
+          selPass.setBindGroup(0, this.selOutlineBG);
+          selPass.draw(3);
+          selPass.end();
         }
 
         // Step 9: Gizmo (selection axes) drawn over the final image
@@ -1033,8 +1250,16 @@ export class DeferredDemo implements Demo {
     editFolder.add(this, "editMode").name("Edit Mode (pick & move)");
     editFolder.add(this, "selectedId", 0, 2, 1).name("Selection").listen();
     editFolder.add(this, "outlineEnabled").name("Selection Outline");
-    editFolder.add(this, "outlineScale", 1.01, 1.2, 0.005).name("Outline Width");
+    editFolder.add(this, "editorOverlay").name("Editor Overlay (off for export)");
+    editFolder.add(this, "selectionWidth", 1, 6, 1).name("Selection Width (px)");
     gui.add(this.taaPass, "alpha", 0.02, 0.5, 0.01).name("TAA Alpha");
+    const toonFolder = gui.addFolder("Toon Sphere (ShadingModelID=TOON)");
+    toonFolder.add(this, "toonBands", 1, 6, 1).name("Cel Bands");
+    toonFolder.add(this, "toonR", 0, 1, 0.01).name("Base R");
+    toonFolder.add(this, "toonG", 0, 1, 0.01).name("Base G");
+    toonFolder.add(this, "toonB", 0, 1, 0.01).name("Base B");
+    toonFolder.add(this, "toonOutline").name("Cel Outline");
+    toonFolder.add(this, "celOutlineWidth", 1, 4, 0.5).name("Cel Outline Width (px)");
     const taaFolder = gui.addFolder("TAA Debug");
     taaFolder.add(this.taaPass, "debugMode", {
       "OFF": 0,
@@ -1062,10 +1287,12 @@ export class DeferredDemo implements Demo {
     this.sphereVB.destroy();
     this.sphereIB.destroy();
     this.globalsCubeUBO.destroy();
-    this.globalsBallUBO.destroy();
+    this.globalsSphereUBO.destroy();
     this.standardMaterial.destroy();
+    this.toonMaterial.destroy();
     this.shadowUBO.destroy();
-    this.outlineUBO.destroy();
+    this.celOutlineUBO.destroy();
+    this.selOutlineUBO.destroy();
     this.gizmoVB.destroy();
     this.dummyDepthTexture.destroy();
     this.gbuffer.destroy();

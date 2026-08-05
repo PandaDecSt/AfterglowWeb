@@ -363,6 +363,75 @@ fn cookTorrance(N: vec3<f32>, V: vec3<f32>, L: vec3<f32>, f0: vec3<f32>, roughne
   return D * G * F;
 }
 
+// ---- Toon / cel shading (ShadingModelID == TOON) -------------------------
+// Quantize N·L into discrete bands for the flat anime look, plus a crisp
+// stepped specular. Shadows still apply (sampled in the caller).
+fn quantizeToon(x: f32, bands: f32) -> f32 {
+  let b = max(bands, 1.0);
+  let scaled = clamp(x, 0.0, 1.0) * b;
+  let lo = floor(scaled);
+  let frac = scaled - lo;
+  // small soft edge at each band boundary for anti-aliasing
+  let edge = smoothstep(0.9, 1.0, frac);
+  return (lo + edge) / max(b - 1.0, 1.0);
+}
+
+fn evalLightToon(
+  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
+  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+  baseColor: vec3<f32>, bands: f32
+) -> vec3<f32> {
+  var L: vec3<f32>;
+  var attenuation = 1.0;
+  var lightColor: vec3<f32>;
+  let lt = i32(lightType);
+
+  if (lt == 0) {
+    L = normalize(-posOrDir.xyz);
+    lightColor = colorOrDir2.rgb * lightParams.y;
+  } else if (lt == 1) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let falloff = lightParams.w;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, falloff));
+    attenuation = attenuation * attenuation;
+    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
+  } else if (lt == 2) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, 2.0));
+    attenuation = attenuation * attenuation;
+    let spotDir = normalize(colorOrDir2.xyz);
+    let cosAngle = dot(-L, spotDir);
+    let outerCone = lightParams.w;
+    let innerCone = posOrDir.w;
+    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
+    attenuation *= spotAtten * spotAtten;
+    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
+  } else {
+    return vec3<f32>(0.0);
+  }
+
+  let nol = max(dot(N, L), 0.0);
+  if (nol <= 0.0) { return vec3<f32>(0.0); }
+
+  let diffuseTone = quantizeToon(nol, bands);
+  var col = baseColor * diffuseTone * lightColor;
+
+  // crisp cartoon highlight
+  let H = normalize(V + L);
+  let spec = smoothstep(0.86, 0.94, max(dot(N, H), 0.0));
+  col += lightColor * spec * 0.7;
+
+  return col;
+}
+
 fn evalLight(
   lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
   worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
@@ -441,6 +510,31 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 
   let worldPos = reconstructWorldPos(uv, depth);
   let V = normalize(u.cameraPos.xyz - worldPos);
+
+  // --- ShadingModelID dispatch -------------------------------------------
+  // material.a carries the shading model id written by the GBuffer pass.
+  let matID = material.a;
+  if (matID > 0.5) {
+    // TOON / cel shading: quantized diffuse, crisp specular, shadows kept.
+    let bands = max(material.g, 1.0);
+    var toonColor = u.ambient.rgb * baseColor * ao;
+    let numLightsT = i32(lights[0]);
+    for (var i = 0; i < numLightsT; i = i + 1) {
+      let base = 1 + i * 12;
+      let lightType = lights[base + 0];
+      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
+      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
+      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
+      var shadowVis = 1.0;
+      if (lightType == 0.0) {
+        let L = normalize(-posOrDir.xyz);
+        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
+      }
+      toonColor += evalLightToon(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, bands) * shadowVis;
+    }
+    toonColor += baseColor * emissive;
+    return vec4<f32>(toonColor, 1.0);
+  }
 
   var color = u.ambient.rgb * baseColor * ao * (1.0 - min(u.envIntensity.x, 1.0));
 
