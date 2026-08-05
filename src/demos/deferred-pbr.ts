@@ -199,6 +199,106 @@ fn fs_main(in: VSOut) -> GBufferOutput {
 }
 `;
 
+// ---- Step 2 character materials (ShadingModelID 2/3/4) -------------------
+// Each packs its own parameters into the GBuffer material channel; the
+// lighting pass reads them back to pick the right BxDF.
+const SKIN_MATERIAL_BLUEPRINT: MaterialBlueprint = {
+  name: "skin",
+  group: 1,
+  fields: [
+    { name: "time", type: "f32", value: 0 },
+    { name: "sssStrength", type: "f32", value: 0.8 },
+    { name: "roughness", type: "f32", value: 0.4 },
+  ],
+};
+
+const HAIR_MATERIAL_BLUEPRINT: MaterialBlueprint = {
+  name: "hair",
+  group: 1,
+  fields: [
+    { name: "time", type: "f32", value: 0 },
+    { name: "roughness", type: "f32", value: 0.5 },
+    { name: "aniso", type: "f32", value: 0.5 },
+  ],
+};
+
+const EYE_MATERIAL_BLUEPRINT: MaterialBlueprint = {
+  name: "eye",
+  group: 1,
+  fields: [
+    { name: "time", type: "f32", value: 0 },
+    { name: "cornea", type: "f32", value: 0.9 },
+    { name: "irisDark", type: "f32", value: 0.25 },
+  ],
+};
+
+// Generic GBuffer FS for a character part: writes a flat albedo and stamps
+// ShadingModelID into material.a. `albedoExpr` / `packExpr` are WGSL
+// expressions (they may reference the material's fields via `mat_<name>.x`).
+function makeCharGbufferFS(
+  id: number,
+  material: MaterialInstance,
+  albedoExpr: string,
+  packExpr: string,
+  objectId: number,
+): string {
+  return `
+struct VSOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) worldPos: vec3<f32>,
+  @location(1) worldNormal: vec3<f32>,
+  @location(2) uv: vec2<f32>,
+  @location(3) prevClipXY: vec2<f32>,
+  @location(4) prevClipW: f32,
+  @location(5) curClipXY: vec2<f32>,
+  @location(6) curClipW: f32,
+};
+
+struct GBufferOutput {
+  @location(0) albedo: vec4<f32>,
+  @location(1) normal: vec4<f32>,
+  @location(2) material: vec4<f32>,
+  @location(3) motion: vec2<f32>,
+  @location(4) depthCopy: vec4<f32>,
+};
+
+@fragment
+fn fs_main(in: VSOut) -> GBufferOutput {
+  var out: GBufferOutput;
+  var baseColor = ${albedoExpr};
+  out.albedo = vec4<f32>(baseColor, 1.0);
+  // normal.w carries the object ID for the screen-space selection outline.
+  out.normal = vec4<f32>(normalize(in.worldNormal), ${objectId.toFixed(1)});
+  // material = (paramR, paramG, paramB, shadingModelId)
+  out.material = vec4<f32>(${packExpr}, ${id.toFixed(1)});
+  let prevNDC = in.prevClipXY / in.prevClipW;
+  let curNDC = in.curClipXY / in.curClipW;
+  out.motion = vec2<f32>((curNDC.x - prevNDC.x) * 0.5, (prevNDC.y - curNDC.y) * 0.5);
+  out.depthCopy = vec4<f32>(in.position.z, 0.0, 0.0, 0.0);
+  return out;
+}
+`;
+}
+
+/** One character part in the Step-2 demo scene. */
+interface CharPart {
+  material: MaterialInstance;
+  fsCode: string;
+  pipeline: GPURenderPipeline | null;
+  materialBG: GPUBindGroup | null;
+  gbufferBG: GPUBindGroup | null;
+  globalsUBO: GPUBuffer | null;
+  uboData: Float32Array;
+  model: Float32Array;
+  prevModel: Float32Array;
+  position: [number, number, number];
+  scale: [number, number, number];
+  rotSpeed: number;
+  objectId: number;
+  selectedId: number;
+  geometry: "sphere" | "cube";
+}
+
 const shadowVS = `
 struct Uniforms {
   lightVP: mat4x4<f32>,
@@ -407,6 +507,33 @@ export class DeferredDemo implements Demo {
   toonG = 0.56;
   toonB = 0.95;
 
+  // --- Step 2 character shading GUI params (ShadingModelID 2/3/4) -------
+  /** Skin subsurface-scattering strength (0-1). */
+  skinSss = 0.8;
+  /** Skin roughness. */
+  skinRoughness = 0.4;
+  /** Hair roughness. */
+  hairRoughness = 0.5;
+  /** Hair anisotropy / strand shift. */
+  hairAniso = 0.5;
+  /** Eye cornea highlight strength. */
+  eyeCornea = 0.9;
+  /** Eye iris darkness (lower = darker iris). */
+  eyeIrisDark = 0.25;
+
+  // Step 2 character parts (skin head / hair tuft / eye). Each is a full
+  // GBuffer pipeline + MaterialInstance + per-object globals UBO.
+  private skinMaterial!: MaterialInstance;
+  private hairMaterial!: MaterialInstance;
+  private eyeMaterial!: MaterialInstance;
+  private gbufferSkinPipeline!: GPURenderPipeline;
+  private gbufferHairPipeline!: GPURenderPipeline;
+  private gbufferEyePipeline!: GPURenderPipeline;
+  private skinFsCode = "";
+  private hairFsCode = "";
+  private eyeFsCode = "";
+  private charParts: CharPart[] = [];
+
   init(ctx: GPUContext, camera: Camera, engine?: EngineContext) {
     this.device = ctx.device;
     this.ctx = ctx;
@@ -444,6 +571,46 @@ export class DeferredDemo implements Demo {
     this.vsCode = GLOBALS_STRUCT + gbufferVSBody;
     this.fsCode = this.standardMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT + gbufferFSBody;
     this.toonFsCode = this.toonMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT + gbufferToonFSBody;
+
+    // Step 2 character materials + their GBuffer FS (stamp ShadingModelID).
+    this.skinMaterial = new MaterialInstance(SKIN_MATERIAL_BLUEPRINT);
+    this.hairMaterial = new MaterialInstance(HAIR_MATERIAL_BLUEPRINT);
+    this.eyeMaterial = new MaterialInstance(EYE_MATERIAL_BLUEPRINT);
+    this.skinFsCode = this.skinMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT
+      + makeCharGbufferFS(ShadingModel.SKIN, this.skinMaterial, "vec3<f32>(0.95, 0.72, 0.62)", "vec3<f32>(mat_skin.sssStrength, mat_skin.roughness, 0.0)", 3);
+    this.hairFsCode = this.hairMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT
+      + makeCharGbufferFS(ShadingModel.HAIR, this.hairMaterial, "vec3<f32>(0.28, 0.18, 0.13)", "vec3<f32>(mat_hair.roughness, mat_hair.aniso, 0.0)", 4);
+    this.eyeFsCode = this.eyeMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT
+      + makeCharGbufferFS(ShadingModel.EYE, this.eyeMaterial, "vec3<f32>(0.85, 0.9, 0.95)", "vec3<f32>(mat_eye.cornea, mat_eye.irisDark, 0.0)", 5);
+
+    const mkCharUbo = (label: string) => this.device.createBuffer({
+      label, size: 352, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    // Step 2 character parts: a small "head" = skin sphere + hair tuft
+    // (stretched cube) + eye sphere. Placed to the left of the standard cube
+    // / toon sphere so all five objects share ONE scene, ONE lighting pass.
+    // NOTE: must be populated BEFORE buildPipelines() so the per-part pipeline
+    // references are valid.
+    this.charParts = [
+      {
+        material: this.skinMaterial, fsCode: this.skinFsCode,
+        pipeline: null, materialBG: null, gbufferBG: null, globalsUBO: mkCharUbo("deferred-globals-skin-ubo"),
+        uboData: new Float32Array(88), model: new Float32Array(16), prevModel: new Float32Array(16),
+        position: [-2.6, 0, 0.5], scale: [1.1, 1.1, 1.1], rotSpeed: 0.3, objectId: 3, selectedId: 3, geometry: "sphere",
+      },
+      {
+        material: this.hairMaterial, fsCode: this.hairFsCode,
+        pipeline: null, materialBG: null, gbufferBG: null, globalsUBO: mkCharUbo("deferred-globals-hair-ubo"),
+        uboData: new Float32Array(88), model: new Float32Array(16), prevModel: new Float32Array(16),
+        position: [-2.6, 1.15, 0.5], scale: [0.22, 0.9, 0.22], rotSpeed: 0.0, objectId: 4, selectedId: 4, geometry: "cube",
+      },
+      {
+        material: this.eyeMaterial, fsCode: this.eyeFsCode,
+        pipeline: null, materialBG: null, gbufferBG: null, globalsUBO: mkCharUbo("deferred-globals-eye-ubo"),
+        uboData: new Float32Array(88), model: new Float32Array(16), prevModel: new Float32Array(16),
+        position: [-2.15, 0.2, 1.25], scale: [0.35, 0.35, 0.35], rotSpeed: 0.3, objectId: 5, selectedId: 5, geometry: "sphere",
+      },
+    ];
 
     this.createGeometry();
     this.buildPipelines();
@@ -552,6 +719,7 @@ export class DeferredDemo implements Demo {
     this.gbufferSphereBG = null;
     this.stdMaterialBG = null;
     this.toonMaterialBG = null;
+    for (const p of this.charParts) { p.gbufferBG = null; p.materialBG = null; }
 
     const vertexLayout: GPUVertexBufferLayout = {
       arrayStride: 8 * 4,
@@ -565,6 +733,9 @@ export class DeferredDemo implements Demo {
     const vsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-vs", this.vsCode);
     const stdFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-fs", this.fsCode);
     const toonFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-toon-fs", this.toonFsCode);
+    const skinFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-skin-fs", this.skinFsCode);
+    const hairFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-hair-fs", this.hairFsCode);
+    const eyeFsModule = this.engine.modules.resolveAndCompile(this.device, "deferred-gbuffer-eye-fs", this.eyeFsCode);
 
     const makeGBufferPipeline = (label: string, fsModule: GPUShaderModule): GPURenderPipeline => {
       return this.device.createRenderPipeline({
@@ -595,10 +766,19 @@ export class DeferredDemo implements Demo {
     // different ShadingModelIDs into the material channel.
     this.gbufferStdPipeline = makeGBufferPipeline("deferred-gbuffer-std", stdFsModule);
     this.gbufferToonPipeline = makeGBufferPipeline("deferred-gbuffer-toon", toonFsModule);
+    this.gbufferSkinPipeline = makeGBufferPipeline("deferred-gbuffer-skin", skinFsModule);
+    this.gbufferHairPipeline = makeGBufferPipeline("deferred-gbuffer-hair", hairFsModule);
+    this.gbufferEyePipeline = makeGBufferPipeline("deferred-gbuffer-eye", eyeFsModule);
+    this.charParts[0].pipeline = this.gbufferSkinPipeline;
+    this.charParts[1].pipeline = this.gbufferHairPipeline;
+    this.charParts[2].pipeline = this.gbufferEyePipeline;
 
     // The material's uniform block (group 1) is per-pipeline.
     this.stdMaterialBG = this.standardMaterial.createBindGroup(this.device, this.gbufferStdPipeline);
     this.toonMaterialBG = this.toonMaterial.createBindGroup(this.device, this.gbufferToonPipeline);
+    for (const p of this.charParts) {
+      p.materialBG = p.material.createBindGroup(this.device, p.pipeline!);
+    }
 
     const shadowVsModule = this.device.createShaderModule({ code: shadowVS });
     this.shadowPipeline = this.device.createRenderPipeline({
@@ -771,6 +951,40 @@ export class DeferredDemo implements Demo {
     this.device.queue.writeBuffer(this.globalsSphereUBO, 0, ballUbo as unknown as GPUAllowSharedBufferSource);
     this.prevBallModel.set(ballModel as unknown as ArrayLike<number>);
 
+    // Step 2 character parts: per-object globals + material params.
+    for (const p of this.charParts) {
+      const m = mat4.mul(
+        mat4.translation(p.position),
+        mat4.mul(mat4.rotationY(time * p.rotSpeed), mat4.scaling(p.scale)),
+      );
+      const invT = mat4.transpose(mat4.inverse(m));
+      p.uboData.set(viewProj as unknown as ArrayLike<number>, 0);
+      p.uboData.set(this.prevViewProj as unknown as ArrayLike<number>, 16);
+      p.uboData.set(m as unknown as ArrayLike<number>, 32);
+      p.uboData.set(invT as unknown as ArrayLike<number>, 48);
+      p.uboData.set(p.prevModel as unknown as ArrayLike<number>, 64);
+      p.uboData[80] = this.camera.position[0];
+      p.uboData[81] = this.camera.position[1];
+      p.uboData[82] = this.camera.position[2];
+      p.uboData[83] = 1.0;
+      p.uboData[84] = this.selectedId === p.selectedId ? 1 : 0;
+      this.device.queue.writeBuffer(p.globalsUBO!, 0, p.uboData as unknown as GPUAllowSharedBufferSource);
+      p.prevModel.set(m as unknown as ArrayLike<number>);
+
+      p.material.setField("time", time);
+      if (p.material.name === "skin") {
+        p.material.setField("sssStrength", this.skinSss);
+        p.material.setField("roughness", this.skinRoughness);
+      } else if (p.material.name === "hair") {
+        p.material.setField("roughness", this.hairRoughness);
+        p.material.setField("aniso", this.hairAniso);
+      } else if (p.material.name === "eye") {
+        p.material.setField("cornea", this.eyeCornea);
+        p.material.setField("irisDark", this.eyeIrisDark);
+      }
+      p.material.upload(this.device);
+    }
+
     this.bloomPass.bloomIntensity = this.bloomIntensity;
 
     const invViewProj = mat4.inverse(viewProj);
@@ -839,6 +1053,20 @@ export class DeferredDemo implements Demo {
             shadowPass.setVertexBuffer(0, this.sphereVB);
             shadowPass.setIndexBuffer(this.sphereIB, "uint16");
             shadowPass.drawIndexed(this.sphereIndexCount);
+
+            // Step 2 character parts also cast shadows.
+            for (const p of this.charParts) {
+              shadowUbo.set(this.csm.cascadeVPs[i] as unknown as ArrayLike<number>, 0);
+              shadowUbo.set(p.model as unknown as ArrayLike<number>, 16);
+              this.device.queue.writeBuffer(this.shadowUBO, 0, shadowUbo as unknown as GPUAllowSharedBufferSource);
+              shadowPass.setBindGroup(0, this.shadowCubeBG!);
+              const vb = p.geometry === "sphere" ? this.sphereVB : this.cubeVB;
+              const ib = p.geometry === "sphere" ? this.sphereIB : this.cubeIB;
+              const idx = p.geometry === "sphere" ? this.sphereIndexCount : this.cubeIndexCount;
+              shadowPass.setVertexBuffer(0, vb);
+              shadowPass.setIndexBuffer(ib, "uint16");
+              shadowPass.drawIndexed(idx);
+            }
             shadowPass.end();
           }
         }
@@ -876,6 +1104,27 @@ export class DeferredDemo implements Demo {
           gbufferPass.setVertexBuffer(0, this.sphereVB);
           gbufferPass.setIndexBuffer(this.sphereIB, "uint16");
           gbufferPass.drawIndexed(this.sphereIndexCount);
+
+          // --- Step 2 character parts: SKIN / HAIR / EYE ---
+          // Each writes its own ShadingModelID into the GBuffer material
+          // channel; the lighting pass picks the matching BxDF. Same scene.
+          for (const p of this.charParts) {
+            gbufferPass.setPipeline(p.pipeline!);
+            if (!p.gbufferBG) {
+              p.gbufferBG = this.device.createBindGroup({
+                layout: p.pipeline!.getBindGroupLayout(0),
+                entries: [{ binding: 0, resource: { buffer: p.globalsUBO! } }],
+              });
+            }
+            gbufferPass.setBindGroup(0, p.gbufferBG);
+            gbufferPass.setBindGroup(1, p.materialBG!);
+            const vb = p.geometry === "sphere" ? this.sphereVB : this.cubeVB;
+            const ib = p.geometry === "sphere" ? this.sphereIB : this.cubeIB;
+            const idx = p.geometry === "sphere" ? this.sphereIndexCount : this.cubeIndexCount;
+            gbufferPass.setVertexBuffer(0, vb);
+            gbufferPass.setIndexBuffer(ib, "uint16");
+            gbufferPass.drawIndexed(idx);
+          }
 
           gbufferPass.end();
         }
@@ -1063,7 +1312,8 @@ export class DeferredDemo implements Demo {
   private GIZMO_LEN = 0.6;
 
   private buildGizmoData(): void {
-    const pos = this.selectedId === 1 ? this.cubePos : this.ballPos;
+    const part = this.charParts.find((p) => p.selectedId === this.selectedId);
+    const pos = this.selectedId === 1 ? this.cubePos : this.selectedId === 2 ? this.ballPos : (part ? part.position : this.cubePos);
     const d = this.gizmoData;
     const ndc = this.gizmoNDC;
     for (let a = 0; a < 3; a++) {
@@ -1126,7 +1376,9 @@ export class DeferredDemo implements Demo {
   private applyGizmoDrag(dxPx: number, dyPx: number): void {
     if (this.dragAxis < 1 || this.dragAxis > 3) return;
     const axis = this.gizmoAxes[this.dragAxis - 1];
-    const pos = this.selectedId === 1 ? this.cubePos : this.ballPos;
+    const part = this.selectedId > 2 ? this.charParts.find((p) => p.selectedId === this.selectedId) : null;
+    const pos = this.selectedId === 1 ? this.cubePos : this.selectedId === 2 ? this.ballPos : (part ? part.position : null);
+    if (!pos) return;
     const p0 = mat4.mul(this.frameViewProj as unknown as Mat4, vec4.create(pos[0], pos[1], pos[2], 1));
     const p1 = mat4.mul(this.frameViewProj as unknown as Mat4, vec4.create(pos[0] + axis[0], pos[1] + axis[1], pos[2] + axis[2], 1));
     let sx = p1[0] / p1[3] - p0[0] / p0[3];
@@ -1234,7 +1486,41 @@ export class DeferredDemo implements Demo {
       if (t < bestT) { bestT = t; bestId = 1; }
     }
 
+    // Character parts (SKIN/HAIR/EYE): OBB via inverse model; sphere geometry
+    // is a unit sphere (AABB [-1, 1]), cube geometry is [-1.5, 1.5].
+    for (const p of this.charParts) {
+      const half = p.geometry === "sphere" ? 1 : 1.5;
+      const t = this.rayHitOBB(cam, rd, p.model, half);
+      if (t < bestT) { bestT = t; bestId = p.objectId; }
+    }
+
     return bestId;
+  }
+
+  /** Slab test against an oriented box: model transforms the unit sphere /
+   *  cube geometry; returns the ray parameter t (> 0) or Infinity on miss. */
+  private rayHitOBB(ro: ArrayLike<number>, rd: ArrayLike<number>, model: Float32Array, half: number): number {
+    const inv = mat4.inverse(model as unknown as Mat4) as unknown as Float32Array;
+    const om = mat4.mul(inv, vec4.create(ro[0], ro[1], ro[2], 1));
+    const dm = mat4.mul(inv, vec4.create(ro[0] + rd[0], ro[1] + rd[1], ro[2] + rd[2], 1));
+    const ox = om[0] / om[3], oy = om[1] / om[3], oz = om[2] / om[3];
+    const dx = dm[0] / dm[3] - ox, dy = dm[1] / dm[3] - oy, dz = dm[2] / dm[3] - oz;
+    let tmin = -Infinity;
+    let tmax = Infinity;
+    for (const s of [[dx, ox], [dy, oy], [dz, oz]] as const) {
+      const d = s[0], o = s[1];
+      if (Math.abs(d) < 1e-8) {
+        if (o < -half || o > half) return Infinity;
+      } else {
+        let t1 = (-half - o) / d;
+        let t2 = (half - o) / d;
+        if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+        tmin = Math.max(tmin, t1);
+        tmax = Math.min(tmax, t2);
+        if (tmin > tmax) return Infinity;
+      }
+    }
+    return Math.max(tmin, 0);
   }
 
   registerGUI(gui: any) {
@@ -1248,7 +1534,7 @@ export class DeferredDemo implements Demo {
     gui.add(this, "pauseAnimation").name("Pause");
     const editFolder = gui.addFolder("Edit");
     editFolder.add(this, "editMode").name("Edit Mode (pick & move)");
-    editFolder.add(this, "selectedId", 0, 2, 1).name("Selection").listen();
+    editFolder.add(this, "selectedId", 0, 5, 1).name("Selection (1=cube 2=sphere 3=skin 4=hair 5=eye)").listen();
     editFolder.add(this, "outlineEnabled").name("Selection Outline");
     editFolder.add(this, "editorOverlay").name("Editor Overlay (off for export)");
     editFolder.add(this, "selectionWidth", 1, 6, 1).name("Selection Width (px)");
@@ -1260,6 +1546,13 @@ export class DeferredDemo implements Demo {
     toonFolder.add(this, "toonB", 0, 1, 0.01).name("Base B");
     toonFolder.add(this, "toonOutline").name("Cel Outline");
     toonFolder.add(this, "celOutlineWidth", 1, 4, 0.5).name("Cel Outline Width (px)");
+    const charFolder = gui.addFolder("Character (Step 2: SKIN/HAIR/EYE)");
+    charFolder.add(this, "skinSss", 0, 1, 0.01).name("Skin SSS Strength");
+    charFolder.add(this, "skinRoughness", 0.01, 1, 0.01).name("Skin Roughness");
+    charFolder.add(this, "hairRoughness", 0.01, 1, 0.01).name("Hair Roughness");
+    charFolder.add(this, "hairAniso", 0, 1, 0.01).name("Hair Anisotropy");
+    charFolder.add(this, "eyeCornea", 0, 1, 0.01).name("Eye Cornea Highlight");
+    charFolder.add(this, "eyeIrisDark", 0.05, 1, 0.01).name("Eye Iris Darkness");
     const taaFolder = gui.addFolder("TAA Debug");
     taaFolder.add(this.taaPass, "debugMode", {
       "OFF": 0,
@@ -1290,6 +1583,10 @@ export class DeferredDemo implements Demo {
     this.globalsSphereUBO.destroy();
     this.standardMaterial.destroy();
     this.toonMaterial.destroy();
+    for (const p of this.charParts) {
+      p.globalsUBO?.destroy();
+      p.material.destroy();
+    }
     this.shadowUBO.destroy();
     this.celOutlineUBO.destroy();
     this.selOutlineUBO.destroy();

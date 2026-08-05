@@ -432,6 +432,202 @@ fn evalLightToon(
   return col;
 }
 
+// ---- Skin / subsurface scattering (ShadingModelID == SKIN) ----------------
+// Cheap SSS approximation: a wrap-diffuse term so light bleeds slightly past
+// the terminator, tinted with a reddish subsurface color on the shadowed
+// side. Far from a real screen-space diffusion profile, but reads as "skin".
+fn evalSkin(
+  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
+  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+  baseColor: vec3<f32>, sssStrength: f32, roughness: f32
+) -> vec3<f32> {
+  var L: vec3<f32>;
+  var attenuation = 1.0;
+  var lightColor: vec3<f32>;
+  let lt = i32(lightType);
+  if (lt == 0) {
+    L = normalize(-posOrDir.xyz);
+    lightColor = colorOrDir2.rgb * lightParams.y;
+  } else if (lt == 1) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let falloff = lightParams.w;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, falloff));
+    attenuation = attenuation * attenuation;
+    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
+  } else if (lt == 2) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, 2.0));
+    attenuation = attenuation * attenuation;
+    let spotDir = normalize(colorOrDir2.xyz);
+    let cosAngle = dot(-L, spotDir);
+    let outerCone = lightParams.w;
+    let innerCone = posOrDir.w;
+    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
+    attenuation *= spotAtten * spotAtten;
+    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
+  } else {
+    return vec3<f32>(0.0);
+  }
+
+  let nol = max(dot(N, L), 0.0);
+  if (nol <= 0.0) { return vec3<f32>(0.0); }
+
+  // Wrap diffuse: light wraps a bit past the terminator (subsurface scatter).
+  let wrap = 0.35;
+  let wrapNL = max(0.0, (nol + wrap) / (1.0 + wrap));
+  // Reddish transmission glow on the shadowed side (back-lit skin).
+  let backWrap = max(0.0, (dot(-N, L) + wrap * 2.0) / (1.0 + wrap * 2.0));
+  let subsurfaceColor = vec3<f32>(1.0, 0.5, 0.42);
+  var diffuse = baseColor * wrapNL + baseColor * subsurfaceColor * backWrap * sssStrength * 0.6;
+
+  let f0 = vec3<f32>(0.03);
+  let specular = cookTorrance(N, V, L, f0, roughness) * nol;
+  let kS = fresnelSchlick(f0, max(dot(N, V), 0.0));
+  let kD = (vec3<f32>(1.0) - kS);
+  let diffuseLit = kD * diffuse * INV_PI * nol;
+
+  return (diffuseLit + specular) * lightColor;
+}
+
+// ---- Hair / anisotropic dual-spec (ShadingModelID == HAIR) ----------------
+// Kajiya-Kay hair model: the specular highlight rides along a tangent
+// direction. Without per-vertex tangents we derive a streak direction from
+// the normal and world up, which is enough to read as "hair strands".
+fn evalHair(
+  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
+  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+  baseColor: vec3<f32>, roughness: f32, aniso: f32
+) -> vec3<f32> {
+  var L: vec3<f32>;
+  var attenuation = 1.0;
+  var lightColor: vec3<f32>;
+  let lt = i32(lightType);
+  if (lt == 0) {
+    L = normalize(-posOrDir.xyz);
+    lightColor = colorOrDir2.rgb * lightParams.y;
+  } else if (lt == 1) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let falloff = lightParams.w;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, falloff));
+    attenuation = attenuation * attenuation;
+    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
+  } else if (lt == 2) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, 2.0));
+    attenuation = attenuation * attenuation;
+    let spotDir = normalize(colorOrDir2.xyz);
+    let cosAngle = dot(-L, spotDir);
+    let outerCone = lightParams.w;
+    let innerCone = posOrDir.w;
+    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
+    attenuation *= spotAtten * spotAtten;
+    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
+  } else {
+    return vec3<f32>(0.0);
+  }
+
+  let nol = max(dot(N, L), 0.0);
+  if (nol <= 0.0) { return vec3<f32>(0.0); }
+
+  // Streak tangent from normal + world up.
+  let up = vec3<f32>(0.0, 1.0, 0.0);
+  var T = normalize(cross(up, N));
+  if (length(T) < 0.001) { T = normalize(cross(vec3<f32>(1.0, 0.0, 0.0), N)); }
+  let H = normalize(V + L);
+
+  // Two shifted specular lobes (primary highlight + secondary sheen).
+  let shift1 = aniso * 0.12;
+  let shift2 = -aniso * 0.12;
+  let tH1 = dot(T, H) + shift1;
+  let tH2 = dot(T, H) + shift2;
+  let sinTH1 = sqrt(max(1.0 - tH1 * tH1, 0.0));
+  let sinTH2 = sqrt(max(1.0 - tH2 * tH2, 0.0));
+  let gloss1 = mix(90.0, 12.0, roughness);
+  let gloss2 = mix(45.0, 6.0, roughness);
+  let spec1 = pow(sinTH1, gloss1) * 0.85;
+  let spec2 = pow(sinTH2, gloss2) * 0.5;
+
+  let diffuse = baseColor * nol * INV_PI;
+  let specular = (spec1 + spec2) * vec3<f32>(1.0, 0.95, 0.85);
+
+  return (diffuse + specular) * lightColor;
+}
+
+// ---- Eye / cornea + iris (ShadingModelID == EYE) --------------------------
+// A bright tight cornea highlight plus a darker iris disc. Demonstrative,
+// not anatomically exact — a real eye needs a parallax/iris texture.
+fn evalEye(
+  lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
+  worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
+  baseColor: vec3<f32>, cornea: f32, irisDark: f32
+) -> vec3<f32> {
+  var L: vec3<f32>;
+  var attenuation = 1.0;
+  var lightColor: vec3<f32>;
+  let lt = i32(lightType);
+  if (lt == 0) {
+    L = normalize(-posOrDir.xyz);
+    lightColor = colorOrDir2.rgb * lightParams.y;
+  } else if (lt == 1) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let falloff = lightParams.w;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, falloff));
+    attenuation = attenuation * attenuation;
+    lightColor = colorOrDir2.rgb * lightParams.y * attenuation;
+  } else if (lt == 2) {
+    let toLight = posOrDir.xyz - worldPos;
+    let dist = length(toLight);
+    L = toLight / max(dist, EPSILON);
+    let range = lightParams.z;
+    let distRatio = dist / range;
+    attenuation = saturate(1.0 - pow(distRatio, 2.0));
+    attenuation = attenuation * attenuation;
+    let spotDir = normalize(colorOrDir2.xyz);
+    let cosAngle = dot(-L, spotDir);
+    let outerCone = lightParams.w;
+    let innerCone = posOrDir.w;
+    let spotAtten = saturate((cosAngle - outerCone) / max(innerCone - outerCone, EPSILON));
+    attenuation *= spotAtten * spotAtten;
+    lightColor = vec3<f32>(1.0, 1.0, 1.0) * lightParams.y * attenuation;
+  } else {
+    return vec3<f32>(0.0);
+  }
+
+  let nol = max(dot(N, L), 0.0);
+  if (nol <= 0.0) { return vec3<f32>(0.0); }
+
+  let H = normalize(V + L);
+  // Tight bright cornea highlight.
+  let spec = pow(max(dot(N, H), 0.0), mix(500.0, 120.0, 1.0 - cornea)) * cornea * 2.0;
+  // Fresnel rim (wet look).
+  let fresnel = fresnelSchlick(vec3<f32>(0.02), max(dot(N, V), 0.0)).r;
+  // Iris disc = base color darkened.
+  let iris = baseColor * irisDark * nol;
+
+  var col = iris + baseColor * spec + baseColor * fresnel * 0.3;
+  return col * lightColor;
+}
+
 fn evalLight(
   lightType: f32, lightParams: vec4<f32>, posOrDir: vec4<f32>, colorOrDir2: vec4<f32>,
   worldPos: vec3<f32>, N: vec3<f32>, V: vec3<f32>,
@@ -514,6 +710,76 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
   // --- ShadingModelID dispatch -------------------------------------------
   // material.a carries the shading model id written by the GBuffer pass.
   let matID = material.a;
+
+  // SKIN (2): subsurface-scattering skin.
+  if (matID > 1.5 && matID < 2.5) {
+    let sssStrength = material.r;
+    let skinRough = max(material.g, 0.04);
+    var skinColor = u.ambient.rgb * baseColor * ao;
+    let numLightsS = i32(lights[0]);
+    for (var i = 0; i < numLightsS; i = i + 1) {
+      let base = 1 + i * 12;
+      let lightType = lights[base + 0];
+      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
+      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
+      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
+      var shadowVis = 1.0;
+      if (lightType == 0.0) {
+        let L = normalize(-posOrDir.xyz);
+        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
+      }
+      skinColor += evalSkin(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, sssStrength, skinRough) * shadowVis;
+    }
+    skinColor += baseColor * emissive;
+    return vec4<f32>(skinColor, 1.0);
+  }
+
+  // HAIR (3): anisotropic dual-spec (Kajiya-Kay).
+  if (matID > 2.5 && matID < 3.5) {
+    let hairRough = max(material.r, 0.04);
+    let aniso = material.g;
+    var hairColor = u.ambient.rgb * baseColor * ao;
+    let numLightsH = i32(lights[0]);
+    for (var i = 0; i < numLightsH; i = i + 1) {
+      let base = 1 + i * 12;
+      let lightType = lights[base + 0];
+      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
+      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
+      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
+      var shadowVis = 1.0;
+      if (lightType == 0.0) {
+        let L = normalize(-posOrDir.xyz);
+        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
+      }
+      hairColor += evalHair(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, hairRough, aniso) * shadowVis;
+    }
+    hairColor += baseColor * emissive;
+    return vec4<f32>(hairColor, 1.0);
+  }
+
+  // EYE (4): cornea highlight + iris disc.
+  if (matID > 3.5) {
+    let cornea = material.r;
+    let irisDark = max(material.g, 0.1);
+    var eyeColor = u.ambient.rgb * baseColor * ao;
+    let numLightsE = i32(lights[0]);
+    for (var i = 0; i < numLightsE; i = i + 1) {
+      let base = 1 + i * 12;
+      let lightType = lights[base + 0];
+      let lightParams = vec4<f32>(lights[base + 0], lights[base + 1], lights[base + 2], lights[base + 3]);
+      let posOrDir = vec4<f32>(lights[base + 4], lights[base + 5], lights[base + 6], lights[base + 7]);
+      let colorOrDir2 = vec4<f32>(lights[base + 8], lights[base + 9], lights[base + 10], lights[base + 11]);
+      var shadowVis = 1.0;
+      if (lightType == 0.0) {
+        let L = normalize(-posOrDir.xyz);
+        ${hasShadow ? "shadowVis = sampleShadowPCF(worldPos, N, L);" : ""}
+      }
+      eyeColor += evalEye(lightType, lightParams, posOrDir, colorOrDir2, worldPos, N, V, baseColor, cornea, irisDark) * shadowVis;
+    }
+    eyeColor += baseColor * emissive;
+    return vec4<f32>(eyeColor, 1.0);
+  }
+
   if (matID > 0.5) {
     // TOON / cel shading: quantized diffuse, crisp specular, shadows kept.
     let bands = max(material.g, 1.0);
