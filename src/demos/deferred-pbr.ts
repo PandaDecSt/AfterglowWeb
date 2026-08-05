@@ -13,7 +13,7 @@ import { LightScene, createDirectionalLight, createPointLight, createSpotLight }
 import { EnvironmentMap } from "../passes/environment";
 import { BrdfLut } from "../passes/brdf-lut";
 import { createCubeGeometry, createSphereGeometry } from "../utils/geometry";
-import { mat4, vec3, type Mat4 } from "wgpu-matrix";
+import { mat4, vec3, vec4, type Mat4 } from "wgpu-matrix";
 import type { EngineContext } from "../core/engine";
 import type { RenderPass } from "../core/renderer";
 
@@ -143,6 +143,29 @@ fn vs_main(
 }
 `;
 
+const gizmoVS = `
+struct GizmoOut {
+  @builtin(position) position: vec4<f32>,
+  @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(
+  @location(0) pos: vec4<f32>,
+  @location(1) color: vec4<f32>,
+) -> GizmoOut {
+  var out: GizmoOut;
+  out.position = pos;
+  out.color = color;
+  return out;
+}
+
+@fragment
+fn fs_main(in: GizmoOut) -> @location(0) vec4<f32> {
+  return in.color;
+}
+`;
+
 export class DeferredDemo implements Demo {
   label = "Deferred PBR";
 
@@ -191,6 +214,21 @@ export class DeferredDemo implements Demo {
 
   private vsCode = gbufferVS;
   private fsCode = gbufferFS;
+
+  private cubePos: [number, number, number] = [0, 0, 0];
+  private ballPos: [number, number, number] = [2.6, 0, 0];
+  private ballModel = new Float32Array(16);
+  private selectedId = 0;
+  private editMode = false;
+  private dragAxis = 0;
+  private dragging = false;
+  private dragLastX = 0;
+  private dragLastY = 0;
+
+  private gizmoVB!: GPUBuffer;
+  private gizmoPipeline!: GPURenderPipeline;
+  private gizmoData = new Float32Array(6 * 8);
+  private gizmoNDC = new Float32Array(6 * 2);
 
   init(ctx: GPUContext, camera: Camera, engine?: EngineContext) {
     this.device = ctx.device;
@@ -255,6 +293,18 @@ export class DeferredDemo implements Demo {
       format: "depth32float",
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
     });
+
+    this.gizmoVB = this.device.createBuffer({
+      label: "gizmo-vb",
+      size: 6 * 8 * 4,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+
+    const cv = ctx.canvas;
+    cv.addEventListener("pointerdown", this.onPointerDown, true);
+    cv.addEventListener("pointermove", this.onPointerMove, true);
+    cv.addEventListener("pointerup", this.onPointerUp, true);
+    cv.addEventListener("pointercancel", this.onPointerUp, true);
   }
 
   private createGeometry(): void {
@@ -345,6 +395,25 @@ export class DeferredDemo implements Demo {
         depthCompare: "less",
       },
     });
+
+    const gizmoModule = this.device.createShaderModule({ code: gizmoVS });
+    this.gizmoPipeline = this.device.createRenderPipeline({
+      label: "gizmo",
+      layout: "auto",
+      vertex: {
+        module: gizmoModule,
+        entryPoint: "vs_main",
+        buffers: [{
+          arrayStride: 8 * 4,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: "float32x4" },
+            { shaderLocation: 1, offset: 16, format: "float32x4" },
+          ],
+        }],
+      },
+      fragment: { module: gizmoModule, entryPoint: "fs_main", targets: [{ format: this.ctx.format }] },
+      primitive: { topology: "line-list" },
+    });
   }
 
   getShaderStages(): ShaderStageDesc[] {
@@ -411,7 +480,10 @@ export class DeferredDemo implements Demo {
     const ubo = this.uboData;
     ubo.set(viewProj as unknown as ArrayLike<number>, 0);
     ubo.set(this.prevViewProj as unknown as ArrayLike<number>, 16);
-    const model = mat4.mul(mat4.rotationY(time * 0.5), mat4.scaling([1.5, 1.5, 1.5]));
+    const model = mat4.mul(
+      mat4.translation(this.cubePos),
+      mat4.mul(mat4.rotationY(time * 0.5), mat4.scaling([1.5, 1.5, 1.5])),
+    );
     const invTransModel = mat4.transpose(mat4.inverse(model));
     this.cubeModel.set(model as unknown as ArrayLike<number>);
     ubo.set(model as unknown as ArrayLike<number>, 32);
@@ -432,10 +504,11 @@ export class DeferredDemo implements Demo {
 
     // Ball model: offset to the side, slowly rotating
     const ballModel = mat4.mul(
-      mat4.translation([2.6, 0, 0]),
+      mat4.translation(this.ballPos),
       mat4.mul(mat4.rotationY(time * 0.4), mat4.scaling([1.0, 1.0, 1.0])),
     );
     const invTransBall = mat4.transpose(mat4.inverse(ballModel));
+    this.ballModel.set(ballModel as unknown as ArrayLike<number>);
     const ballUbo = this.ballUboData;
     ballUbo.set(viewProj as unknown as ArrayLike<number>, 0);
     ballUbo.set(this.prevViewProj as unknown as ArrayLike<number>, 16);
@@ -608,6 +681,25 @@ export class DeferredDemo implements Demo {
           [w, h],
           this.frameTime,
         );
+
+        // Step 8: Gizmo (selection axes) drawn over the final image
+        if (this.selectedId > 0) {
+          this.buildGizmoData();
+          this.device.queue.writeBuffer(this.gizmoVB, 0, this.gizmoData as unknown as GPUAllowSharedBufferSource);
+          const gizmoPass = encoder.beginRenderPass({
+            label: "gizmo",
+            colorAttachments: [{
+              view: screenView,
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              loadOp: "load",
+              storeOp: "store",
+            }],
+          });
+          gizmoPass.setPipeline(this.gizmoPipeline);
+          gizmoPass.setVertexBuffer(0, this.gizmoVB);
+          gizmoPass.draw(6);
+          gizmoPass.end();
+        }
       },
     }];
   }
@@ -625,6 +717,193 @@ export class DeferredDemo implements Demo {
     };
   }
 
+  private gizmoAxes: [number, number, number][] = [
+    [1, 0, 0],
+    [0, 1, 0],
+    [0, 0, 1],
+  ];
+  private gizmoColors: [number, number, number, number][] = [
+    [1, 0.25, 0.25, 1],
+    [0.3, 1, 0.3, 1],
+    [0.35, 0.45, 1, 1],
+  ];
+  private GIZMO_LEN = 0.6;
+
+  private buildGizmoData(): void {
+    const pos = this.selectedId === 1 ? this.cubePos : this.ballPos;
+    const d = this.gizmoData;
+    const ndc = this.gizmoNDC;
+    for (let a = 0; a < 3; a++) {
+      const o = [pos[0], pos[1], pos[2], 1] as const;
+      const tip = [
+        pos[0] + this.gizmoAxes[a][0] * this.GIZMO_LEN,
+        pos[1] + this.gizmoAxes[a][1] * this.GIZMO_LEN,
+        pos[2] + this.gizmoAxes[a][2] * this.GIZMO_LEN,
+        1,
+      ] as const;
+      const c0 = mat4.mul(this.frameViewProj as unknown as Mat4, vec4.create(o[0], o[1], o[2], o[3]));
+      const c1 = mat4.mul(this.frameViewProj as unknown as Mat4, vec4.create(tip[0], tip[1], tip[2], tip[3]));
+      const base = a * 16;
+      d[base] = c0[0] / c0[3]; d[base + 1] = c0[1] / c0[3]; d[base + 2] = c0[2] / c0[3]; d[base + 3] = 1;
+      d[base + 4] = this.gizmoColors[a][0];
+      d[base + 5] = this.gizmoColors[a][1];
+      d[base + 6] = this.gizmoColors[a][2];
+      d[base + 7] = this.gizmoColors[a][3];
+      d[base + 8] = c1[0] / c1[3]; d[base + 9] = c1[1] / c1[3]; d[base + 10] = c1[2] / c1[3]; d[base + 11] = 1;
+      d[base + 12] = this.gizmoColors[a][0];
+      d[base + 13] = this.gizmoColors[a][1];
+      d[base + 14] = this.gizmoColors[a][2];
+      d[base + 15] = this.gizmoColors[a][3];
+      ndc[a * 4] = c0[0] / c0[3]; ndc[a * 4 + 1] = c0[1] / c0[3];
+      ndc[a * 4 + 2] = c1[0] / c1[3]; ndc[a * 4 + 3] = c1[1] / c1[3];
+    }
+  }
+
+  private eventToNDC(e: PointerEvent): [number, number] {
+    const rect = this.ctx.canvas.getBoundingClientRect();
+    return [
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -(((e.clientY - rect.top) / rect.height) * 2 - 1),
+    ];
+  }
+
+  private distToSegment(px: number, py: number, ax: number, ay: number, bx: number, by: number): number {
+    const abx = bx - ax, aby = by - ay;
+    const len2 = abx * abx + aby * aby;
+    let t = len2 > 0 ? ((px - ax) * abx + (py - ay) * aby) / len2 : 0;
+    t = Math.max(0, Math.min(1, t));
+    const dx = px - (ax + abx * t);
+    const dy = py - (ay + aby * t);
+    return Math.hypot(dx, dy);
+  }
+
+  private hitGizmoAxis(ndc: [number, number]): number {
+    if (this.selectedId <= 0) return 0;
+    const thr = 10 / (this.ctx.canvas.height * 0.5);
+    let best = 0;
+    let bestD = Infinity;
+    for (let a = 0; a < 3; a++) {
+      const p = a * 4;
+      const d = this.distToSegment(ndc[0], ndc[1], this.gizmoNDC[p], this.gizmoNDC[p + 1], this.gizmoNDC[p + 2], this.gizmoNDC[p + 3]);
+      if (d < bestD) { bestD = d; best = a + 1; }
+    }
+    return bestD <= thr ? best : 0;
+  }
+
+  private applyGizmoDrag(dxPx: number, dyPx: number): void {
+    if (this.dragAxis < 1 || this.dragAxis > 3) return;
+    const axis = this.gizmoAxes[this.dragAxis - 1];
+    const pos = this.selectedId === 1 ? this.cubePos : this.ballPos;
+    const p0 = mat4.mul(this.frameViewProj as unknown as Mat4, vec4.create(pos[0], pos[1], pos[2], 1));
+    const p1 = mat4.mul(this.frameViewProj as unknown as Mat4, vec4.create(pos[0] + axis[0], pos[1] + axis[1], pos[2] + axis[2], 1));
+    let sx = p1[0] / p1[3] - p0[0] / p0[3];
+    let sy = p1[1] / p1[3] - p0[1] / p0[3];
+    const len = Math.hypot(sx, sy);
+    if (len < 1e-6) return;
+    sx /= len; sy /= len;
+    // screen pixels moved along the axis (NDC y is flipped vs mouse y)
+    const sPx = dxPx * sx - dyPx * sy;
+    const scale = (2 * this.camera.distance * Math.tan(this.camera.fov * Math.PI / 360)) / this.ctx.canvas.height;
+    const t = sPx * scale;
+    pos[0] += axis[0] * t;
+    pos[1] += axis[1] * t;
+    pos[2] += axis[2] * t;
+  }
+
+  private onPointerDown = (e: PointerEvent) => {
+    if (!this.editMode) return;
+    const ndc = this.eventToNDC(e);
+    const axis = this.hitGizmoAxis(ndc);
+    if (axis > 0) {
+      e.stopPropagation();
+      e.preventDefault();
+      this.ctx.canvas.setPointerCapture(e.pointerId);
+      this.dragAxis = axis;
+      this.dragging = true;
+      this.dragLastX = e.clientX;
+      this.dragLastY = e.clientY;
+      return;
+    }
+    this.selectedId = this.pickAtNDC(ndc);
+  };
+
+  private onPointerMove = (e: PointerEvent) => {
+    if (!this.dragging) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const dx = e.clientX - this.dragLastX;
+    const dy = e.clientY - this.dragLastY;
+    this.dragLastX = e.clientX;
+    this.dragLastY = e.clientY;
+    this.applyGizmoDrag(dx, dy);
+  };
+
+  private onPointerUp = (e: PointerEvent) => {
+    if (!this.dragging) return;
+    e.stopPropagation();
+    this.dragging = false;
+    this.dragAxis = 0;
+    this.ctx.canvas.releasePointerCapture(e.pointerId);
+  };
+
+  private pickAtNDC(ndc: [number, number]): number {
+    // Unproject a ray through the clicked pixel using the last frame's invVP.
+    const cam = this.camera.position;
+    const near = mat4.mul(this.frameInvViewProj as unknown as Mat4, vec4.create(ndc[0], ndc[1], 0.0, 1.0));
+    const rd = vec3.normalize(vec3.create(
+      near[0] / near[3] - cam[0],
+      near[1] / near[3] - cam[1],
+      near[2] / near[3] - cam[2],
+    ));
+
+    let bestT = Infinity;
+    let bestId = 0;
+
+    // Ball: sphere at ballPos with radius 1
+    {
+      const ocx = cam[0] - this.ballPos[0];
+      const ocy = cam[1] - this.ballPos[1];
+      const ocz = cam[2] - this.ballPos[2];
+      const b = ocx * rd[0] + ocy * rd[1] + ocz * rd[2];
+      const c = ocx * ocx + ocy * ocy + ocz * ocz - 1;
+      const disc = b * b - c;
+      if (disc >= 0) {
+        const t = -b - Math.sqrt(disc);
+        if (t > 0 && t < bestT) { bestT = t; bestId = 2; }
+      }
+    }
+
+    // Cube: OBB via inverse model; local AABB is [-1.5, 1.5] (scale 1.5).
+    // Ray param t is preserved under the affine transform.
+    {
+      const inv = mat4.inverse(this.cubeModel as unknown as Mat4) as unknown as Float32Array;
+      const om = mat4.mul(inv, vec4.create(cam[0], cam[1], cam[2], 1));
+      const dm = mat4.mul(inv, vec4.create(cam[0] + rd[0], cam[1] + rd[1], cam[2] + rd[2], 1));
+      const ox = om[0] / om[3], oy = om[1] / om[3], oz = om[2] / om[3];
+      const dx = dm[0] / dm[3] - ox, dy = dm[1] / dm[3] - oy, dz = dm[2] / dm[3] - oz;
+      let tmin = -Infinity;
+      let tmax = Infinity;
+      const slabs = [[dx, ox, -1.5, 1.5], [dy, oy, -1.5, 1.5], [dz, oz, -1.5, 1.5]] as const;
+      for (let i = 0; i < 3; i++) {
+        const d = slabs[i][0], o = slabs[i][1], lo = slabs[i][2], hi = slabs[i][3];
+        if (Math.abs(d) < 1e-8) {
+          if (o < lo || o > hi) return bestId;
+        } else {
+          let t1 = (lo - o) / d;
+          let t2 = (hi - o) / d;
+          if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; }
+          tmin = Math.max(tmin, t1);
+          tmax = Math.min(tmax, t2);
+          if (tmin > tmax) return bestId;
+        }
+      }
+      const t = Math.max(tmin, 0);
+      if (t < bestT) { bestT = t; bestId = 1; }
+    }
+
+    return bestId;
+  }
+
   registerGUI(gui: any) {
     gui.add(this, "metallic", 0, 1, 0.01).name("Metallic");
     gui.add(this, "roughness", 0.01, 1, 0.01).name("Roughness");
@@ -634,6 +913,9 @@ export class DeferredDemo implements Demo {
     gui.add(this, "useTAA").name("TAA");
     gui.add(this, "taaJitter").name("TAA Jitter");
     gui.add(this, "pauseAnimation").name("Pause");
+    const editFolder = gui.addFolder("Edit");
+    editFolder.add(this, "editMode").name("Edit Mode (pick & move)");
+    editFolder.add(this, "selectedId", 0, 2, 1).name("Selection").listen();
     gui.add(this.taaPass, "alpha", 0.02, 0.5, 0.01).name("TAA Alpha");
     const taaFolder = gui.addFolder("TAA Debug");
     taaFolder.add(this.taaPass, "debugMode", {
@@ -653,6 +935,10 @@ export class DeferredDemo implements Demo {
   }
 
   destroy() {
+    this.ctx.canvas.removeEventListener("pointerdown", this.onPointerDown, true);
+    this.ctx.canvas.removeEventListener("pointermove", this.onPointerMove, true);
+    this.ctx.canvas.removeEventListener("pointerup", this.onPointerUp, true);
+    this.ctx.canvas.removeEventListener("pointercancel", this.onPointerUp, true);
     this.cubeVB.destroy();
     this.cubeIB.destroy();
     this.sphereVB.destroy();
@@ -660,6 +946,7 @@ export class DeferredDemo implements Demo {
     this.sceneUBO.destroy();
     this.ballUBO.destroy();
     this.shadowUBO.destroy();
+    this.gizmoVB.destroy();
     this.dummyDepthTexture.destroy();
     this.gbuffer.destroy();
     this.passManager.destroy();
