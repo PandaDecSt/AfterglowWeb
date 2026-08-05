@@ -16,20 +16,38 @@ import { createCubeGeometry, createSphereGeometry } from "../utils/geometry";
 import { mat4, vec3, vec4, type Mat4 } from "wgpu-matrix";
 import type { EngineContext } from "../core/engine";
 import type { RenderPass } from "../core/renderer";
+import { MaterialInstance, type MaterialBlueprint } from "../core/material-instance";
 
-const gbufferVS = `
-struct Uniforms {
+// Per-object / per-frame matrices + selection tint. These are camera/object
+// state, NOT material state, so they stay in an explicit "globals" block.
+const GLOBALS_STRUCT = `
+struct Globals {
   viewProj: mat4x4<f32>,
   prevViewProj: mat4x4<f32>,
   model: mat4x4<f32>,
   invTransModel: mat4x4<f32>,
   prevModel: mat4x4<f32>,
   cameraPosition: vec4<f32>,
-  params: vec4<f32>,
+  selectedTint: f32,
+};
+@group(0) @binding(0) var<uniform> globals: Globals;
+`;
+
+// Material parameters (metallic / roughness / time) live in a MaterialInstance.
+// The WGSL struct + binding for it are AUTO-GENERATED at runtime from the
+// blueprint (see init()), exactly like the original AfterglowRender's
+// "auto generate shader codes" feature.
+const STANDARD_MATERIAL_BLUEPRINT: MaterialBlueprint = {
+  name: "standard",
+  group: 1,
+  fields: [
+    { name: "time", type: "f32", value: 0 },
+    { name: "metallic", type: "f32", value: 0.1 },
+    { name: "roughness", type: "f32", value: 0.5 },
+  ],
 };
 
-@group(0) @binding(0) var<uniform> u: Uniforms;
-
+const gbufferVSBody = `
 struct VSOut {
   @builtin(position) position: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
@@ -48,14 +66,14 @@ fn vs_main(
   @location(2) uv: vec2<f32>,
 ) -> VSOut {
   var out: VSOut;
-  let worldPos = u.model * vec4<f32>(pos, 1.0);
-  let clip = u.viewProj * worldPos;
+  let worldPos = globals.model * vec4<f32>(pos, 1.0);
+  let clip = globals.viewProj * worldPos;
   out.position = clip;
   out.worldPos = worldPos.xyz;
-  out.worldNormal = normalize((u.invTransModel * vec4<f32>(normal, 0.0)).xyz);
+  out.worldNormal = normalize((globals.invTransModel * vec4<f32>(normal, 0.0)).xyz);
   out.uv = uv;
-  let prevWorld = u.prevModel * vec4<f32>(pos, 1.0);
-  let prevClip = u.prevViewProj * prevWorld;
+  let prevWorld = globals.prevModel * vec4<f32>(pos, 1.0);
+  let prevClip = globals.prevViewProj * prevWorld;
   out.prevClipXY = prevClip.xy;
   out.prevClipW = prevClip.w;
   out.curClipXY = clip.xy;
@@ -64,19 +82,7 @@ fn vs_main(
 }
 `;
 
-const gbufferFS = `
-struct Uniforms {
-  viewProj: mat4x4<f32>,
-  prevViewProj: mat4x4<f32>,
-  model: mat4x4<f32>,
-  invTransModel: mat4x4<f32>,
-  prevModel: mat4x4<f32>,
-  cameraPosition: vec4<f32>,
-  params: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-
+const gbufferFSBody = `
 struct VSOut {
   @builtin(position) position: vec4<f32>,
   @location(0) worldPos: vec3<f32>,
@@ -101,16 +107,16 @@ fn fs_main(in: VSOut) -> GBufferOutput {
   var out: GBufferOutput;
 
   var baseColor = vec3<f32>(
-    0.5 + 0.5 * sin(u.params.x * 0.3 + in.uv.x * 6.28),
-    0.5 + 0.5 * cos(u.params.x * 0.5 + in.uv.y * 6.28),
+    0.5 + 0.5 * sin(mat_standard.time * 0.3 + in.uv.x * 6.28),
+    0.5 + 0.5 * cos(mat_standard.time * 0.5 + in.uv.y * 6.28),
     0.7
   );
-  // Blender-style selection tint (params.w = 1 when selected)
-  baseColor = mix(baseColor, vec3<f32>(0.97, 0.66, 0.11), u.params.w * 0.45);
+  // Blender-style selection tint (selectedTint = 1 when selected)
+  baseColor = mix(baseColor, vec3<f32>(0.97, 0.66, 0.11), globals.selectedTint * 0.45);
 
   out.albedo = vec4<f32>(baseColor, 1.0);
   out.normal = vec4<f32>(normalize(in.worldNormal), 0.0);
-  out.material = vec4<f32>(u.params.y, u.params.z, 0.0, 0.0);
+  out.material = vec4<f32>(mat_standard.metallic, mat_standard.roughness, 0.0, 0.0);
 
   // perspective-correct NDC: clip.xy and clip.w are interpolated separately
   // note: NDC.y grows upward but texture uv.y grows downward, so flip y
@@ -221,9 +227,11 @@ export class DeferredDemo implements Demo {
   private sphereIB!: GPUBuffer;
   private sphereIndexCount = 0;
 
-  private sceneUBO!: GPUBuffer;
-  private ballUBO!: GPUBuffer;
+  private globalsCubeUBO!: GPUBuffer;
+  private globalsBallUBO!: GPUBuffer;
   private shadowUBO!: GPUBuffer;
+  private materialBG: GPUBindGroup | null = null;
+  private standardMaterial!: MaterialInstance;
   private dummyDepthTexture!: GPUTexture;
 
   private prevViewProj: Float32Array = new Float32Array(16);
@@ -237,8 +245,8 @@ export class DeferredDemo implements Demo {
   useSSAO = true;
   useTAA = true;
 
-  private vsCode = gbufferVS;
-  private fsCode = gbufferFS;
+  private vsCode = "";
+  private fsCode = "";
 
   private cubePos: [number, number, number] = [0, 0, 0];
   private ballPos: [number, number, number] = [2.6, 0, 0];
@@ -293,17 +301,21 @@ export class DeferredDemo implements Demo {
     this.postProcessPass = new PostProcessPass(ctx.device, ctx.format);
     this.taaPass = new TAAPass(ctx.device, "rgba16float");
 
+    this.standardMaterial = new MaterialInstance(STANDARD_MATERIAL_BLUEPRINT);
+    this.vsCode = GLOBALS_STRUCT + gbufferVSBody;
+    this.fsCode = this.standardMaterial.generateWGSL() + "\n" + GLOBALS_STRUCT + gbufferFSBody;
+
     this.createGeometry();
     this.buildPipelines();
 
-    this.sceneUBO = this.device.createBuffer({
-      label: "deferred-scene-ubo",
+    this.globalsCubeUBO = this.device.createBuffer({
+      label: "deferred-globals-cube-ubo",
       size: 352,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    this.ballUBO = this.device.createBuffer({
-      label: "deferred-ball-ubo",
+    this.globalsBallUBO = this.device.createBuffer({
+      label: "deferred-globals-ball-ubo",
       size: 352,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -384,6 +396,12 @@ export class DeferredDemo implements Demo {
   }
 
   private buildPipelines(): void {
+    // Reset bind groups so they are recreated against the new pipeline layout
+    // (also happens on shader hot-reload).
+    this.gbufferCubeBG = null;
+    this.gbufferBallBG = null;
+    this.materialBG = null;
+
     const vertexLayout: GPUVertexBufferLayout = {
       arrayStride: 8 * 4,
       attributes: [
@@ -418,6 +436,9 @@ export class DeferredDemo implements Demo {
         depthCompare: "less",
       },
     });
+
+    // The material's uniform block (group 1) is shared across both draws.
+    this.materialBG = this.standardMaterial.createBindGroup(this.device, this.gbufferPipeline);
 
     const shadowVsModule = this.device.createShaderModule({ code: shadowVS });
     this.shadowPipeline = this.device.createRenderPipeline({
@@ -543,12 +564,15 @@ export class DeferredDemo implements Demo {
     ubo[81] = this.camera.position[1];
     ubo[82] = this.camera.position[2];
     ubo[83] = 1.0;
-    ubo[84] = time;
-    ubo[85] = this.metallic;
-    ubo[86] = this.roughness;
-    ubo[87] = this.selectedId === 1 ? 1 : 0;
+    ubo[84] = this.selectedId === 1 ? 1 : 0;
 
-    this.device.queue.writeBuffer(this.sceneUBO, 0, ubo as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.globalsCubeUBO, 0, ubo as unknown as GPUAllowSharedBufferSource);
+
+    // Material parameters are owned by the MaterialInstance, not the globals UBO.
+    this.standardMaterial.setField("time", time);
+    this.standardMaterial.setField("metallic", this.metallic);
+    this.standardMaterial.setField("roughness", this.roughness);
+    this.standardMaterial.upload(this.device);
     this.prevViewProj.set(viewProj as unknown as ArrayLike<number>);
     this.prevModel.set(model as unknown as ArrayLike<number>);
 
@@ -569,12 +593,9 @@ export class DeferredDemo implements Demo {
     ballUbo[81] = this.camera.position[1];
     ballUbo[82] = this.camera.position[2];
     ballUbo[83] = 1.0;
-    ballUbo[84] = time;
-    ballUbo[85] = this.metallic;
-    ballUbo[86] = this.roughness;
-    ballUbo[87] = this.selectedId === 2 ? 1 : 0;
+    ballUbo[84] = this.selectedId === 2 ? 1 : 0;
 
-    this.device.queue.writeBuffer(this.ballUBO, 0, ballUbo as unknown as GPUAllowSharedBufferSource);
+    this.device.queue.writeBuffer(this.globalsBallUBO, 0, ballUbo as unknown as GPUAllowSharedBufferSource);
     this.prevBallModel.set(ballModel as unknown as ArrayLike<number>);
 
     this.bloomPass.bloomIntensity = this.bloomIntensity;
@@ -652,10 +673,11 @@ export class DeferredDemo implements Demo {
           if (!this.gbufferCubeBG) {
             this.gbufferCubeBG = this.device.createBindGroup({
               layout: this.gbufferPipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: this.sceneUBO } }],
+              entries: [{ binding: 0, resource: { buffer: this.globalsCubeUBO } }],
             });
           }
           gbufferPass.setBindGroup(0, this.gbufferCubeBG);
+          gbufferPass.setBindGroup(1, this.materialBG!);
           gbufferPass.setVertexBuffer(0, this.cubeVB);
           gbufferPass.setIndexBuffer(this.cubeIB, "uint16");
           gbufferPass.drawIndexed(this.cubeIndexCount);
@@ -663,10 +685,11 @@ export class DeferredDemo implements Demo {
           if (!this.gbufferBallBG) {
             this.gbufferBallBG = this.device.createBindGroup({
               layout: this.gbufferPipeline.getBindGroupLayout(0),
-              entries: [{ binding: 0, resource: { buffer: this.ballUBO } }],
+              entries: [{ binding: 0, resource: { buffer: this.globalsBallUBO } }],
             });
           }
           gbufferPass.setBindGroup(0, this.gbufferBallBG);
+          gbufferPass.setBindGroup(1, this.materialBG!);
           gbufferPass.setVertexBuffer(0, this.sphereVB);
           gbufferPass.setIndexBuffer(this.sphereIB, "uint16");
           gbufferPass.end();
@@ -1038,8 +1061,9 @@ export class DeferredDemo implements Demo {
     this.cubeIB.destroy();
     this.sphereVB.destroy();
     this.sphereIB.destroy();
-    this.sceneUBO.destroy();
-    this.ballUBO.destroy();
+    this.globalsCubeUBO.destroy();
+    this.globalsBallUBO.destroy();
+    this.standardMaterial.destroy();
     this.shadowUBO.destroy();
     this.outlineUBO.destroy();
     this.gizmoVB.destroy();
