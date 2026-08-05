@@ -39,6 +39,12 @@ export interface MaterialBlueprint {
   group: number;
   /** Which shader stages can see this uniform block. */
   visibility?: GPUShaderStageFlags;
+  /**
+   * Override the WGSL struct type name. By default it is `Mat_<name>`.
+   * Use this when the shader already declares the binding variable and
+   * you only want the struct definition (e.g. to match `struct Mat`).
+   */
+  structName?: string;
   fields: MaterialField[];
 }
 
@@ -114,6 +120,7 @@ export class MaterialInstance {
   readonly group: number;
   readonly fields: MaterialField[];
   readonly visibility: GPUShaderStageFlags;
+  private readonly structNameOverride?: string;
 
   private buffer: GPUBuffer | null = null;
   private bindGroup: GPUBindGroup | null = null;
@@ -123,11 +130,12 @@ export class MaterialInstance {
     this.group = blueprint.group;
     this.fields = blueprint.fields.map((f) => ({ ...f }));
     this.visibility = blueprint.visibility ?? GPUShaderStage.FRAGMENT;
+    this.structNameOverride = blueprint.structName;
   }
 
   /** WGSL struct type name, derived from the material name. */
   get structName(): string {
-    return `Mat_${this.name}`;
+    return this.structNameOverride ?? `Mat_${this.name}`;
   }
 
   /** WGSL uniform variable name, derived from the material name. */

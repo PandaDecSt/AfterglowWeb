@@ -30,6 +30,36 @@ import { RenderClass, PresetConfig, PRESETS, detectPreset } from "../scene/pmx-p
 import { PMXTonemapper } from "../passes/pmx-tonemapper";
 import { create1x1Texture, createToonRampTexture, loadTextureImage } from "../utils/texture-utils";
 import { IKDebugRenderer } from "../debug/ik-debug-renderer";
+import { MaterialInstance, type MaterialBlueprint } from "../core/material-instance";
+
+// Single source of truth for a PMX material's uniform block.
+// The WGSL `struct Mat` is generated from this blueprint; the field names
+// match the shader's `mat.*` references exactly (vec4 packing).
+const PMX_MAT_BLUEPRINT: MaterialBlueprint = {
+  name: "pmx",
+  group: 0,
+  structName: "Mat",
+  fields: [
+    { name: "diffuseColor_alpha", type: "vec4", value: [1, 1, 1, 1] },
+    { name: "ambient_shininess", type: "vec4", value: [0, 0, 0, 0] },
+    { name: "specular_sphereMode", type: "vec4", value: [0, 0, 0, 0] },
+    { name: "pbrParams", type: "vec4", value: [0.1, 0.5, 0, 0] },
+    { name: "rimColor_strength", type: "vec4", value: [0, 0, 0, 0] },
+    { name: "rimPower_pad", type: "vec4", value: [0, 0, 0, 0] },
+  ],
+};
+const PMX_MAT_WGSL = new MaterialInstance(PMX_MAT_BLUEPRINT).generateWGSLStruct();
+
+function buildPMXMaterialInstance(m: PMXMaterial, preset: PresetConfig): MaterialInstance {
+  const instance = new MaterialInstance(PMX_MAT_BLUEPRINT);
+  instance.setField("diffuseColor_alpha", [m.diffuse[0], m.diffuse[1], m.diffuse[2], m.diffuse[3]]);
+  instance.setField("ambient_shininess", [m.ambient[0], m.ambient[1], m.ambient[2], m.specularPower]);
+  instance.setField("specular_sphereMode", [m.specular[0], m.specular[1], m.specular[2], m.sphereMode]);
+  instance.setField("pbrParams", [preset.metallic, preset.roughness, preset.emissionStrength, preset.nprMix]);
+  instance.setField("rimColor_strength", [preset.rimColor[0], preset.rimColor[1], preset.rimColor[2], preset.rimStrength]);
+  instance.setField("rimPower_pad", [preset.rimPower, preset.alphaMode ?? 0, 0, 0]);
+  return instance;
+}
 
 const MSAA_COUNT = 4;
 
@@ -44,6 +74,7 @@ interface MatRenderData {
   hasEdge: boolean;
   renderClass: RenderClass;
   castsShadow: boolean;
+  materialInstance: MaterialInstance;
 }
 
 export class PMXDemo implements Demo {
@@ -278,17 +309,10 @@ export class PMXDemo implements Demo {
       const isTransparent = m.diffuse[3] < 1.0 - 0.001;
       const hasEdge = (m.flag & 0x10) !== 0 && m.edgeScale > 0;
 
-      const matBuf = this.device.createBuffer({ label: `pmx-mat-${mi}`, size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
       const preset = detectPreset(m.name, isTransparent);
-      const matData = new Float32Array(24);
-      matData[0] = m.diffuse[0]; matData[1] = m.diffuse[1]; matData[2] = m.diffuse[2]; matData[3] = m.diffuse[3];
-      matData[4] = m.ambient[0]; matData[5] = m.ambient[1]; matData[6] = m.ambient[2]; matData[7] = m.specularPower;
-      matData[8] = m.specular[0]; matData[9] = m.specular[1]; matData[10] = m.specular[2]; matData[11] = m.sphereMode;
-      matData[12] = preset.metallic; matData[13] = preset.roughness; matData[14] = preset.emissionStrength; matData[15] = preset.nprMix;
-      matData[16] = preset.rimColor[0]; matData[17] = preset.rimColor[1]; matData[18] = preset.rimColor[2]; matData[19] = preset.rimStrength;
-      matData[20] = preset.rimPower;
-      matData[21] = preset.alphaMode ?? 0;
-      this.device.queue.writeBuffer(matBuf, 0, matData as unknown as GPUAllowSharedBufferSource);
+      // MaterialInstance owns the uniform buffer + packing + upload.
+      const materialInstance = buildPMXMaterialInstance(m, preset);
+      materialInstance.upload(this.device);
 
       const diffuseTex = (m.textureIndex >= 0 && m.textureIndex + 1 < loadedTextures.length && loadedTextures[m.textureIndex + 1]) ? loadedTextures[m.textureIndex + 1]! : defaultTex;
       const sphereTex = (m.sphereTextureIndex >= 0 && m.sphereTextureIndex + 1 < loadedTextures.length && loadedTextures[m.sphereTextureIndex + 1]) ? loadedTextures[m.sphereTextureIndex + 1]! : defaultTex;
@@ -299,7 +323,7 @@ export class PMXDemo implements Demo {
         label: `pmx-main-bg-${mi}`, layout: mainBGL,
         entries: [
           { binding: 0, resource: { buffer: this.sceneBuffer } },
-          { binding: 1, resource: { buffer: matBuf } },
+          { binding: 1, resource: { buffer: materialInstance.uniformBuffer! } },
           { binding: 2, resource: diffuseTex.createView() },
           { binding: 3, resource: sphereTex.createView() },
           { binding: 4, resource: toonTex.createView() },
@@ -336,7 +360,7 @@ export class PMXDemo implements Demo {
       }
 
       const castsShadow = (m.flag & 0x04) !== 0;
-      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, shadowGen: this.shadowMap.generation, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass, castsShadow });
+      this.matRenders.push({ indexOffset, indexCount: matIndexCount, mainBG, shadowBG, shadowGen: this.shadowMap.generation, outlineBG, isTransparent, hasEdge, renderClass: preset.renderClass, castsShadow, materialInstance });
       indexOffset += matIndexCount;
     }
 
@@ -508,7 +532,7 @@ export class PMXDemo implements Demo {
 
   private buildPipelines(): void {
     const vsModule = this.device.createShaderModule({ code: SCENE_VS });
-    const fsModule = this.device.createShaderModule({ code: buildMainFS() });
+    const fsModule = this.device.createShaderModule({ code: buildMainFS(PMX_MAT_WGSL) });
     const shadowVSModule = this.device.createShaderModule({ code: SHADOW_VS });
     const outVSModule = this.device.createShaderModule({ code: OUTLINE_VS });
 
@@ -1027,6 +1051,7 @@ export class PMXDemo implements Demo {
 
     for (const t of this.gpuTextures) t.destroy();
     this.gpuTextures = [];
+    for (const mr of this.matRenders) mr.materialInstance.destroy();
     this.matRenders = [];
   }
 

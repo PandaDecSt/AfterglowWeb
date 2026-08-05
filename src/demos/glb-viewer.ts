@@ -4,6 +4,32 @@ import { Demo } from "./types";
 import { mat4 } from "wgpu-matrix";
 import { loadGLTF, interleaveMesh, type MeshData, type MaterialData } from "../utils/gltf-loader";
 import type { RenderPass } from "../core/renderer";
+import { MaterialInstance, type MaterialBlueprint } from "../core/material-instance";
+
+// Single source of truth for a GLB material's uniform block.
+// The WGSL `struct MatUniforms` is generated from this blueprint, so the
+// shader's struct and the CPU packing can never drift apart.
+const GLB_MAT_BLUEPRINT: MaterialBlueprint = {
+  name: "glb",
+  group: 1,
+  structName: "MatUniforms",
+  fields: [
+    { name: "baseColorFactor", type: "vec4", value: [1, 1, 1, 1] },
+    { name: "params", type: "vec4", value: [0, 0.5, 0, 0] },
+    { name: "params2", type: "vec4", value: [0, 1, 0.015, 0] },
+  ],
+};
+const GLB_MAT_WGSL = new MaterialInstance(GLB_MAT_BLUEPRINT).generateWGSLStruct();
+
+function buildGLBMaterialInstance(mat: MaterialData, outlineWidth: number): MaterialInstance {
+  const instance = new MaterialInstance(GLB_MAT_BLUEPRINT);
+  const hasBaseColorTex = mat.baseColorImage ? 1 : 0;
+  const lightmapStrength = mat.occlusionImage ? mat.occlusionStrength : 0;
+  instance.setField("baseColorFactor", [...mat.baseColorFactor]);
+  instance.setField("params", [mat.metallicFactor, mat.roughnessFactor, hasBaseColorTex, lightmapStrength]);
+  instance.setField("params2", [0.0, 1.0, outlineWidth, 0.0]);
+  return instance;
+}
 
 // === Material Classification ===
 type MaterialCategory = "body" | "face" | "hair" | "eye" | "eyelash" | "other";
@@ -49,7 +75,7 @@ function defaultPreset(): RenderPreset {
 }
 
 // === Shaders ===
-const modelShader = `
+const modelShaderBody = `
 struct FrameUniforms {
   viewProj: mat4x4<f32>,
   model: mat4x4<f32>,
@@ -57,12 +83,6 @@ struct FrameUniforms {
   cameraPosition: vec4<f32>,
   lightDir: vec4<f32>,
   lightColor: vec4<f32>,
-};
-
-struct MatUniforms {
-  baseColorFactor: vec4<f32>,
-  params: vec4<f32>,  // metallic, roughness, hasBaseColorTex, lightmapStrength
-  params2: vec4<f32>, // alphaCutoff, renderMode, outlineWidth, pad
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -266,7 +286,9 @@ fn fs_main(in: VSOut, @builtin(front_facing) isFront: bool) -> @location(0) vec4
 }
 `;
 
-const outlineShader = `
+const modelShader = GLB_MAT_WGSL + "\n" + modelShaderBody;
+
+const outlineShaderBody = `
 struct FrameUniforms {
   viewProj: mat4x4<f32>,
   model: mat4x4<f32>,
@@ -274,12 +296,6 @@ struct FrameUniforms {
   cameraPosition: vec4<f32>,
   lightDir: vec4<f32>,
   lightColor: vec4<f32>,
-};
-
-struct MatUniforms {
-  baseColorFactor: vec4<f32>,
-  params: vec4<f32>,
-  params2: vec4<f32>, // alphaCutoff, renderMode, outlineWidth, pad
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -317,6 +333,8 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 `;
 
+const outlineShader = GLB_MAT_WGSL + "\n" + outlineShaderBody;
+
 // === Main Demo Class ===
 interface MeshBuffers {
   vertexBuffer: GPUBuffer;
@@ -332,7 +350,7 @@ interface MeshBuffers {
 
 interface MaterialResources {
   bindGroup: GPUBindGroup;
-  matUbo: GPUBuffer;
+  materialInstance: MaterialInstance;
   name: string;
   category: MaterialCategory;
   baseColorFactor: [number, number, number, number];
@@ -506,27 +524,16 @@ export class GLBViewerDemo implements Demo {
       ? this.createTextureFromBitmap(matData.occlusionImage, `lightmap-${matData.name}`, "rgba8unorm").createView()
       : this.defaultTexture.createView();
 
-    const matUbo = this.device.createBuffer({
-      label: `glb-mat-ubo-${matData.name}`,
-      size: 48,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-
     const category = classifyMaterial(matData.name);
-    const hasBaseColorTex = matData.baseColorImage ? 1 : 0;
-    const lightmapStrength = matData.occlusionImage ? matData.occlusionStrength : 0;
 
-    const matUboData = new Float32Array([
-      matData.baseColorFactor[0], matData.baseColorFactor[1], matData.baseColorFactor[2], matData.baseColorFactor[3],
-      matData.metallicFactor, matData.roughnessFactor, hasBaseColorTex, lightmapStrength,
-      0.0, 1.0, this.globalOutlineWidth, 0.0,
-    ]);
-    this.device.queue.writeBuffer(matUbo, 0, matUboData as unknown as GPUAllowSharedBufferSource);
+    // MaterialInstance owns the uniform buffer + packing + upload.
+    const materialInstance = buildGLBMaterialInstance(matData, this.globalOutlineWidth);
+    materialInstance.upload(this.device);
 
     const bindGroup = this.device.createBindGroup({
       layout: matBGL,
       entries: [
-        { binding: 0, resource: { buffer: matUbo } },
+        { binding: 0, resource: { buffer: materialInstance.uniformBuffer! } },
         { binding: 1, resource: baseColorView },
         { binding: 2, resource: lightmapView },
         { binding: 3, resource: this.defaultSampler },
@@ -535,14 +542,14 @@ export class GLBViewerDemo implements Demo {
 
     this.materialResources.push({
       bindGroup,
-      matUbo,
+      materialInstance,
       name: matData.name,
       category,
       baseColorFactor: matData.baseColorFactor,
       metallic: matData.metallicFactor,
       roughness: matData.roughnessFactor,
-      hasBaseColorTex,
-      lightmapStrength,
+      hasBaseColorTex: matData.baseColorImage ? 1 : 0,
+      lightmapStrength: matData.occlusionImage ? matData.occlusionStrength : 0,
       hasLightmap: !!matData.occlusionImage,
       previewImage: matData.baseColorImage ?? null,
       alphaCutoff: 0.0,
@@ -746,12 +753,10 @@ export class GLBViewerDemo implements Demo {
   }
 
   private updateMatUbo(matRes: MaterialResources) {
-    const data = new Float32Array([
-      matRes.baseColorFactor[0], matRes.baseColorFactor[1], matRes.baseColorFactor[2], matRes.baseColorFactor[3],
-      matRes.metallic, matRes.roughness, matRes.hasBaseColorTex, matRes.lightmapStrength,
-      matRes.alphaCutoff, matRes.renderMode, matRes.outlineWidth, 0,
-    ]);
-    this.device.queue.writeBuffer(matRes.matUbo, 0, data as unknown as GPUAllowSharedBufferSource);
+    matRes.materialInstance.setField("baseColorFactor", [...matRes.baseColorFactor]);
+    matRes.materialInstance.setField("params", [matRes.metallic, matRes.roughness, matRes.hasBaseColorTex, matRes.lightmapStrength]);
+    matRes.materialInstance.setField("params2", [matRes.alphaCutoff, matRes.renderMode, matRes.outlineWidth, 0]);
+    matRes.materialInstance.upload(this.device);
   }
 
   private exportPresetJSON(preset: RenderPreset) {
@@ -923,7 +928,7 @@ export class GLBViewerDemo implements Demo {
       mb.indexBuffer.destroy();
     }
     for (const mr of this.materialResources) {
-      mr.matUbo.destroy();
+      mr.materialInstance.destroy();
       mr.previewImage?.close();
     }
     this.frameUbo.destroy();
