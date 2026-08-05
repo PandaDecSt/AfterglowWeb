@@ -100,11 +100,13 @@ struct GBufferOutput {
 fn fs_main(in: VSOut) -> GBufferOutput {
   var out: GBufferOutput;
 
-  let baseColor = vec3<f32>(
+  var baseColor = vec3<f32>(
     0.5 + 0.5 * sin(u.params.x * 0.3 + in.uv.x * 6.28),
     0.5 + 0.5 * cos(u.params.x * 0.5 + in.uv.y * 6.28),
     0.7
   );
+  // Blender-style selection tint (params.w = 1 when selected)
+  baseColor = mix(baseColor, vec3<f32>(0.97, 0.66, 0.11), u.params.w * 0.45);
 
   out.albedo = vec4<f32>(baseColor, 1.0);
   out.normal = vec4<f32>(normalize(in.worldNormal), 0.0);
@@ -140,6 +142,29 @@ fn vs_main(
 ) -> @builtin(position) vec4<f32> {
   let worldPos = u.model * vec4<f32>(pos, 1.0);
   return u.lightVP * worldPos;
+}
+`;
+
+const outlineVS = `
+struct OutlineUniforms {
+  viewProj: mat4x4<f32>,
+  model: mat4x4<f32>,
+  scale: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: OutlineUniforms;
+
+@vertex
+fn vs_main(
+  @location(0) pos: vec3<f32>,
+) -> @builtin(position) vec4<f32> {
+  let worldPos = u.model * vec4<f32>(pos * u.scale, 1.0);
+  return u.viewProj * worldPos;
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+  return vec4<f32>(0.02, 0.02, 0.03, 1.0);
 }
 `;
 
@@ -229,6 +254,12 @@ export class DeferredDemo implements Demo {
   private gizmoPipeline!: GPURenderPipeline;
   private gizmoData = new Float32Array(6 * 8);
   private gizmoNDC = new Float32Array(6 * 2);
+  private outlinePipeline!: GPURenderPipeline;
+  private outlineUBO!: GPUBuffer;
+  private outlineUboData = new Float32Array(48);
+  private outlineBG: GPUBindGroup | null = null;
+  outlineEnabled = true;
+  outlineScale = 1.04;
 
   init(ctx: GPUContext, camera: Camera, engine?: EngineContext) {
     this.device = ctx.device;
@@ -298,6 +329,11 @@ export class DeferredDemo implements Demo {
       label: "gizmo-vb",
       size: 6 * 8 * 4,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    });
+    this.outlineUBO = this.device.createBuffer({
+      label: "deferred-outline-ubo",
+      size: 192,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
     const cv = ctx.canvas;
@@ -414,6 +450,20 @@ export class DeferredDemo implements Demo {
       fragment: { module: gizmoModule, entryPoint: "fs_main", targets: [{ format: this.ctx.format }] },
       primitive: { topology: "line-list" },
     });
+
+    const outlineModule = this.device.createShaderModule({ code: outlineVS });
+    this.outlinePipeline = this.device.createRenderPipeline({
+      label: "deferred-outline",
+      layout: "auto",
+      vertex: { module: outlineModule, entryPoint: "vs_main", buffers: [vertexLayout] },
+      fragment: { module: outlineModule, entryPoint: "fs_main", targets: [{ format: this.ctx.format }] },
+      primitive: { topology: "triangle-list", cullMode: "front" },
+      depthStencil: {
+        format: GBuffer.DEPTH_FORMAT,
+        depthWriteEnabled: false,
+        depthCompare: "less",
+      },
+    });
   }
 
   getShaderStages(): ShaderStageDesc[] {
@@ -496,7 +546,7 @@ export class DeferredDemo implements Demo {
     ubo[84] = time;
     ubo[85] = this.metallic;
     ubo[86] = this.roughness;
-    ubo[87] = 0;
+    ubo[87] = this.selectedId === 1 ? 1 : 0;
 
     this.device.queue.writeBuffer(this.sceneUBO, 0, ubo as unknown as GPUAllowSharedBufferSource);
     this.prevViewProj.set(viewProj as unknown as ArrayLike<number>);
@@ -522,7 +572,7 @@ export class DeferredDemo implements Demo {
     ballUbo[84] = time;
     ballUbo[85] = this.metallic;
     ballUbo[86] = this.roughness;
-    ballUbo[87] = 0;
+    ballUbo[87] = this.selectedId === 2 ? 1 : 0;
 
     this.device.queue.writeBuffer(this.ballUBO, 0, ballUbo as unknown as GPUAllowSharedBufferSource);
     this.prevBallModel.set(ballModel as unknown as ArrayLike<number>);
@@ -682,7 +732,50 @@ export class DeferredDemo implements Demo {
           this.frameTime,
         );
 
-        // Step 8: Gizmo (selection axes) drawn over the final image
+        // Step 8: Selection outline (Blender-style inverted hull) over the final image
+        if (this.outlineEnabled && this.selectedId > 0) {
+          if (!this.outlineBG) {
+            this.outlineBG = this.device.createBindGroup({
+              layout: this.outlinePipeline.getBindGroupLayout(0),
+              entries: [{ binding: 0, resource: { buffer: this.outlineUBO } }],
+            });
+          }
+          const oUbo = this.outlineUboData;
+          oUbo.set(this.frameViewProj as unknown as ArrayLike<number>, 0);
+          oUbo[32] = this.outlineScale;
+          const outlinePass = encoder.beginRenderPass({
+            label: "outline",
+            colorAttachments: [{
+              view: screenView,
+              clearValue: { r: 0, g: 0, b: 0, a: 1 },
+              loadOp: "load",
+              storeOp: "store",
+            }],
+            depthStencilAttachment: {
+              view: this.gbuffer.depthView,
+              depthLoadOp: "load",
+              depthStoreOp: "store",
+            },
+          });
+          outlinePass.setPipeline(this.outlinePipeline);
+          outlinePass.setBindGroup(0, this.outlineBG);
+          if (this.selectedId === 1) {
+            oUbo.set(this.cubeModel as unknown as ArrayLike<number>, 16);
+            this.device.queue.writeBuffer(this.outlineUBO, 0, oUbo as unknown as GPUAllowSharedBufferSource);
+            outlinePass.setVertexBuffer(0, this.cubeVB);
+            outlinePass.setIndexBuffer(this.cubeIB, "uint16");
+            outlinePass.drawIndexed(this.cubeIndexCount);
+          } else {
+            oUbo.set(this.ballModel as unknown as ArrayLike<number>, 16);
+            this.device.queue.writeBuffer(this.outlineUBO, 0, oUbo as unknown as GPUAllowSharedBufferSource);
+            outlinePass.setVertexBuffer(0, this.sphereVB);
+            outlinePass.setIndexBuffer(this.sphereIB, "uint16");
+            outlinePass.drawIndexed(this.sphereIndexCount);
+          }
+          outlinePass.end();
+        }
+
+        // Step 9: Gizmo (selection axes) drawn over the final image
         if (this.selectedId > 0) {
           this.buildGizmoData();
           this.device.queue.writeBuffer(this.gizmoVB, 0, this.gizmoData as unknown as GPUAllowSharedBufferSource);
@@ -916,6 +1009,8 @@ export class DeferredDemo implements Demo {
     const editFolder = gui.addFolder("Edit");
     editFolder.add(this, "editMode").name("Edit Mode (pick & move)");
     editFolder.add(this, "selectedId", 0, 2, 1).name("Selection").listen();
+    editFolder.add(this, "outlineEnabled").name("Selection Outline");
+    editFolder.add(this, "outlineScale", 1.01, 1.2, 0.005).name("Outline Width");
     gui.add(this.taaPass, "alpha", 0.02, 0.5, 0.01).name("TAA Alpha");
     const taaFolder = gui.addFolder("TAA Debug");
     taaFolder.add(this.taaPass, "debugMode", {
@@ -946,6 +1041,7 @@ export class DeferredDemo implements Demo {
     this.sceneUBO.destroy();
     this.ballUBO.destroy();
     this.shadowUBO.destroy();
+    this.outlineUBO.destroy();
     this.gizmoVB.destroy();
     this.dummyDepthTexture.destroy();
     this.gbuffer.destroy();
